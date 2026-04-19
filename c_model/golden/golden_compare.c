@@ -47,9 +47,17 @@ static int libjpeg_decode_ycc(const uint8_t *data, size_t size, libjpeg_ycc_t *o
     uint32_t H = cinfo.output_height;
     out->width = W;
     out->height = H;
-    out->y  = (uint8_t*)calloc((size_t)W * H, 1);
-    out->cb = (uint8_t*)calloc((size_t)(W/2) * (H/2), 1);
-    out->cr = (uint8_t*)calloc((size_t)(W/2) * (H/2), 1);
+
+    /* raw_data_out 要求 MCU 对齐的行缓冲。每次调用 jpeg_read_raw_data
+       会填 16 行 Y / 8 行 Cb / 8 行 Cr，哪怕 H 不是 16 的倍数。
+       用 padded 临时缓冲，之后 crop 到 W×H。 */
+    uint32_t Wp = ((W + 15) / 16) * 16;
+    uint32_t Hp = ((H + 15) / 16) * 16;
+    uint32_t CWp = Wp / 2;
+    uint32_t CHp = Hp / 2;
+    uint8_t *y_pad  = (uint8_t*)calloc((size_t)Wp  * Hp,  1);
+    uint8_t *cb_pad = (uint8_t*)calloc((size_t)CWp * CHp, 1);
+    uint8_t *cr_pad = (uint8_t*)calloc((size_t)CWp * CHp, 1);
 
     JSAMPROW y_rowptrs[16];
     JSAMPROW cb_rowptrs[8];
@@ -59,15 +67,28 @@ static int libjpeg_decode_ycc(const uint8_t *data, size_t size, libjpeg_ycc_t *o
     while (cinfo.output_scanline < H) {
         uint32_t base_y = cinfo.output_scanline;
         for (uint32_t i = 0; i < 16; i++) {
-            y_rowptrs[i]  = out->y + (size_t)(base_y + i) * W;
+            y_rowptrs[i]  = y_pad + (size_t)(base_y + i) * Wp;
         }
         uint32_t base_c = base_y >> 1;
         for (uint32_t i = 0; i < 8; i++) {
-            cb_rowptrs[i] = out->cb + (size_t)(base_c + i) * (W/2);
-            cr_rowptrs[i] = out->cr + (size_t)(base_c + i) * (W/2);
+            cb_rowptrs[i] = cb_pad + (size_t)(base_c + i) * CWp;
+            cr_rowptrs[i] = cr_pad + (size_t)(base_c + i) * CWp;
         }
         (void)jpeg_read_raw_data(&cinfo, arrays, 16);
     }
+
+    /* Crop padded buffers to actual W×H / (W/2)×(H/2). */
+    out->y  = (uint8_t*)calloc((size_t)W * H, 1);
+    out->cb = (uint8_t*)calloc((size_t)(W/2) * (H/2), 1);
+    out->cr = (uint8_t*)calloc((size_t)(W/2) * (H/2), 1);
+    for (uint32_t r = 0; r < H; r++) {
+        memcpy(out->y + (size_t)r * W, y_pad + (size_t)r * Wp, W);
+    }
+    for (uint32_t r = 0; r < H/2; r++) {
+        memcpy(out->cb + (size_t)r * (W/2), cb_pad + (size_t)r * CWp, W/2);
+        memcpy(out->cr + (size_t)r * (W/2), cr_pad + (size_t)r * CWp, W/2);
+    }
+    free(y_pad); free(cb_pad); free(cr_pad);
 
     jpeg_finish_decompress(&cinfo);
     jpeg_destroy_decompress(&cinfo);

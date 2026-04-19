@@ -23,6 +23,12 @@ module bitstream_unpack (
 
     output reg         marker_detected,
     output reg  [7:0]  marker_byte,
+    // Phase 7: RST 自动丢弃 —— 上游判定 marker 是 0xD0..0xD7 时拉高，
+    // 本模块清 marker 状态、清 shreg+bit_cnt（RST 要求下一字节起 byte-aligned）
+    input  wire        restart_ack,
+    // Phase 7: 进入 S_WAIT_RST 时 block_sequencer 拉高，把 shreg/bit_cnt 清零，
+    // 从而允许 FIFO 继续送字节直到 marker 被识别。不清 marker_detected。
+    input  wire        align_req,
 
     input  wire [4:0]  consume_n,
     input  wire        consume_req,
@@ -37,8 +43,11 @@ module bitstream_unpack (
     assign bit_cnt_o = {1'b0, bit_cnt};
     reg        ff_wait;     // 已经吃进 0xFF，等待下一个字节判定
 
-    // 可以接纳新字节的条件：空间足够 且 未 marker 暂停
-    wire can_accept = (bit_cnt <= 6'd24) && !marker_detected;
+    // 可以接纳新字节的条件：空间足够 且 未 marker 暂停。
+    // Phase 7: 当 ff_wait=1 时下一字节是 marker-judgement byte（要么是 00 被丢弃，
+    // 要么是 marker 使 bit_cnt-=8），都不会增加 bit_cnt，因此即便 bit_cnt>24
+    // 也必须允许 accept，否则会卡死在无法判定 marker。
+    wire can_accept = ((bit_cnt <= 6'd24) || ff_wait) && !marker_detected;
     assign byte_ready = byte_valid && can_accept;
 
     // 下一拍的 bit_cnt / shreg
@@ -118,6 +127,18 @@ module bitstream_unpack (
             ff_wait         <= 1'b0;
             marker_detected <= 1'b0;
             marker_byte     <= 8'd0;
+        end else if (restart_ack) begin
+            // Phase 7: 清 marker 和 bit 缓冲，下一字节起从零开始（byte-aligned）
+            shreg           <= 32'd0;
+            bit_cnt         <= 6'd0;
+            ff_wait         <= 1'b0;
+            marker_detected <= 1'b0;
+            marker_byte     <= 8'd0;
+        end else if (align_req) begin
+            // Phase 7: 只清 bit buffer（MCU 末尾残留是 pad 位），留 marker 状态
+            shreg           <= 32'd0;
+            bit_cnt         <= 6'd0;
+            ff_wait         <= 1'b0;
         end else begin
             shreg           <= next_shreg;
             bit_cnt         <= next_bit_cnt;

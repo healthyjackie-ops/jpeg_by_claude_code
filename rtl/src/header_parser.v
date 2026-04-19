@@ -35,6 +35,7 @@ module header_parser (
     output reg  [7:0]  ht_val_idx,
     output reg  [7:0]  ht_val_data,
     output reg         ht_build_start, // 触发 huffman_tables 构造 mincode/maxcode/valptr
+    input  wire        ht_build_done,  // 等构建完再去吃下一个 DHT（避免 pulse 被吞）
 
     // Frame info
     output reg  [15:0] img_width,
@@ -52,6 +53,7 @@ module header_parser (
     output reg         header_done,    // SOS 结束
     output reg         data_mode,      // 1=进入熵编码数据段
     output reg         frame_done,     // 遇 EOI
+    output reg  [15:0] dri_interval,   // Phase 7: DRI 间隔 MCU 数（0=禁用）
     output reg  [8:0]  err             // sticky
 );
 
@@ -74,6 +76,7 @@ module header_parser (
         S_DHT_BITS     = 6'd12,
         S_DHT_VAL      = 6'd13,
         S_DHT_BUILD    = 6'd14,
+        S_DHT_WAIT_BLD = 6'd35,     // 等 htable_ram.build_done（避免多 DHT 时 pulse 被吞）
         S_SOF_P        = 6'd15,
         S_SOF_H_HI     = 6'd16,
         S_SOF_H_LO     = 6'd17,
@@ -176,6 +179,7 @@ module header_parser (
             comp0_td <= 2'd0; comp1_td <= 2'd0; comp2_td <= 2'd0;
             comp0_ta <= 2'd0; comp1_ta <= 2'd0; comp2_ta <= 2'd0;
             header_done <= 1'b0; data_mode <= 1'b0; frame_done <= 1'b0;
+            dri_interval <= 16'd0;
             err <= 9'd0;
             qt_wr <= 1'b0; qt_sel <= 2'd0; qt_idx <= 6'd0; qt_val <= 8'd0;
             ht_bits_wr <= 1'b0; ht_val_wr <= 1'b0;
@@ -186,6 +190,7 @@ module header_parser (
         end else if (soft_reset) begin
             state <= S_IDLE;
             header_done <= 1'b0; data_mode <= 1'b0; frame_done <= 1'b0;
+            dri_interval <= 16'd0;
             err <= 9'd0;
             qt_wr <= 1'b0; ht_bits_wr <= 1'b0; ht_val_wr <= 1'b0;
             ht_build_start <= 1'b0;
@@ -205,6 +210,7 @@ module header_parser (
                         header_done <= 1'b0;
                         data_mode   <= 1'b0;
                         frame_done  <= 1'b0;
+                        dri_interval <= 16'd0;
                         err         <= 9'd0;
                     end
                 end
@@ -359,8 +365,13 @@ module header_parser (
                     end
                 end
                 S_DHT_BUILD: begin
-                    // 单周期脉冲，触发 htable 模块内部构建 MINCODE/MAXCODE/VALPTR
+                    // 单周期脉冲，触发 htable 模块内部构建 MINCODE/MAXCODE/VALPTR。
+                    // 构建需要 ~18 cycles。若段内还有下一表，必须等 build_done 再继续，
+                    // 否则下一次 build_start 会在 htable_ram 非 B_IDLE 状态被忽略。
                     ht_build_start <= 1'b1;
+                    state <= S_DHT_WAIT_BLD;
+                end
+                S_DHT_WAIT_BLD: if (ht_build_done) begin
                     if (remain > 0) begin
                         state <= S_DHT_TCTH;
                     end else begin
@@ -490,14 +501,14 @@ module header_parser (
                     end
                 end
 
-                // ------------------------------------------------------ DRI
+                // ------------------------------------------------------ DRI (Phase 7: 接受任意值)
                 S_DRI_HI: if (beat) begin
-                    if (byte_in != 8'd0) begin err[`ERR_DRI_NONZERO] <= 1'b1; state <= S_ERROR; end
-                    else begin remain <= remain - 16'd1; state <= S_DRI_LO; end
+                    dri_interval[15:8] <= byte_in;
+                    remain <= remain - 16'd1; state <= S_DRI_LO;
                 end
                 S_DRI_LO: if (beat) begin
-                    if (byte_in != 8'd0) begin err[`ERR_DRI_NONZERO] <= 1'b1; state <= S_ERROR; end
-                    else begin state <= S_FIND_FF; end
+                    dri_interval[7:0] <= byte_in;
+                    state <= S_FIND_FF;
                 end
 
                 // ------------------------------------------------------ DATA / DONE

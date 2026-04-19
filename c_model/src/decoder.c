@@ -82,6 +82,9 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
     uint8_t cb_blk[64];
     uint8_t cr_blk[64];
 
+    /* Phase 7: DRI restart 计数器 */
+    uint16_t restart_cnt = 0;
+
     for (uint16_t my = 0; my < info.mcu_rows; my++) {
         for (uint16_t mx = 0; mx < info.mcu_cols; mx++) {
             for (int i = 0; i < 4; i++) {
@@ -116,6 +119,43 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
             uint8_t *cr_dst = cr_pad_420 + (size_t)(my * 8) * CWp + (mx * 8);
             copy_block_8x8(cb_blk, cb_dst, CWp);
             copy_block_8x8(cr_blk, cr_dst, CWp);
+
+            /* Phase 7: DRI 边界 — 每 N 个 MCU 一个 RSTn。
+               最后一个 MCU 之后不再要求 RST（紧跟 EOI）。 */
+            if (info.dri != 0) {
+                restart_cnt++;
+                int is_last = (my == info.mcu_rows - 1) && (mx == info.mcu_cols - 1);
+                if (restart_cnt == info.dri && !is_last) {
+                    /* 消费 RSTn marker。fetch_entropy_byte 可能已经把它记录
+                       到 bs->last_marker（marker_pending=1），也可能还没读到。 */
+                    bs_align_to_byte(&bs);
+                    if (!bs.marker_pending) {
+                        uint8_t b;
+                        if (bs_read_byte(&bs, &b) || b != 0xFF) {
+                            out->err = JPEG_ERR_BAD_MARKER;
+                            return -1;
+                        }
+                        while (bs_read_byte(&bs, &b) == 0 && b == 0xFF) {}
+                        if (b < MARKER_RST0 || b > MARKER_RST7) {
+                            out->err = JPEG_ERR_BAD_MARKER;
+                            return -1;
+                        }
+                    } else {
+                        if (bs.last_marker < MARKER_RST0 ||
+                            bs.last_marker > MARKER_RST7) {
+                            out->err = JPEG_ERR_BAD_MARKER;
+                            return -1;
+                        }
+                        bs.marker_pending = 0;
+                        bs.last_marker    = 0;
+                    }
+                    /* 重置 DC 预测器 */
+                    info.components[0].dc_pred = 0;
+                    info.components[1].dc_pred = 0;
+                    info.components[2].dc_pred = 0;
+                    restart_cnt = 0;
+                }
+            }
         }
     }
 

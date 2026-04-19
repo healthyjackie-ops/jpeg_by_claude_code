@@ -35,6 +35,14 @@ module block_sequencer (
     input  wire signed [15:0] h_dc_pred_out,
     input  wire        h_dc_pred_upd,
 
+    // Phase 7: DRI / Restart marker 支持
+    input  wire [15:0] dri_interval,   // 来自 header_parser（0=禁用）
+    input  wire        marker_detected, // 来自 bitstream_unpack
+    input  wire [7:0]  marker_byte,
+    output reg         restart_ack,    // 1-cycle pulse：吞掉 RST + 清 shreg
+    output reg         dc_restart,     // 1-cycle pulse：清 DC 预测器
+    output reg         align_req,      // 1-cycle pulse：进 S_WAIT_RST 时清 shreg/bit_cnt
+
     // 当前 block 的 quant 表号
     output reg  [1:0]  qt_sel_out,
 
@@ -80,11 +88,14 @@ module block_sequencer (
         S_MCU_COPY = 4'd5,
         S_NEXT_MCU = 4'd6,
         S_ROW_OUT  = 4'd7,
-        S_DONE     = 4'd8;
+        S_DONE     = 4'd8,
+        S_WAIT_RST = 4'd9;   // Phase 7: DRI 边界等 RSTn
 
     reg [3:0] st;
+    reg [3:0] next_st_after_rst;  // Phase 7: 吞掉 RST 后回到哪
     reg [2:0] blk_idx;     // 0..5
     reg [15:0] my, mx;
+    reg [15:0] restart_cnt; // Phase 7: 自上次 restart 累计 MCU 数
     reg pending_h_done;
     reg pending_idct_done;
 
@@ -119,24 +130,32 @@ module block_sequencer (
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             st <= S_IDLE;
+            next_st_after_rst <= S_IDLE;
             blk_idx <= 3'd0; my <= 16'd0; mx <= 16'd0;
+            restart_cnt <= 16'd0;
             pending_h_done <= 1'b0; pending_idct_done <= 1'b0;
             h_blk_start <= 1'b0;
             dcp_wr <= 1'b0; dcp_wr_data <= 16'sd0;
             mcu_copy_start <= 1'b0; mcu_col_idx <= 16'd0;
             row_ready <= 1'b0; is_first_row_o <= 1'b0; is_last_row_o <= 1'b0;
             frame_done_o <= 1'b0;
+            restart_ack <= 1'b0; dc_restart <= 1'b0; align_req <= 1'b0;
         end else if (soft_reset) begin
             st <= S_IDLE;
             h_blk_start <= 1'b0; dcp_wr <= 1'b0;
             mcu_copy_start <= 1'b0; row_ready <= 1'b0;
             frame_done_o <= 1'b0;
+            restart_ack <= 1'b0; dc_restart <= 1'b0; align_req <= 1'b0;
+            restart_cnt <= 16'd0;
         end else begin
             h_blk_start    <= 1'b0;
             dcp_wr         <= 1'b0;
             mcu_copy_start <= 1'b0;
             row_ready      <= 1'b0;
             frame_done_o   <= 1'b0;
+            restart_ack    <= 1'b0;
+            dc_restart     <= 1'b0;
+            align_req      <= 1'b0;
 
             // 收集异步完成信号
             if (h_blk_done)    pending_h_done    <= 1'b1;
@@ -196,13 +215,54 @@ module block_sequencer (
                     if (mx + 16'd1 == mcu_cols) begin
                         // MCU 行完成 → 触发 raster 输出
                         mx <= 16'd0;
-                        row_ready <= 1'b1;
                         is_first_row_o <= (my == 16'd0);
                         is_last_row_o  <= (my == mcu_rows - 16'd1);
-                        st <= S_ROW_OUT;
+                        // Phase 7: DRI 边界（非帧末行）需要先吞 RSTn 再输出
+                        if (dri_interval != 16'd0 &&
+                            restart_cnt + 16'd1 == dri_interval &&
+                            my != mcu_rows - 16'd1) begin
+                            restart_cnt <= 16'd0;
+                            next_st_after_rst <= S_ROW_OUT;
+                            align_req <= 1'b1;
+                            st <= S_WAIT_RST;
+                        end else begin
+                            row_ready <= 1'b1;
+                            restart_cnt <= (dri_interval != 16'd0 &&
+                                            restart_cnt + 16'd1 == dri_interval) ?
+                                           16'd0 : restart_cnt + 16'd1;
+                            st <= S_ROW_OUT;
+                        end
                     end else begin
                         mx <= mx + 16'd1;
-                        st <= S_START_BLK;
+                        // Phase 7: 行内 DRI 边界
+                        if (dri_interval != 16'd0 &&
+                            restart_cnt + 16'd1 == dri_interval) begin
+                            restart_cnt <= 16'd0;
+                            next_st_after_rst <= S_START_BLK;
+                            align_req <= 1'b1;
+                            st <= S_WAIT_RST;
+                        end else begin
+                            restart_cnt <= restart_cnt + 16'd1;
+                            st <= S_START_BLK;
+                        end
+                    end
+                end
+
+                S_WAIT_RST: begin
+                    // Phase 7: 等 bitstream_unpack 报 marker = 0xD0..0xD7
+                    if (marker_detected) begin
+                        if (marker_byte[7:3] == 5'b11010) begin
+                            // RSTn：吞掉它，清 DC 预测器
+                            restart_ack <= 1'b1;
+                            dc_restart  <= 1'b1;
+                            if (next_st_after_rst == S_ROW_OUT)
+                                row_ready <= 1'b1;
+                            st <= next_st_after_rst;
+                        end else begin
+                            // 出现非法 marker，终止
+                            frame_done_o <= 1'b1;
+                            st <= S_DONE;
+                        end
                     end
                 end
 

@@ -115,6 +115,10 @@ module jpeg_axi_top (
     wire        header_done_w;
     wire        frame_done_hp;
     wire [8:0]  err_w;
+    wire [15:0] dri_interval_w;     // Phase 7
+    wire        restart_ack_w;      // Phase 7: block_seq → bitstream_unpack
+    wire        dc_restart_w;       // Phase 7: block_seq → dc_predictor
+    wire        align_req_w;        // Phase 7: block_seq → bitstream_unpack (drain shreg)
 
     header_parser u_hp (
         .clk(aclk), .rst_n(aresetn), .start(start_pulse),
@@ -127,12 +131,15 @@ module jpeg_axi_top (
         .ht_bits_idx(ht_bits_idx_w), .ht_bits_val(ht_bits_val_w),
         .ht_val_idx(ht_val_idx_w), .ht_val_data(ht_val_data_w),
         .ht_build_start(ht_build_start_w),
+        .ht_build_done(ht_build_done_w),
         .img_width(img_w_w), .img_height(img_h_w),
         .comp0_qt(comp0_qt), .comp1_qt(comp1_qt), .comp2_qt(comp2_qt),
         .comp0_td(comp0_td), .comp1_td(comp1_td), .comp2_td(comp2_td),
         .comp0_ta(comp0_ta), .comp1_ta(comp1_ta), .comp2_ta(comp2_ta),
         .header_done(header_done_w), .data_mode(data_mode),
-        .frame_done(frame_done_hp), .err(err_w)
+        .frame_done(frame_done_hp),
+        .dri_interval(dri_interval_w),   // Phase 7
+        .err(err_w)
     );
 
     // ---------------- QTable RAM ------------------------------------
@@ -184,6 +191,8 @@ module jpeg_axi_top (
         .byte_in(fifo_byte), .byte_valid(byte_to_bs_valid),
         .byte_ready(bs_byte_ready),
         .marker_detected(marker_detected_w), .marker_byte(marker_byte_w),
+        .restart_ack(restart_ack_w),       // Phase 7
+        .align_req(align_req_w),           // Phase 7
         .consume_n(consume_n_w), .consume_req(consume_req_w),
         .peek_win(peek_win_w), .peek_valid(peek_valid_nc),
         .bit_cnt_o(bit_cnt_w)
@@ -195,7 +204,7 @@ module jpeg_axi_top (
     wire        dcp_wr_w;
     wire signed [15:0] dcp_wr_data_w;
     wire signed [15:0] dcp_y_w, dcp_cb_w, dcp_cr_w;
-    wire        dcp_new_frame = start_pulse;
+    wire        dcp_new_frame = start_pulse | dc_restart_w;  // Phase 7: RSTn 清 DC 预测器
 
     dc_predictor u_dcp (
         .clk(aclk), .rst_n(aresetn), .soft_reset(softrst),
@@ -393,6 +402,13 @@ module jpeg_axi_top (
         .h_dc_pred_in(h_dc_pred_in_w),
         .h_blk_done(h_blk_done_w), .h_dc_pred_out(h_dc_pred_out_w),
         .h_dc_pred_upd(h_dc_pred_upd_w),
+        // Phase 7: DRI / restart
+        .dri_interval(dri_interval_w),
+        .marker_detected(marker_detected_w),
+        .marker_byte(marker_byte_w),
+        .restart_ack(restart_ack_w),
+        .dc_restart(dc_restart_w),
+        .align_req(align_req_w),
         .qt_sel_out(qt_sel_cur_w),
         .cur_blk_type(cur_blk_type_w),
         .idct_blk_done(idct_blk_done_w),
@@ -474,8 +490,8 @@ module jpeg_axi_top (
     );
 
     // 防未使用告警
-    wire _unused = &{1'b0, marker_detected_w, marker_byte_w,
-                     ht_build_done_w, frame_done_hp,
+    wire _unused = &{1'b0,
+                     frame_done_hp,
                      cfg_reg_w, scratch_reg_w, int_en_w,
                      fifo_byte_tlast, in_fifo_full, out_fifo_empty,
                      in_fifo_tuser_nc, peek_valid_nc, mb_ready_nc,

@@ -194,7 +194,7 @@ static int parse_dri(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
     uint16_t len;
     if (bs_read_u16(bs, &len)) { *err |= JPEG_ERR_STREAM_TRUNC; return -1; }
     if (bs_read_u16(bs, &info->dri)) { *err |= JPEG_ERR_STREAM_TRUNC; return -1; }
-    if (info->dri != 0) { *err |= JPEG_ERR_DRI_NONZERO; return -1; }
+    /* Phase 7: DRI > 0 现在合法；restart_count 由 decoder.c 管理 */
     return 0;
 }
 
