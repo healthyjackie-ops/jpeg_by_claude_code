@@ -1,0 +1,46 @@
+#=============================================================================
+# Hierarchy-preserving synthesis for per-module area breakdown.
+# Skips ABC mapping and just maps to generic + flops, then uses `stat` with
+# the liberty file to estimate per-module combinational area.
+#=============================================================================
+
+read_verilog -nomem2reg -I../../rtl/include \
+    ../../rtl/src/axi_lite_slave.v \
+    ../../rtl/src/axi_stream_fifo.v \
+    ../../rtl/src/bitstream_unpack.v \
+    ../../rtl/src/block_sequencer.v \
+    ../../rtl/src/chroma_upsample.v \
+    ../../rtl/src/dc_predictor.v \
+    ../../rtl/src/dequant_izz.v \
+    ../../rtl/src/header_parser.v \
+    ../../rtl/src/htable_ram.v \
+    ../../rtl/src/huffman_decoder.v \
+    ../../rtl/src/idct_1d.v \
+    ../../rtl/src/idct_2d.v \
+    ../../rtl/src/line_buffer.v \
+    ../../rtl/src/mcu_buffer.v \
+    ../../rtl/src/mcu_line_copy.v \
+    ../../rtl/src/pixel_out.v \
+    ../../rtl/src/qtable_ram.v \
+    ../../rtl/src/jpeg_axi_top.v
+
+hierarchy -top jpeg_axi_top -check
+
+proc
+opt -fast
+fsm
+opt
+memory -nomap
+opt
+wreduce
+opt_clean -purge
+techmap
+opt -fast
+
+dfflibmap -liberty ../asap7/asap7_merged_RVT_TT.lib
+abc -liberty ../asap7/asap7_merged_RVT_TT.lib -fast
+
+setundef -zero -undriven
+opt_clean -purge
+
+stat -width -liberty ../asap7/asap7_merged_RVT_TT.lib

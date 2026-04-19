@@ -1,0 +1,40 @@
+# Build artifacts
+c_model/build/
+verification/tests/obj_dir/
+**/obj_dir/
+*.o
+*.a
+*.so
+*.dylib
+
+# Simulation output
+*.vcd
+*.fst
+*.wlf
+trace.vcd
+sim.log
+
+# Generated intermediate files
+*.ppm
+*.pgm
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+
+# Local temp
+/tmp/
+tmp/
+scratch/
