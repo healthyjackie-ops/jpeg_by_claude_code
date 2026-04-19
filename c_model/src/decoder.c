@@ -37,18 +37,28 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
 
     out->width  = info.width;
     out->height = info.height;
-    uint16_t W = info.width;
-    uint16_t H = info.height;
-    uint16_t CW = W >> 1;
-    uint16_t CH = H >> 1;
+    uint16_t W  = info.width;
+    uint16_t H  = info.height;
+    /* Phase 6: 内部用 MCU 对齐的 padded 尺寸解码，结束再 crop 到 W×H */
+    uint16_t Wp = info.mcu_cols * 16;
+    uint16_t Hp = info.mcu_rows * 16;
+    uint16_t CWp = Wp >> 1;
+    uint16_t CHp = Hp >> 1;
 
+    uint8_t *y_pad       = (uint8_t*)calloc((size_t)Wp  * Hp,  1);
+    uint8_t *cb_pad_420  = (uint8_t*)calloc((size_t)CWp * CHp, 1);
+    uint8_t *cr_pad_420  = (uint8_t*)calloc((size_t)CWp * CHp, 1);
+    uint8_t *cb_pad      = (uint8_t*)calloc((size_t)Wp  * Hp,  1);
+    uint8_t *cr_pad      = (uint8_t*)calloc((size_t)Wp  * Hp,  1);
     out->y_plane       = (uint8_t*)calloc((size_t)W  * H,  1);
-    out->cb_plane_420  = (uint8_t*)calloc((size_t)CW * CH, 1);
-    out->cr_plane_420  = (uint8_t*)calloc((size_t)CW * CH, 1);
+    out->cb_plane_420  = (uint8_t*)calloc((size_t)(W >> 1) * (H >> 1), 1);
+    out->cr_plane_420  = (uint8_t*)calloc((size_t)(W >> 1) * (H >> 1), 1);
     out->cb_plane      = (uint8_t*)calloc((size_t)W  * H,  1);
     out->cr_plane      = (uint8_t*)calloc((size_t)W  * H,  1);
-    if (!out->y_plane || !out->cb_plane_420 || !out->cr_plane_420 ||
+    if (!y_pad || !cb_pad_420 || !cr_pad_420 || !cb_pad || !cr_pad ||
+        !out->y_plane || !out->cb_plane_420 || !out->cr_plane_420 ||
         !out->cb_plane || !out->cr_plane) {
+        free(y_pad); free(cb_pad_420); free(cr_pad_420); free(cb_pad); free(cr_pad);
         out->err = (uint32_t)JPEG_ERR_INTERNAL;
         return -1;
     }
@@ -99,18 +109,35 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
             dequant_block(coef, cr_qt);
             idct_islow(coef, cr_blk);
 
-            uint8_t *y_dst = out->y_plane + (my * 16) * W + (mx * 16);
-            copy_block_16x16_y(y_blk, y_dst, W);
+            uint8_t *y_dst = y_pad + (size_t)(my * 16) * Wp + (mx * 16);
+            copy_block_16x16_y(y_blk, y_dst, Wp);
 
-            uint8_t *cb_dst = out->cb_plane_420 + (my * 8) * CW + (mx * 8);
-            uint8_t *cr_dst = out->cr_plane_420 + (my * 8) * CW + (mx * 8);
-            copy_block_8x8(cb_blk, cb_dst, CW);
-            copy_block_8x8(cr_blk, cr_dst, CW);
+            uint8_t *cb_dst = cb_pad_420 + (size_t)(my * 8) * CWp + (mx * 8);
+            uint8_t *cr_dst = cr_pad_420 + (size_t)(my * 8) * CWp + (mx * 8);
+            copy_block_8x8(cb_blk, cb_dst, CWp);
+            copy_block_8x8(cr_blk, cr_dst, CWp);
         }
     }
 
-    chroma_upsample_nn(out->cb_plane_420, out->cb_plane, W, H);
-    chroma_upsample_nn(out->cr_plane_420, out->cr_plane, W, H);
+    chroma_upsample_nn(cb_pad_420, cb_pad, Wp, Hp);
+    chroma_upsample_nn(cr_pad_420, cr_pad, Wp, Hp);
+
+    /* Phase 6: crop padded planes → actual W×H output planes */
+    for (uint16_t r = 0; r < H; r++) {
+        memcpy(out->y_plane  + (size_t)r * W,  y_pad  + (size_t)r * Wp,  W);
+        memcpy(out->cb_plane + (size_t)r * W,  cb_pad + (size_t)r * Wp,  W);
+        memcpy(out->cr_plane + (size_t)r * W,  cr_pad + (size_t)r * Wp,  W);
+    }
+    /* 4:2:0 chroma planes: only fill the top-left (W/2)×(H/2) portion; caller
+       may inspect these when needed. MCU-aligned W/H were previously assumed,
+       so we pack conservatively for non-aligned: copy (W>>1) cols from padded. */
+    for (uint16_t r = 0; r < (H >> 1); r++) {
+        memcpy(out->cb_plane_420 + (size_t)r * (W >> 1),
+               cb_pad_420 + (size_t)r * CWp, (W >> 1));
+        memcpy(out->cr_plane_420 + (size_t)r * (W >> 1),
+               cr_pad_420 + (size_t)r * CWp, (W >> 1));
+    }
+    free(y_pad); free(cb_pad_420); free(cr_pad_420); free(cb_pad); free(cr_pad);
 
     bs_align_to_byte(&bs);
     uint8_t b;

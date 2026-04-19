@@ -127,10 +127,7 @@ static int parse_sof0(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
         *err |= JPEG_ERR_SIZE_OOR;
         return -1;
     }
-    if ((info->width & 15) || (info->height & 15)) {
-        *err |= JPEG_ERR_SIZE_OOR;
-        return -1;
-    }
+    /* Phase 6: 非 16 对齐尺寸允许；decoder 自己做 padding + crop */
 
     uint8_t nf;
     if (bs_read_byte(bs, &nf)) { *err |= JPEG_ERR_STREAM_TRUNC; return -1; }
@@ -155,8 +152,9 @@ static int parse_sof0(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
         return -1;
     }
 
-    info->mcu_cols = info->width / 16;
-    info->mcu_rows = info->height / 16;
+    /* Phase 6: 向上取整支持非对齐尺寸 */
+    info->mcu_cols = (info->width  + 15) / 16;
+    info->mcu_rows = (info->height + 15) / 16;
     return 0;
 }
 

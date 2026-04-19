@@ -67,9 +67,9 @@ module block_sequencer (
     output reg         frame_done_o
 );
 
-    // 计算 mcu 行列数
-    wire [15:0] mcu_cols = img_width  >> 4;
-    wire [15:0] mcu_rows = img_height >> 4;
+    // 计算 mcu 行列数（Phase 6: 非 16 对齐尺寸向上取整）
+    wire [15:0] mcu_cols = (img_width  + 16'd15) >> 4;
+    wire [15:0] mcu_rows = (img_height + 16'd15) >> 4;
 
     localparam [3:0]
         S_IDLE     = 4'd0,

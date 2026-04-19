@@ -402,8 +402,8 @@ module header_parser (
                     if (byte_in != 8'd3) begin
                         err[`ERR_UNSUP_CHROMA] <= 1'b1; state <= S_ERROR;
                     end else if (img_width == 16'd0 || img_height == 16'd0 ||
-                                 img_width > 16'd4096 || img_height > 16'd4096 ||
-                                 img_width[3:0] != 4'd0 || img_height[3:0] != 4'd0) begin
+                                 img_width > 16'd4096 || img_height > 16'd4096) begin
+                        // Phase 6: 非 16 对齐尺寸由 decoder 自行裁剪，不再拒绝
                         err[`ERR_SIZE_OOR] <= 1'b1; state <= S_ERROR;
                     end else begin
                         remain <= remain - 16'd1;

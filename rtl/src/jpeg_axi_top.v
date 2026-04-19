@@ -352,6 +352,7 @@ module jpeg_axi_top (
     pixel_out u_po (
         .clk(aclk), .rst_n(aresetn), .soft_reset(softrst),
         .row_start(row_ready_w), .img_width(img_w_w[11:0]),
+        .img_height(img_h_w[11:0]),   // Phase 6: H 裁剪
         .is_first_row(is_first_row_w), .is_last_row(is_last_row_w),
         .row_done(row_done_w),
         .rd_y_row(po_rd_y_row_w), .rd_y_col(po_rd_y_col_w),
