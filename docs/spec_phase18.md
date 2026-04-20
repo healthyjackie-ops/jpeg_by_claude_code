@@ -127,3 +127,31 @@ int huff_decode_ac_refine(bitstream_t *bs, const htable_t *ac_tab,
 
 ### 6.4 首次运行即 17/17 bit-exact
 Phase 17a 的 EOBn-unsigned-bits + natural-extent 两个坑已经踩过，18a 纯新逻辑上线就稳。
+
+---
+
+## 7. Phase 17c / 18c 完工记录（progressive + DRI）
+
+**状态**：✅ 完成（20/20 `phase_prog_dri` 向量 pixel-exact vs libjpeg-turbo；phase06-18 全部零退步；unit tests 全通）。
+
+### 7.1 实现要点
+- 新增静态辅助 `prog_handle_restart(bs, info, num_comps, *eob_run)`：字节对齐 → 消费 RSTn（`0xFF`/`MARKER_RST0..7`，兼容 `marker_pending`/`last_marker` 已 latch 的情况）→ 复位所有分量 `dc_pred`、AC scan 额外复位 `eob_run`。与 baseline 在 `decoder.c:469-508` 的 RST 流程完全一致。
+- `jpeg_decode()` 移除 `if (info.sof_type == 2 && info.dri != 0) UNSUP_SOF` 拒绝。
+- `decode_progressive()` DC 支路（interleaved，Ns=num_comps）：每 `info->dri` 个 MCU 触发 RST，最后一个 MCU 后**不**再等 RST（紧跟 EOI / 下个 SOS）。
+- `decode_progressive()` AC 支路（non-interleaved，Ns=1）：依据 ISO F.1.2.3 —— 非 interleaved scan 的 "MCU" 即单个 data unit（8×8 block），所以 DRI 计数以 block 为单位。最后一个 block 后跳过 RST。
+- 两条路径的重启计数器都是 scan-local（进入 scan 时清零），与 libjpeg-turbo `jdhuff.c`/`jdphuff.c` 的 `restarts_to_go` 语义一致。
+
+### 7.2 测试向量矩阵（`verification/vectors/phase_prog_dri/`）
+20 张 `cjpeg -progressive -scans -restart NB` 向量，DRI ∈ {1, 2, 4, 8, 16}：
+- Spectral-only（全 Ah=0）11 张：gray/444/420，覆盖 MCU 对齐（32×32/48×48/64×48/192×128）+ 非对齐（97×73 444、100×75 gray、100×76 420）
+- Refinement（Ah>0，default 或 minimal 脚本）9 张：同上尺寸池 + gray default 100×75 r=1（每 block 都 RST，最严酷的 AC-refine + RST 交互）
+
+关键覆盖点：
+- RST 发生在 DC interleaved scan 内（6-block MCU）
+- RST 发生在 AC 非-interleaved scan 内（1-block MCU）→ AC-refine 的 EOB run 被强制在 RST 处清零
+- RST 发生在自然范围 != MCU-padded 的 Y 分量内（100×76 420、97×73 444）
+- DRI=1 情形：每个 data unit 都触发 RST（压力测试）
+- DRI=16 情形：跨多行 Y MCU
+
+### 7.3 首次运行即 20/20 bit-exact
+因复用 baseline 已稳定的 RST-consume 逻辑，加上 18a 已 nail 住 AC-refine 的 EOBn / natural-extent 坑位，新路径上线即稳。

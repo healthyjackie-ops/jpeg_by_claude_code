@@ -88,17 +88,14 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
         return decode_p12(&bs, &info, out);
     }
 
-    /* Phase 17a: SOF2 handled via a dedicated multi-scan decoder that supports
-     * DC + spectral-selection AC scans (Ah=0). The legacy single-scan DC-only
-     * path (Phase 16b) is a degenerate sub-case and remains covered by the same
-     * routine. */
+    /* Phase 17a/17c: SOF2 handled via a dedicated multi-scan decoder that
+     * supports DC + spectral-selection AC scans (Ah=0) and refinement scans
+     * (Ah>0, Phase 18a). DRI>0 is accepted (Phase 17c/18c) and enforced inside
+     * each scan's MCU/block loop. The legacy single-scan DC-only path (Phase
+     * 16b) is a degenerate sub-case and remains covered by the same routine. */
     g_dc_only = 0;
     g_al      = 0;
     if (info.sof_type == 2) {
-        if (info.dri != 0) {
-            out->err = JPEG_ERR_UNSUP_SOF;
-            return -1;
-        }
         return decode_progressive(&bs, &info, out);
     }
 
@@ -921,6 +918,36 @@ static int pdbg_enabled(void) {
     return v;
 }
 
+/* Phase 17c/18c: consume a RSTn marker at a progressive-scan restart boundary.
+ *
+ * Mirrors the baseline (SOF0/SOF1) restart sequence at decoder.c lines 469–508
+ * and the P12 path at lines 811–838. Byte-align the bitstream, accept either a
+ * still-in-the-stream 0xFF..RSTn pair or a marker the bitstream layer already
+ * latched into bs->last_marker, then reset the scan's prediction state:
+ *   • DC preds (both first-scan and refine run 1 bit/block → no cross-block
+ *     state, but libjpeg resets them anyway; we follow.)
+ *   • EOB run (AC scans only — EOBn spans blocks, must zero at every restart).
+ * Returns 0 on success, -1 on malformed marker.
+ */
+static int prog_handle_restart(bitstream_t *bs, jpeg_info_t *info,
+                               int num_comps, uint32_t *eob_run) {
+    bs_align_to_byte(bs);
+    if (!bs->marker_pending) {
+        uint8_t b;
+        if (bs_read_byte(bs, &b) || b != 0xFF) return -1;
+        while (bs_read_byte(bs, &b) == 0 && b == 0xFF) {}
+        if (b < MARKER_RST0 || b > MARKER_RST7) return -1;
+    } else {
+        if (bs->last_marker < MARKER_RST0 ||
+            bs->last_marker > MARKER_RST7) return -1;
+        bs->marker_pending = 0;
+        bs->last_marker    = 0;
+    }
+    for (int c = 0; c < num_comps; c++) info->components[c].dc_pred = 0;
+    if (eob_run) *eob_run = 0;
+    return 0;
+}
+
 static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
                               jpeg_decoded_t *out) {
     int dbg = pdbg_enabled();
@@ -1032,10 +1059,13 @@ static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
             /* Interleaved DC scan (Ns = num_comps). Walk MCU-major.
              * First scan: DC preds reset, coef[0] = dc<<Al.
              * Refinement (Ah>0): per block, 1 bit OR'd into coef[0] at pos Al.
-             */
+             *
+             * Phase 17c/18c: DRI — every info->dri MCUs insert a RSTn marker,
+             * reset DC preds. No RST after the final MCU (EOI follows). */
             if (!is_refine) {
                 for (int c = 0; c < num_comps; c++) info->components[c].dc_pred = 0;
             }
+            uint32_t restart_cnt = 0;
             for (uint32_t my = 0; my < info->mcu_rows; my++) {
                 for (uint32_t mx = 0; mx < info->mcu_cols; mx++) {
                     if (is_gray) {
@@ -1113,6 +1143,17 @@ static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
                             }
                         }
                     }
+                    if (info->dri != 0) {
+                        restart_cnt++;
+                        int is_last = (my == info->mcu_rows - 1u) &&
+                                      (mx == info->mcu_cols - 1u);
+                        if (restart_cnt == info->dri && !is_last) {
+                            if (prog_handle_restart(bs, info, num_comps, NULL)) {
+                                out->err = JPEG_ERR_BAD_MARKER; goto fail;
+                            }
+                            restart_cnt = 0;
+                        }
+                    }
                 }
             }
         } else {
@@ -1144,6 +1185,10 @@ static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
             uint32_t stride   = cg[scan_comp].blk_cols;
             uint32_t n_blk    = nat_rows * nat_cols;
             uint32_t b = 0;
+            /* Phase 17c/18c: for non-interleaved scans the ISO "MCU" is a
+             * single data unit (one 8×8 block), so restart interval applies
+             * per block. No RST after the final block. */
+            uint32_t restart_cnt = 0;
             for (uint32_t by = 0; by < nat_rows; by++) {
                 for (uint32_t bx = 0; bx < nat_cols; bx++) {
                     uint32_t blk = cg[scan_comp].base + by * stride + bx;
@@ -1168,6 +1213,17 @@ static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
                         out->err = JPEG_ERR_BAD_HUFFMAN; goto fail;
                     }
                     b++;
+                    if (info->dri != 0) {
+                        restart_cnt++;
+                        int is_last_blk = (by == nat_rows - 1u) &&
+                                          (bx == nat_cols - 1u);
+                        if (restart_cnt == info->dri && !is_last_blk) {
+                            if (prog_handle_restart(bs, info, num_comps, &eob_run)) {
+                                out->err = JPEG_ERR_BAD_MARKER; goto fail;
+                            }
+                            restart_cnt = 0;
+                        }
+                    }
                 }
             }
             if (dbg) fprintf(stderr,
