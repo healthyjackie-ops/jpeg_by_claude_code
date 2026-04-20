@@ -6,7 +6,7 @@
 
 #define JPEG_MAX_WIDTH   4096
 #define JPEG_MAX_HEIGHT  4096
-#define JPEG_MAX_COMPONENTS 3
+#define JPEG_MAX_COMPONENTS 4   /* Phase 12: CMYK (Nf=4) */
 #define JPEG_BLOCK_SIZE  64
 #define JPEG_MCU_WIDTH   16
 #define JPEG_MCU_HEIGHT  16
@@ -50,7 +50,8 @@ typedef enum {
     CHROMA_444  = 2,   /* Nf=3, H=V=1 all comps      -> MCU 8x8,  3 blocks */
     CHROMA_422  = 3,   /* Phase 10: Nf=3, H0=2,V0=1 -> MCU 16x8, 4 blocks */
     CHROMA_440  = 4,   /* Phase 11a: Nf=3, H0=1,V0=2 -> MCU 8x16, 4 blocks */
-    CHROMA_411  = 5    /* Phase 11b: Nf=3, H0=4,V0=1 -> MCU 32x8, 6 blocks */
+    CHROMA_411  = 5,   /* Phase 11b: Nf=3, H0=4,V0=1 -> MCU 32x8, 6 blocks */
+    CHROMA_CMYK = 6    /* Phase 12: Nf=4, all H=V=1  -> MCU 8x8,  4 blocks (C,M,Y,K) */
 } chroma_mode_t;
 
 typedef struct {

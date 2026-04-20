@@ -17,6 +17,10 @@ typedef struct {
     uint8_t *cr_plane_440;
     uint8_t *cb_plane_411;   /* Phase 11b: sub-res chroma (W/4) × H */
     uint8_t *cr_plane_411;
+    uint8_t *c_plane;        /* Phase 12: CMYK planes (all W × H, 1x1) */
+    uint8_t *m_plane;
+    uint8_t *y_plane_cmyk;
+    uint8_t *k_plane;
     uint32_t err;
 } jpeg_decoded_t;
 

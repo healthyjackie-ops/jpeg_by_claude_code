@@ -131,8 +131,8 @@ static int parse_sof0(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
 
     uint8_t nf;
     if (bs_read_byte(bs, &nf)) { *err |= JPEG_ERR_STREAM_TRUNC; return -1; }
-    /* Phase 8: accept Nf==1 (grayscale) or Nf==3 (4:2:0) */
-    if (nf != 1 && nf != 3) { *err |= JPEG_ERR_UNSUP_CHROMA; return -1; }
+    /* Phase 12: accept Nf ∈ {1, 3, 4} (grayscale / YCbCr / CMYK) */
+    if (nf != 1 && nf != 3 && nf != 4) { *err |= JPEG_ERR_UNSUP_CHROMA; return -1; }
     info->num_components = nf;
 
     for (int i = 0; i < nf; i++) {
@@ -181,6 +181,17 @@ static int parse_sof0(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
             *err |= JPEG_ERR_UNSUP_CHROMA;
             return -1;
         }
+    } else if (nf == 4) {
+        /* Phase 12: CMYK — all components must be H=V=1 (1x1x1x1) */
+        for (int i = 0; i < 4; i++) {
+            if (info->components[i].h_samp != 1 || info->components[i].v_samp != 1) {
+                *err |= JPEG_ERR_UNSUP_CHROMA;
+                return -1;
+            }
+        }
+        info->chroma_mode = CHROMA_CMYK;
+        info->mcu_cols = (info->width  + 7) / 8;
+        info->mcu_rows = (info->height + 7) / 8;
     } else {
         /* Phase 8: grayscale requires H=V=1; MCU=8x8 */
         if (info->components[0].h_samp != 1 || info->components[0].v_samp != 1) {
