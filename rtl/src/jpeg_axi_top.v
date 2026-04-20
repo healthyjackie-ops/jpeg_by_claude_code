@@ -253,12 +253,18 @@ module jpeg_axi_top (
     wire [5:0]  huf_coef_nat_idx_w;
     wire signed [15:0] huf_coef_val_w;
 
+    // Phase 16c: SOF2 DC-only 模式 — 由 header_parser 捕获的 sof_type + Al 驱动
+    wire        dc_only_mode_w = (sof_type_w == 2'd2);
+    wire [3:0]  al_shift_w     = sos_al_w;
+
     huffman_decoder u_huf (
         .clk(aclk), .rst_n(aresetn), .soft_reset(softrst),
         .blk_start(h_blk_start_w), .dc_sel(h_dc_sel_w), .ac_sel(h_ac_sel_w),
         .dc_pred_in(h_dc_pred_in_w),
         .dc_pred_out(h_dc_pred_out_w), .dc_pred_upd(h_dc_pred_upd_w),
         .blk_done(h_blk_done_w), .blk_err(h_blk_err_w),
+        .dc_only_mode(dc_only_mode_w),     // Phase 16c
+        .al_shift(al_shift_w),             // Phase 16c
         .peek_win(peek_win_w), .peek_valid_any(peek_valid_any_w),
         .peek_bits_avail(bit_cnt_w),
         .consume_n(consume_n_w), .consume_req(consume_req_w),
@@ -436,11 +442,14 @@ module jpeg_axi_top (
     );
 
     // ---------------- Output FIFO (Phase 13: DW=48) -----------------
+    // Phase 16c: SOF2 error gate — 在 sof2_err_r 置位后阻断像素向外输出，
+    // 保证 errout 测试能观察到 "UNSUP_SOF && no pixels"。
     wire out_fifo_empty, out_fifo_full;
+    wire po_tvalid_gated = po_tvalid & ~sof2_gate_err;
     axi_stream_fifo #(.DW(48), .UW(1), .DEPTH(32)) u_out_fifo (
         .clk(aclk), .rst_n(aresetn), .flush(softrst),
         .s_tdata(po_tdata),  .s_tuser(po_tuser),
-        .s_tlast(po_tlast),  .s_tvalid(po_tvalid),
+        .s_tlast(po_tlast),  .s_tvalid(po_tvalid_gated),
         .s_tready(po_tready),
         .m_tdata(m_px_tdata),.m_tuser(m_px_tuser),
         .m_tlast(m_px_tlast),.m_tvalid(m_px_tvalid),
@@ -507,8 +516,30 @@ module jpeg_axi_top (
         else if (frame_done_seq_w) busy_r <= 1'b0;
     end
 
+    // Phase 16c: SOF2 运行时 gate — 在 header_done 脉冲时 latch
+    // 1) DRI>0：progressive + restart 留给 Phase 17
+    // 2) Al>0：successive approximation / 多扫描进度 scans 留给 Phase 18。
+    //    Phase 16c 只接 Al=0 的单扫描 DC-only。libjpeg 默认 progressive 脚本
+    //    首扫描 Al=1，因此此 gate 也同时拦下所有默认多扫描文件。
+    // 3) 多扫描保险丝：若 data 模式里再出现 SOS marker 也置错（冗余兜底）。
+    reg sof2_err_r;
+    always @(posedge aclk or negedge aresetn) begin
+        if (!aresetn)           sof2_err_r <= 1'b0;
+        else if (softrst)       sof2_err_r <= 1'b0;
+        else begin
+            if (header_done_w && sof_type_w == 2'd2 &&
+                (dri_interval_w != 16'd0 || sos_al_w != 4'd0))
+                sof2_err_r <= 1'b1;
+            if (sof_type_w == 2'd2 && marker_detected_w && marker_byte_w == 8'hDA)
+                sof2_err_r <= 1'b1;
+        end
+    end
+    wire sof2_gate_err = sof2_err_r;
+
     // 合并错误：header_parser.err 与 huffman_decoder.blk_err (ERR_BAD_HUFFMAN 位)
-    wire [8:0] err_comb = err_w | ({8'd0, h_blk_err_w} << `ERR_BAD_HUFFMAN);
+    wire [8:0] err_comb = err_w
+                         | ({8'd0, h_blk_err_w}  << `ERR_BAD_HUFFMAN)
+                         | ({8'd0, sof2_gate_err} << `ERR_UNSUP_SOF);
 
     // err 事件：err_comb 任意位从 0→1
     reg [8:0] err_prev;

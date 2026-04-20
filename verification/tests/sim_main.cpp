@@ -488,10 +488,10 @@ static DiffResult diff_one(const std::vector<uint8_t>& jpeg,
 
     R.rtl_ok = (err == 0);
 
-    // Phase 16a: CSR SCAN_PARAMS sanity check. For baseline (SOF0/SOF1) the
-    // parser must have captured {Ss=0, Se=63, Ah=0, Al=0} and SofType matching
-    // precision. Any deviation would indicate the new plumbing mis-routed
-    // bits — fail the test so drift is caught immediately.
+    // Phase 16a/16c: CSR SCAN_PARAMS sanity check.
+    //   baseline (SOF0/SOF1): {Ss=0, Se=63, Ah=0, Al=0, SofType=precision}
+    //   SOF2 DC-only (Phase 16c): {Ss=0, Se=0,  Ah=0, Al=任意, SofType=2}
+    // 任何偏离都算 TB 级失败，用合成 bit 8 标记。
     if (R.rtl_ok) {
         uint32_t sp = csr.read32(REG_SCAN_PARAMS);
         uint32_t ss_r       =  sp        & 0x3Fu;
@@ -499,10 +499,18 @@ static DiffResult diff_one(const std::vector<uint8_t>& jpeg,
         uint32_t ah_r       = (sp >> 16) & 0x0Fu;
         uint32_t al_r       = (sp >> 20) & 0x0Fu;
         uint32_t sof_type_r = (sp >> 24) & 0x03u;
-        uint32_t want_sof   = (golden.precision == 12) ? 1u : 0u;
-        if (ss_r != 0u || se_r != 63u || ah_r != 0u || al_r != 0u || sof_type_r != want_sof) {
+        bool ok;
+        if (sof_type_r == 2u) {
+            // Phase 16c: DC-only 单扫描 — Ss=Se=0, Ah=0, Al 任意
+            ok = (ss_r == 0u && se_r == 0u && ah_r == 0u);
+        } else {
+            uint32_t want_sof = (golden.precision == 12) ? 1u : 0u;
+            ok = (ss_r == 0u && se_r == 63u && ah_r == 0u && al_r == 0u &&
+                  sof_type_r == want_sof);
+        }
+        if (!ok) {
             std::fprintf(stderr,
-                "  SCAN_PARAMS mismatch: Ss=%u Se=%u Ah=%u Al=%u SofType=%u (want baseline)\n",
+                "  SCAN_PARAMS mismatch: Ss=%u Se=%u Ah=%u Al=%u SofType=%u\n",
                 ss_r, se_r, ah_r, al_r, sof_type_r);
             R.rtl_ok = false;
             R.err_code |= 0x100u;  // synthetic bit 8 to signal TB-level fail

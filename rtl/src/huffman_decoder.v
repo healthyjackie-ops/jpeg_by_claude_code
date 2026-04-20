@@ -21,6 +21,12 @@ module huffman_decoder (
     output reg         blk_done,
     output reg         blk_err,
 
+    // Phase 16c: SOF2 DC-only mode
+    // dc_only_mode=1 时跳过 AC 解码并把 coef[0] 左移 al_shift 位写回。
+    // 其余 63 个 AC 位置隐式为 0 (由下游 coef_start 清零)。
+    input  wire        dc_only_mode,
+    input  wire [3:0]  al_shift,
+
     // Bit window (bitstream_unpack)
     input  wire [15:0] peek_win,
     input  wire        peek_valid_any,    // 至少 1 位可用
@@ -229,14 +235,22 @@ module huffman_decoder (
                 S_DC_WR: begin
                     coef_wr      <= 1'b1;
                     coef_nat_idx <= 6'd0;
-                    coef_val     <= dc_pred_r;
-                    // 准备 AC
-                    code_acc  <= 16'd0;
-                    l         <= 5'd1;
-                    ht_rd_ac  <= 1'b1;
-                    ht_rd_sel <= ac_sel;
-                    ht_rd_l   <= 5'd1;
-                    st        <= S_WAC;
+                    // Phase 16c: DC-only 模式应用 point transform (左移 Al 位)，
+                    // AC 路径整块跳过；下游 coef_start 已清零 63 个 AC 位。
+                    coef_val <= dc_only_mode ?
+                                (dc_pred_r <<< al_shift) :
+                                dc_pred_r;
+                    if (dc_only_mode) begin
+                        st <= S_DONE;
+                    end else begin
+                        // 准备 AC
+                        code_acc  <= 16'd0;
+                        l         <= 5'd1;
+                        ht_rd_ac  <= 1'b1;
+                        ht_rd_sel <= ac_sel;
+                        ht_rd_l   <= 5'd1;
+                        st        <= S_WAC;
+                    end
                 end
 
                 // ------------------------------------------------------ AC symbol

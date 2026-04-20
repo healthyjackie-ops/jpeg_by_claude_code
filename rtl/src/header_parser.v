@@ -278,11 +278,7 @@ module header_parser (
                     case (last_marker)
                         `MARKER_SOF0:  begin sof_type_o <= 2'd0; state <= S_LEN_HI; end
                         `MARKER_SOF1:  begin sof_type_o <= 2'd1; state <= S_LEN_HI; end  // Phase 13: extended sequential
-                        `MARKER_SOF2: begin                 // Phase 14: progressive — explicit recognize + error-out
-                            sof_type_o <= 2'd2;
-                            err[`ERR_UNSUP_SOF] <= 1'b1;
-                            state <= S_ERROR;
-                        end
+                        `MARKER_SOF2:  begin sof_type_o <= 2'd2; state <= S_LEN_HI; end  // Phase 16c: progressive — accept header; gate DC-only 在 top/SOS 层
                         `MARKER_SOF3: begin                 // Reserved: Wave 5 lossless — error-out
                             sof_type_o <= 2'd3;
                             err[`ERR_UNSUP_SOF] <= 1'b1;
@@ -328,6 +324,7 @@ module header_parser (
                         `MARKER_DHT:  begin                state <= S_DHT_TCTH; end
                         `MARKER_SOF0: begin sof_comp_idx <= 2'd0; state <= S_SOF_P;  end
                         `MARKER_SOF1: begin sof_comp_idx <= 2'd0; state <= S_SOF_P;  end  // Phase 13
+                        `MARKER_SOF2: begin sof_comp_idx <= 2'd0; state <= S_SOF_P;  end  // Phase 16c
                         `MARKER_SOS:  begin sos_comp_idx <= 2'd0; state <= S_SOS_NS; end
                         `MARKER_DRI:  begin state <= S_DRI_HI; end
                         default:      begin state <= S_SKIP; end
@@ -453,7 +450,8 @@ module header_parser (
 
                 // ------------------------------------------------------ SOF0/SOF1
                 S_SOF_P: if (beat) begin
-                    // Phase 13: accept P=8 (SOF0/SOF1) or P=12 (SOF1 only)
+                    // Phase 13: accept P=8 (SOF0/SOF1/SOF2) or P=12 (SOF1 only)
+                    // Phase 16c: SOF2 只接受 P=8 (12-bit progressive 超出本阶段范围)
                     if (byte_in == 8'd8) begin
                         precision_o <= 1'b0;
                         remain <= remain - 16'd1;
@@ -597,22 +595,42 @@ module header_parser (
                 end
                 S_SOS_SS: if (beat) begin
                     sos_ss_o <= byte_in[5:0];                          // Phase 16a: capture
+                    // SOF0/SOF1: Ss 必须 0。SOF2 (Phase 16c) 单扫描 DC-only 也是 Ss=0，
+                    // AC 扫描留给 Phase 17，因此此处统一要求 Ss=0。
                     if (byte_in != 8'd0) begin err[`ERR_UNSUP_SOF] <= 1'b1; state <= S_ERROR; end
                     else begin remain <= remain - 16'd1; state <= S_SOS_SE; end
                 end
                 S_SOS_SE: if (beat) begin
                     sos_se_o <= byte_in[5:0];                          // Phase 16a: capture
-                    if (byte_in != 8'd63) begin err[`ERR_UNSUP_SOF] <= 1'b1; state <= S_ERROR; end
-                    else begin remain <= remain - 16'd1; state <= S_SOS_AHAL; end
+                    // SOF0/SOF1 要求 Se=63 (full spectral)。
+                    // SOF2 Phase 16c DC-only 扫描要求 Se=0。其他取值留给 Phase 17。
+                    if (sof_type_o == 2'd2) begin
+                        if (byte_in != 8'd0) begin err[`ERR_UNSUP_SOF] <= 1'b1; state <= S_ERROR; end
+                        else begin remain <= remain - 16'd1; state <= S_SOS_AHAL; end
+                    end else begin
+                        if (byte_in != 8'd63) begin err[`ERR_UNSUP_SOF] <= 1'b1; state <= S_ERROR; end
+                        else begin remain <= remain - 16'd1; state <= S_SOS_AHAL; end
+                    end
                 end
                 S_SOS_AHAL: if (beat) begin
                     sos_ah_o <= byte_in[7:4];                          // Phase 16a: capture
                     sos_al_o <= byte_in[3:0];
-                    if (byte_in != 8'd0) begin err[`ERR_UNSUP_SOF] <= 1'b1; state <= S_ERROR; end
-                    else begin
-                        header_done <= 1'b1;
-                        data_mode   <= 1'b1;
-                        state <= S_DATA;
+                    // SOF0/SOF1: AhAl 必须为 0。
+                    // SOF2 Phase 16c：Ah=0 (第一扫描)，Al 取任意值作 point transform 左移量。
+                    if (sof_type_o == 2'd2) begin
+                        if (byte_in[7:4] != 4'd0) begin err[`ERR_UNSUP_SOF] <= 1'b1; state <= S_ERROR; end
+                        else begin
+                            header_done <= 1'b1;
+                            data_mode   <= 1'b1;
+                            state <= S_DATA;
+                        end
+                    end else begin
+                        if (byte_in != 8'd0) begin err[`ERR_UNSUP_SOF] <= 1'b1; state <= S_ERROR; end
+                        else begin
+                            header_done <= 1'b1;
+                            data_mode   <= 1'b1;
+                            state <= S_DATA;
+                        end
                     end
                 end
 
