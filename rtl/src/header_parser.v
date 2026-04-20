@@ -43,19 +43,22 @@ module header_parser (
     output reg  [1:0]  comp0_qt,       // Y quant-table id
     output reg  [1:0]  comp1_qt,
     output reg  [1:0]  comp2_qt,
+    output reg  [1:0]  comp3_qt,       // Phase 12: CMYK K quant-table id
     output reg  [1:0]  comp0_td,       // DC Huffman tbl idx
     output reg  [1:0]  comp1_td,
     output reg  [1:0]  comp2_td,
+    output reg  [1:0]  comp3_td,       // Phase 12: CMYK K DC tbl idx
     output reg  [1:0]  comp0_ta,       // AC Huffman tbl idx
     output reg  [1:0]  comp1_ta,
     output reg  [1:0]  comp2_ta,
+    output reg  [1:0]  comp3_ta,       // Phase 12: CMYK K AC tbl idx
 
     output reg         header_done,    // SOS 结束
     output reg         data_mode,      // 1=进入熵编码数据段
     output reg         frame_done,     // 遇 EOI
     output reg  [15:0] dri_interval,   // Phase 7: DRI 间隔 MCU 数（0=禁用）
-    output reg  [1:0]  num_components_o,// Phase 8: 1=grayscale, 3=YCbCr
-    output reg  [2:0]  chroma_mode_o,  // Phase 11b: 0=GRAY,1=420,2=444,3=422,4=440,5=411
+    output reg  [2:0]  num_components_o,// Phase 12: 1=gray, 3=YCbCr, 4=CMYK (3b for Nf=4)
+    output reg  [2:0]  chroma_mode_o,  // Phase 12: 0=GRAY,1=420,2=444,3=422,4=440,5=411,6=CMYK
     output reg  [8:0]  err             // sticky
 );
 
@@ -177,12 +180,12 @@ module header_parser (
             dqt_k <= 6'd0; dht_l <= 5'd0; dht_total <= 9'd0; dht_idx <= 9'd0;
             sof_comp_idx <= 2'd0; sos_comp_idx <= 2'd0;
             img_width <= 16'd0; img_height <= 16'd0;
-            comp0_qt <= 2'd0; comp1_qt <= 2'd0; comp2_qt <= 2'd0;
-            comp0_td <= 2'd0; comp1_td <= 2'd0; comp2_td <= 2'd0;
-            comp0_ta <= 2'd0; comp1_ta <= 2'd0; comp2_ta <= 2'd0;
+            comp0_qt <= 2'd0; comp1_qt <= 2'd0; comp2_qt <= 2'd0; comp3_qt <= 2'd0;
+            comp0_td <= 2'd0; comp1_td <= 2'd0; comp2_td <= 2'd0; comp3_td <= 2'd0;
+            comp0_ta <= 2'd0; comp1_ta <= 2'd0; comp2_ta <= 2'd0; comp3_ta <= 2'd0;
             header_done <= 1'b0; data_mode <= 1'b0; frame_done <= 1'b0;
             dri_interval <= 16'd0;
-            num_components_o <= 2'd3;
+            num_components_o <= 3'd3;
             chroma_mode_o <= 3'd1;
             err <= 9'd0;
             qt_wr <= 1'b0; qt_sel <= 2'd0; qt_idx <= 6'd0; qt_val <= 8'd0;
@@ -195,7 +198,7 @@ module header_parser (
             state <= S_IDLE;
             header_done <= 1'b0; data_mode <= 1'b0; frame_done <= 1'b0;
             dri_interval <= 16'd0;
-            num_components_o <= 2'd3;
+            num_components_o <= 3'd3;
             chroma_mode_o <= 3'd1;
             err <= 9'd0;
             qt_wr <= 1'b0; ht_bits_wr <= 1'b0; ht_val_wr <= 1'b0;
@@ -217,7 +220,7 @@ module header_parser (
                         data_mode   <= 1'b0;
                         frame_done  <= 1'b0;
                         dri_interval <= 16'd0;
-                        num_components_o <= 2'd3;
+                        num_components_o <= 3'd3;
                         chroma_mode_o <= 3'd1;
                         err         <= 9'd0;
                     end
@@ -418,18 +421,21 @@ module header_parser (
                     // 尺寸检查在下个 cycle 校验
                 end
                 S_SOF_NF: if (beat) begin
-                    // Phase 8: accept Nf=1 (grayscale) or Nf=3 (4:2:0 / 4:4:4)
-                    if (byte_in != 8'd3 && byte_in != 8'd1) begin
+                    // Phase 12: accept Nf=1 (gray), 3 (YCbCr), 4 (CMYK)
+                    if (byte_in != 8'd4 && byte_in != 8'd3 && byte_in != 8'd1) begin
                         err[`ERR_UNSUP_CHROMA] <= 1'b1; state <= S_ERROR;
                     end else if (img_width == 16'd0 || img_height == 16'd0 ||
                                  img_width > 16'd4096 || img_height > 16'd4096) begin
                         // Phase 6: 非 16 对齐尺寸由 decoder 自行裁剪，不再拒绝
                         err[`ERR_SIZE_OOR] <= 1'b1; state <= S_ERROR;
                     end else begin
-                        num_components_o <= byte_in[1:0];
-                        // Phase 9: Nf=1 -> GRAY; Nf=3 待 comp0 HV 再判定 420 vs 444
+                        num_components_o <= byte_in[2:0];
+                        // Phase 9: Nf=1 -> GRAY; Nf=3 待 comp0 HV 再判定 420/444/422/440/411
+                        // Phase 12: Nf=4 -> CMYK (要求所有分量 H=V=1，在 COMP_HV 校验)
                         if (byte_in == 8'd1)
                             chroma_mode_o <= 3'd0;   // GRAY
+                        else if (byte_in == 8'd4)
+                            chroma_mode_o <= 3'd6;   // CMYK
                         remain <= remain - 16'd1;
                         sof_comp_idx <= 2'd0;
                         state <= S_SOF_COMP_ID;
@@ -444,7 +450,10 @@ module header_parser (
                     // Phase 8: Nf=1 grayscale → Y only H=1,V=1
                     // Phase 9: Nf=3 → comp0 可为 0x22 (4:2:0) 或 0x11 (4:4:4);
                     //                  comp1/2 必须 0x11
-                    if (num_components_o == 2'd1) begin
+                    // Phase 12: Nf=4 → CMYK 所有 4 分量必须 0x11
+                    if (num_components_o == 3'd1) begin
+                        if (byte_in != 8'h11) begin err[`ERR_UNSUP_CHROMA] <= 1'b1; state <= S_ERROR; end
+                    end else if (num_components_o == 3'd4) begin
                         if (byte_in != 8'h11) begin err[`ERR_UNSUP_CHROMA] <= 1'b1; state <= S_ERROR; end
                     end else begin
                         case (sof_comp_idx)
@@ -476,11 +485,11 @@ module header_parser (
                         2'd0: comp0_qt <= byte_in[1:0];
                         2'd1: comp1_qt <= byte_in[1:0];
                         2'd2: comp2_qt <= byte_in[1:0];
-                        default: ;
+                        2'd3: comp3_qt <= byte_in[1:0];
                     endcase
                     remain <= remain - 16'd1;
-                    // Phase 8: 终止条件按 num_components_o
-                    if (sof_comp_idx == num_components_o - 2'd1) begin
+                    // Phase 12: 终止条件按 num_components_o (支持 Nf=4 CMYK)
+                    if ({1'b0, sof_comp_idx} == num_components_o - 3'd1) begin
                         state <= S_FIND_FF;
                     end else begin
                         sof_comp_idx <= sof_comp_idx + 2'd1;
@@ -490,8 +499,8 @@ module header_parser (
 
                 // ------------------------------------------------------ SOS
                 S_SOS_NS: if (beat) begin
-                    // Phase 8: Ns must match Nf from SOF (1 or 3)
-                    if (byte_in[7:0] != {6'd0, num_components_o}) begin
+                    // Phase 12: Ns must match Nf from SOF (1, 3, or 4)
+                    if (byte_in[7:0] != {5'd0, num_components_o}) begin
                         err[`ERR_UNSUP_CHROMA] <= 1'b1; state <= S_ERROR;
                     end else begin
                         sos_comp_idx <= 2'd0;
@@ -509,10 +518,10 @@ module header_parser (
                         2'd0: begin comp0_td <= byte_in[5:4]; comp0_ta <= byte_in[1:0]; end
                         2'd1: begin comp1_td <= byte_in[5:4]; comp1_ta <= byte_in[1:0]; end
                         2'd2: begin comp2_td <= byte_in[5:4]; comp2_ta <= byte_in[1:0]; end
-                        default: ;
+                        2'd3: begin comp3_td <= byte_in[5:4]; comp3_ta <= byte_in[1:0]; end
                     endcase
                     remain <= remain - 16'd1;
-                    if (sos_comp_idx == num_components_o - 2'd1) begin
+                    if ({1'b0, sos_comp_idx} == num_components_o - 3'd1) begin
                         state <= S_SOS_SS;
                     end else begin
                         sos_comp_idx <= sos_comp_idx + 2'd1;

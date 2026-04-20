@@ -16,17 +16,20 @@ module block_sequencer (
     input  wire        frame_start,    // header_parser.header_done 脉冲
     input  wire [15:0] img_width,
     input  wire [15:0] img_height,
-    input  wire [1:0]  num_components,// Phase 8: 1=grayscale, 3=YCbCr
-    input  wire [2:0]  chroma_mode,   // Phase 11b: 0=GRAY,1=420,2=444,3=422,4=440,5=411
+    input  wire [2:0]  num_components,// Phase 12: 1=gray, 3=YCbCr, 4=CMYK
+    input  wire [2:0]  chroma_mode,   // Phase 12: 0=GRAY,1=420,2=444,3=422,4=440,5=411,6=CMYK
     input  wire [1:0]  y_qt_sel,
     input  wire [1:0]  cb_qt_sel,
     input  wire [1:0]  cr_qt_sel,
+    input  wire [1:0]  k_qt_sel,       // Phase 12: CMYK K quant
     input  wire [1:0]  y_dc_sel,
     input  wire [1:0]  y_ac_sel,
     input  wire [1:0]  cb_dc_sel,
     input  wire [1:0]  cb_ac_sel,
     input  wire [1:0]  cr_dc_sel,
     input  wire [1:0]  cr_ac_sel,
+    input  wire [1:0]  k_dc_sel,       // Phase 12: CMYK K DC tbl
+    input  wire [1:0]  k_ac_sel,       // Phase 12: CMYK K AC tbl
 
     // 到 huffman_decoder
     output reg         h_blk_start,
@@ -61,6 +64,7 @@ module block_sequencer (
     input  wire signed [15:0] dcp_y,
     input  wire signed [15:0] dcp_cb,
     input  wire signed [15:0] dcp_cr,
+    input  wire signed [15:0] dcp_k,   // Phase 12: CMYK K predictor
 
     // MCU 完毕：把 mcu_buffer → line_buffer 的搬运控制
     output reg         mcu_copy_start,
@@ -87,20 +91,21 @@ module block_sequencer (
     wire is_422  = (chroma_mode == 3'd3);
     wire is_440  = (chroma_mode == 3'd4);
     wire is_411  = (chroma_mode == 3'd5);
-    // MCU 宽度 8: GRAY/444/440; MCU 宽度 16: 420/422; MCU 宽度 32: 411
-    // MCU 高度 8: GRAY/444/422/411; MCU 高度 16: 420/440
-    wire mcu_w8  = is_gray | is_444 | is_440;
+    wire is_cmyk = (chroma_mode == 3'd6);  // Phase 12: CMYK Nf=4 all 1x1
+    // MCU 宽度 8: GRAY/444/440/CMYK; MCU 宽度 16: 420/422; MCU 宽度 32: 411
+    // MCU 高度 8: GRAY/444/422/411/CMYK; MCU 高度 16: 420/440
+    wire mcu_w8  = is_gray | is_444 | is_440 | is_cmyk;
     wire mcu_w32 = is_411;
-    wire mcu_h8  = is_gray | is_444 | is_422 | is_411;
+    wire mcu_h8  = is_gray | is_444 | is_422 | is_411 | is_cmyk;
     wire [15:0] mcu_cols = mcu_w32 ? ((img_width  + 16'd31) >> 5) :
                            mcu_w8  ? ((img_width  + 16'd7)  >> 3) :
                                      ((img_width  + 16'd15) >> 4);
     wire [15:0] mcu_rows = mcu_h8 ? ((img_height + 16'd7)  >> 3) :
                                     ((img_height + 16'd15) >> 4);
-    // block 数: GRAY→1, 444→3, 422/440→4, 420/411→6
-    wire [2:0] last_blk = is_gray         ? 3'd0 :
-                          is_444          ? 3'd2 :
-                          (is_422|is_440) ? 3'd3 : 3'd5;
+    // block 数: GRAY→1, 444→3, 422/440/CMYK→4, 420/411→6
+    wire [2:0] last_blk = is_gray                 ? 3'd0 :
+                          is_444                  ? 3'd2 :
+                          (is_422|is_440|is_cmyk) ? 3'd3 : 3'd5;
     wire _unused_ncomp = |num_components;  // 保留端口以备 sanity check
     wire _unused_mode  = is_420;            // 保留 is_420 wire 以便未来加 sanity check
 
@@ -130,7 +135,37 @@ module block_sequencer (
     //         的 0..3=Y,4=Cb,5=Cr 语义)，444 下 Y 用 0、Cb 用 4、Cr 用 5 以保持
     //         mcu_buffer 接口不变。
     always @(*) begin
-        if (is_444) begin
+        if (is_cmyk) begin
+            // Phase 12: CMYK Nf=4, all 1x1. blk_idx 0=C, 1=M, 2=Y_cmyk, 3=K.
+            // cur_blk_type 映射到 mcu_buffer 的 4 个 8x8 子 buffer：
+            // 0=C (ybuf Y0 slot), 4=M (cbbuf), 5=Y_cmyk (crbuf), 6=K (new kbuf)
+            case (blk_idx)
+                3'd0: begin
+                    h_dc_sel   = y_dc_sel;   h_ac_sel   = y_ac_sel;
+                    qt_sel_out = y_qt_sel;   dcp_sel    = 2'd0;
+                    h_dc_pred_in = dcp_y;
+                    cur_blk_type = 3'd0;     // C
+                end
+                3'd1: begin
+                    h_dc_sel   = cb_dc_sel;  h_ac_sel   = cb_ac_sel;
+                    qt_sel_out = cb_qt_sel;  dcp_sel    = 2'd1;
+                    h_dc_pred_in = dcp_cb;
+                    cur_blk_type = 3'd4;     // M
+                end
+                3'd2: begin
+                    h_dc_sel   = cr_dc_sel;  h_ac_sel   = cr_ac_sel;
+                    qt_sel_out = cr_qt_sel;  dcp_sel    = 2'd2;
+                    h_dc_pred_in = dcp_cr;
+                    cur_blk_type = 3'd5;     // Y_cmyk
+                end
+                default: begin // blk_idx == 3
+                    h_dc_sel   = k_dc_sel;   h_ac_sel   = k_ac_sel;
+                    qt_sel_out = k_qt_sel;   dcp_sel    = 2'd3;
+                    h_dc_pred_in = dcp_k;
+                    cur_blk_type = 3'd6;     // K
+                end
+            endcase
+        end else if (is_444) begin
             case (blk_idx)
                 3'd0: begin
                     h_dc_sel   = y_dc_sel;   h_ac_sel   = y_ac_sel;

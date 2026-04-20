@@ -45,8 +45,8 @@ module jpeg_axi_top (
     output wire        s_bs_tready,
     input  wire        s_bs_tlast,
 
-    // ---- AXI-Stream output pixel ------------------------------------
-    output wire [23:0] m_px_tdata,
+    // ---- AXI-Stream output pixel (Phase 12: 32b - CMYK {C,M,Y,K}) --
+    output wire [31:0] m_px_tdata,
     output wire        m_px_tvalid,
     input  wire        m_px_tready,
     output wire        m_px_tuser,
@@ -109,9 +109,9 @@ module jpeg_axi_top (
     wire [7:0]  ht_bits_val_w, ht_val_idx_w, ht_val_data_w;
     wire        ht_build_start_w;
     wire [15:0] img_w_w, img_h_w;
-    wire [1:0]  comp0_qt, comp1_qt, comp2_qt;
-    wire [1:0]  comp0_td, comp1_td, comp2_td;
-    wire [1:0]  comp0_ta, comp1_ta, comp2_ta;
+    wire [1:0]  comp0_qt, comp1_qt, comp2_qt, comp3_qt;
+    wire [1:0]  comp0_td, comp1_td, comp2_td, comp3_td;
+    wire [1:0]  comp0_ta, comp1_ta, comp2_ta, comp3_ta;
     wire        header_done_w;
     wire        frame_done_hp;
     wire [8:0]  err_w;
@@ -119,13 +119,14 @@ module jpeg_axi_top (
     wire        restart_ack_w;      // Phase 7: block_seq → bitstream_unpack
     wire        dc_restart_w;       // Phase 7: block_seq → dc_predictor
     wire        align_req_w;        // Phase 7: block_seq → bitstream_unpack (drain shreg)
-    wire [1:0]  num_components_w;   // Phase 8: Nf (1=gray, 3=YCbCr)
-    wire [2:0]  chroma_mode_w;      // Phase 9/10/11a/11b: 0=GRAY,1=420,2=444,3=422,4=440,5=411
+    wire [2:0]  num_components_w;   // Phase 12: Nf (1=gray, 3=YCbCr, 4=CMYK)
+    wire [2:0]  chroma_mode_w;      // Phase 12: 0=GRAY,1=420,2=444,3=422,4=440,5=411,6=CMYK
     wire        is_grayscale_w = (chroma_mode_w == 3'd0);
     wire        is_444_w       = (chroma_mode_w == 3'd2);
     wire        is_422_w       = (chroma_mode_w == 3'd3);
     wire        is_440_w       = (chroma_mode_w == 3'd4);
     wire        is_411_w       = (chroma_mode_w == 3'd5);
+    wire        is_cmyk_w      = (chroma_mode_w == 3'd6);  // Phase 12
 
     header_parser u_hp (
         .clk(aclk), .rst_n(aresetn), .start(start_pulse),
@@ -140,9 +141,9 @@ module jpeg_axi_top (
         .ht_build_start(ht_build_start_w),
         .ht_build_done(ht_build_done_w),
         .img_width(img_w_w), .img_height(img_h_w),
-        .comp0_qt(comp0_qt), .comp1_qt(comp1_qt), .comp2_qt(comp2_qt),
-        .comp0_td(comp0_td), .comp1_td(comp1_td), .comp2_td(comp2_td),
-        .comp0_ta(comp0_ta), .comp1_ta(comp1_ta), .comp2_ta(comp2_ta),
+        .comp0_qt(comp0_qt), .comp1_qt(comp1_qt), .comp2_qt(comp2_qt), .comp3_qt(comp3_qt),
+        .comp0_td(comp0_td), .comp1_td(comp1_td), .comp2_td(comp2_td), .comp3_td(comp3_td),
+        .comp0_ta(comp0_ta), .comp1_ta(comp1_ta), .comp2_ta(comp2_ta), .comp3_ta(comp3_ta),
         .header_done(header_done_w), .data_mode(data_mode),
         .frame_done(frame_done_hp),
         .dri_interval(dri_interval_w),   // Phase 7
@@ -212,14 +213,15 @@ module jpeg_axi_top (
     wire [1:0]  dcp_sel_w;
     wire        dcp_wr_w;
     wire signed [15:0] dcp_wr_data_w;
-    wire signed [15:0] dcp_y_w, dcp_cb_w, dcp_cr_w;
+    wire signed [15:0] dcp_y_w, dcp_cb_w, dcp_cr_w, dcp_k_w;
     wire        dcp_new_frame = start_pulse | dc_restart_w;  // Phase 7: RSTn 清 DC 预测器
 
     dc_predictor u_dcp (
         .clk(aclk), .rst_n(aresetn), .soft_reset(softrst),
         .new_frame(dcp_new_frame),
         .comp_sel(dcp_sel_w), .wr_en(dcp_wr_w), .wr_data(dcp_wr_data_w),
-        .rd_data_y(dcp_y_w), .rd_data_cb(dcp_cb_w), .rd_data_cr(dcp_cr_w)
+        .rd_data_y(dcp_y_w), .rd_data_cb(dcp_cb_w), .rd_data_cr(dcp_cr_w),
+        .rd_data_k(dcp_k_w)
     );
 
     // ---------------- Huffman decoder -------------------------------
@@ -295,7 +297,7 @@ module jpeg_axi_top (
     wire [3:0]  mb_y_row_w;
     wire [4:0]  mb_y_col_w;            // Phase 11b: 5 位支持 0..31 (4:1:1 Y 32-wide)
     wire [2:0]  mb_c_row_w, mb_c_col_w;
-    wire [7:0]  mb_y_data_w, mb_cb_data_w, mb_cr_data_w;
+    wire [7:0]  mb_y_data_w, mb_cb_data_w, mb_cr_data_w, mb_k_data_w;
 
     wire mb_ready_nc;
     mcu_buffer u_mb (
@@ -306,11 +308,13 @@ module jpeg_axi_top (
         .blk_done_in(idct_blk_done_w),
         .blk_type(cur_blk_type_w),
         .is_411(is_411_w),                // Phase 11b: 4:1:1 Y 32x8 布局
+        .is_cmyk(is_cmyk_w),              // Phase 12
         .mcu_ready(mb_ready_nc), .mcu_consume(1'b0),
         .rd_y_row(mb_y_row_w), .rd_y_col(mb_y_col_w),
         .rd_y_data(mb_y_data_w),
         .rd_c_row(mb_c_row_w), .rd_c_col(mb_c_col_w),
-        .rd_cb_data(mb_cb_data_w), .rd_cr_data(mb_cr_data_w)
+        .rd_cb_data(mb_cb_data_w), .rd_cr_data(mb_cr_data_w),
+        .rd_k_data(mb_k_data_w)
     );
 
     // ---------------- Line buffer + mcu_line_copy -------------------
@@ -325,6 +329,10 @@ module jpeg_axi_top (
     wire [2:0]  lb_c_row_w;
     wire [11:0] lb_c_col_w;            // Phase 9: 4:4:4 需 12b chroma 地址
     wire [7:0]  lb_cb_data_w, lb_cr_data_w;
+    wire        lb_k_wr_w;              // Phase 12
+    wire [2:0]  lb_k_row_w;
+    wire [11:0] lb_k_col_w;
+    wire [7:0]  lb_k_data_w;
 
     mcu_line_copy u_lc (
         .clk(aclk), .rst_n(aresetn), .soft_reset(softrst),
@@ -334,21 +342,27 @@ module jpeg_axi_top (
         .is_422(is_422_w),                // Phase 10
         .is_440(is_440_w),                // Phase 11a
         .is_411(is_411_w),                // Phase 11b
+        .is_cmyk(is_cmyk_w),              // Phase 12
         .mb_y_row(mb_y_row_w), .mb_y_col(mb_y_col_w),
         .mb_c_row(mb_c_row_w), .mb_c_col(mb_c_col_w),
         .mb_y_data(mb_y_data_w),
         .mb_cb_data(mb_cb_data_w), .mb_cr_data(mb_cr_data_w),
+        .mb_k_data(mb_k_data_w),
         .lb_y_wr(lb_y_wr_w), .lb_y_row(lb_y_row_w), .lb_y_col(lb_y_col_w),
         .lb_y_data(lb_y_data_w),
         .lb_c_wr(lb_c_wr_w), .lb_c_row(lb_c_row_w), .lb_c_col(lb_c_col_w),
-        .lb_cb_data(lb_cb_data_w), .lb_cr_data(lb_cr_data_w)
+        .lb_cb_data(lb_cb_data_w), .lb_cr_data(lb_cr_data_w),
+        .lb_k_wr(lb_k_wr_w), .lb_k_row(lb_k_row_w), .lb_k_col(lb_k_col_w),
+        .lb_k_data(lb_k_data_w)
     );
 
     wire [3:0]  po_rd_y_row_w;
     wire [11:0] po_rd_y_col_w;
     wire [2:0]  po_rd_c_row_w;
     wire [11:0] po_rd_c_col_w;         // Phase 9: 4:4:4 需 12b chroma 地址
-    wire [7:0]  po_rd_y_data_w, po_rd_cb_data_w, po_rd_cr_data_w;
+    wire [2:0]  po_rd_k_row_w;
+    wire [11:0] po_rd_k_col_w;
+    wire [7:0]  po_rd_y_data_w, po_rd_cb_data_w, po_rd_cr_data_w, po_rd_k_data_w;
 
     line_buffer u_lb (
         .clk(aclk), .rst_n(aresetn), .soft_reset(softrst),
@@ -357,18 +371,22 @@ module jpeg_axi_top (
         .wr_c_en(lb_c_wr_w), .wr_c_row(lb_c_row_w),
         .wr_c_col_abs(lb_c_col_w),
         .wr_cb_data(lb_cb_data_w), .wr_cr_data(lb_cr_data_w),
+        .wr_k_en(lb_k_wr_w), .wr_k_row(lb_k_row_w),
+        .wr_k_col_abs(lb_k_col_w), .wr_k_data(lb_k_data_w),
         .rd_y_row(po_rd_y_row_w), .rd_y_col(po_rd_y_col_w),
         .rd_c_row(po_rd_c_row_w), .rd_c_col(po_rd_c_col_w),
+        .rd_k_row(po_rd_k_row_w), .rd_k_col(po_rd_k_col_w),
         .rd_y_data(po_rd_y_data_w),
-        .rd_cb_data(po_rd_cb_data_w), .rd_cr_data(po_rd_cr_data_w)
+        .rd_cb_data(po_rd_cb_data_w), .rd_cr_data(po_rd_cr_data_w),
+        .rd_k_data(po_rd_k_data_w)
     );
 
     // ---------------- Pixel out (raster → FIFO) --------------------
     wire        row_ready_w, row_done_w;
     wire        is_first_row_w, is_last_row_w;
 
-    // pixel_out → output FIFO slave 接口
-    wire [23:0] po_tdata;
+    // pixel_out → output FIFO slave 接口 (Phase 12: 32b)
+    wire [31:0] po_tdata;
     wire        po_tvalid;
     wire        po_tready;
     wire        po_tuser;
@@ -384,18 +402,21 @@ module jpeg_axi_top (
         .is_422(is_422_w),             // Phase 10
         .is_440(is_440_w),             // Phase 11a
         .is_411(is_411_w),             // Phase 11b
+        .is_cmyk(is_cmyk_w),           // Phase 12
         .row_done(row_done_w),
         .rd_y_row(po_rd_y_row_w), .rd_y_col(po_rd_y_col_w),
         .rd_c_row(po_rd_c_row_w), .rd_c_col(po_rd_c_col_w),
+        .rd_k_row(po_rd_k_row_w), .rd_k_col(po_rd_k_col_w),
         .rd_y_data(po_rd_y_data_w),
         .rd_cb_data(po_rd_cb_data_w), .rd_cr_data(po_rd_cr_data_w),
+        .rd_k_data(po_rd_k_data_w),
         .tvalid(po_tvalid), .tready(po_tready), .tdata(po_tdata),
         .tuser_sof(po_tuser), .tlast(po_tlast)
     );
 
-    // ---------------- Output FIFO -----------------------------------
+    // ---------------- Output FIFO (Phase 12: DW=32) -----------------
     wire out_fifo_empty, out_fifo_full;
-    axi_stream_fifo #(.DW(24), .UW(1), .DEPTH(32)) u_out_fifo (
+    axi_stream_fifo #(.DW(32), .UW(1), .DEPTH(32)) u_out_fifo (
         .clk(aclk), .rst_n(aresetn), .flush(softrst),
         .s_tdata(po_tdata),  .s_tuser(po_tuser),
         .s_tlast(po_tlast),  .s_tvalid(po_tvalid),
@@ -414,12 +435,14 @@ module jpeg_axi_top (
         .clk(aclk), .rst_n(aresetn), .soft_reset(softrst),
         .frame_start(header_done_w),
         .img_width(img_w_w), .img_height(img_h_w),
-        .num_components(num_components_w),  // Phase 8
-        .chroma_mode(chroma_mode_w),        // Phase 9
+        .num_components(num_components_w),  // Phase 12: 3b
+        .chroma_mode(chroma_mode_w),        // Phase 12: 0..6
         .y_qt_sel(comp0_qt), .cb_qt_sel(comp1_qt), .cr_qt_sel(comp2_qt),
+        .k_qt_sel(comp3_qt),                // Phase 12
         .y_dc_sel(comp0_td), .y_ac_sel(comp0_ta),
         .cb_dc_sel(comp1_td), .cb_ac_sel(comp1_ta),
         .cr_dc_sel(comp2_td), .cr_ac_sel(comp2_ta),
+        .k_dc_sel(comp3_td), .k_ac_sel(comp3_ta),   // Phase 12
         .h_blk_start(h_blk_start_w), .h_dc_sel(h_dc_sel_w),
         .h_ac_sel(h_ac_sel_w),
         .h_dc_pred_in(h_dc_pred_in_w),
@@ -437,6 +460,7 @@ module jpeg_axi_top (
         .idct_blk_done(idct_blk_done_w),
         .dcp_sel(dcp_sel_w), .dcp_wr(dcp_wr_w), .dcp_wr_data(dcp_wr_data_w),
         .dcp_y(dcp_y_w), .dcp_cb(dcp_cb_w), .dcp_cr(dcp_cr_w),
+        .dcp_k(dcp_k_w),                   // Phase 12
         .mcu_copy_start(lc_start_w), .mcu_copy_done(lc_done_w),
         .mcu_col_idx(mcu_col_idx_from_seq),
         .row_ready(row_ready_w), .is_first_row_o(is_first_row_w),

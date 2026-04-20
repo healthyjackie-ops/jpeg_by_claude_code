@@ -193,7 +193,8 @@ static DiffResult diff_one(const std::vector<uint8_t>& jpeg,
                            const char* vcd_path = nullptr,
                            std::vector<uint8_t>* out_Y  = nullptr,
                            std::vector<uint8_t>* out_Cb = nullptr,
-                           std::vector<uint8_t>* out_Cr = nullptr) {
+                           std::vector<uint8_t>* out_Cr = nullptr,
+                           std::vector<uint8_t>* out_K  = nullptr) {
     DiffResult R;
 
     // --- Golden C decode --------------------------------------------------
@@ -229,8 +230,8 @@ static DiffResult diff_one(const std::vector<uint8_t>& jpeg,
     auto* d = tb->dut.get();
     d->m_px_tready = 1;
 
-    std::vector<uint8_t> rY, rCb, rCr;
-    rY.reserve(64 * 64); rCb.reserve(64 * 64); rCr.reserve(64 * 64);
+    std::vector<uint8_t> rY, rCb, rCr, rK;
+    rY.reserve(64 * 64); rCb.reserve(64 * 64); rCr.reserve(64 * 64); rK.reserve(64 * 64);
     uint32_t cur_row_len = 0;
     uint16_t rtl_w = 0;
     uint32_t rtl_rows = 0;
@@ -249,9 +250,10 @@ static DiffResult diff_one(const std::vector<uint8_t>& jpeg,
         // 1) pixel capture (pre-edge handshake fires at this tick)
         if (dd->m_px_tvalid && dd->m_px_tready) {
             uint32_t v = dd->m_px_tdata;
-            rY.push_back((v >> 16) & 0xFF);
-            rCb.push_back((v >> 8)  & 0xFF);
-            rCr.push_back((v >> 0)  & 0xFF);
+            rY.push_back((v >> 24) & 0xFF);
+            rCb.push_back((v >> 16) & 0xFF);
+            rCr.push_back((v >> 8)  & 0xFF);
+            rK.push_back((v >> 0)  & 0xFF);
             if (dd->m_px_tuser) saw_tuser = true;
             ++cur_row_len;
             if (dd->m_px_tlast) {
@@ -417,26 +419,41 @@ static DiffResult diff_one(const std::vector<uint8_t>& jpeg,
     R.match_geom = (w_reg == golden.width) && (h_reg == golden.height)
                    && (rY.size() == size_t(golden.width) * golden.height);
 
-    // Pixel compare (Y always; Cb/Cr only when 3-component 4:2:0 upsampled)
-    const bool is_gray = (golden.cb_plane == nullptr);
+    // Pixel compare
+    //   CMYK  (golden.c_plane != null): rY=C rCb=M rCr=Y_cmyk rK=K
+    //   Gray  (golden.cb_plane == null): rCb/rCr are 0x80 padding, rK=0
+    //   YCbCr (else): rY/rCb/rCr from golden
+    const bool is_cmyk = (golden.c_plane != nullptr);
+    const bool is_gray = (!is_cmyk && golden.cb_plane == nullptr);
     if (R.match_geom) {
         for (size_t i = 0; i < rY.size(); ++i) {
-            uint8_t gy  = golden.y_plane[i];
-            uint32_t dy = std::abs(int(rY[i]) - int(gy));
-            if (dy > R.max_diff_y) R.max_diff_y = dy;
-            if (!is_gray) {
-                uint8_t gcb = golden.cb_plane[i];
-                uint8_t gcr = golden.cr_plane[i];
-                uint32_t dcb = std::abs(int(rCb[i]) - int(gcb));
-                uint32_t dcr = std::abs(int(rCr[i]) - int(gcr));
-                uint32_t dc = std::max(dcb, dcr);
+            if (is_cmyk) {
+                uint32_t dc_c = std::abs(int(rY[i])  - int(golden.c_plane[i]));
+                uint32_t dc_m = std::abs(int(rCb[i]) - int(golden.m_plane[i]));
+                uint32_t dc_y = std::abs(int(rCr[i]) - int(golden.y_plane_cmyk[i]));
+                uint32_t dc_k = std::abs(int(rK[i])  - int(golden.k_plane[i]));
+                // Reuse max_diff_y for C, max_diff_c for M/Y/K combined
+                if (dc_c > R.max_diff_y) R.max_diff_y = dc_c;
+                uint32_t dc = std::max(dc_m, std::max(dc_y, dc_k));
                 if (dc > R.max_diff_c) R.max_diff_c = dc;
             } else {
-                // Phase 8: grayscale — RTL outputs Cb=Cr=0x80 padding
-                uint32_t dcb = std::abs(int(rCb[i]) - 0x80);
-                uint32_t dcr = std::abs(int(rCr[i]) - 0x80);
-                uint32_t dc = std::max(dcb, dcr);
-                if (dc > R.max_diff_c) R.max_diff_c = dc;
+                uint8_t gy  = golden.y_plane[i];
+                uint32_t dy = std::abs(int(rY[i]) - int(gy));
+                if (dy > R.max_diff_y) R.max_diff_y = dy;
+                if (!is_gray) {
+                    uint8_t gcb = golden.cb_plane[i];
+                    uint8_t gcr = golden.cr_plane[i];
+                    uint32_t dcb = std::abs(int(rCb[i]) - int(gcb));
+                    uint32_t dcr = std::abs(int(rCr[i]) - int(gcr));
+                    uint32_t dc = std::max(dcb, dcr);
+                    if (dc > R.max_diff_c) R.max_diff_c = dc;
+                } else {
+                    // grayscale — RTL outputs Cb=Cr=0x80 padding
+                    uint32_t dcb = std::abs(int(rCb[i]) - 0x80);
+                    uint32_t dcr = std::abs(int(rCr[i]) - 0x80);
+                    uint32_t dc = std::max(dcb, dcr);
+                    if (dc > R.max_diff_c) R.max_diff_c = dc;
+                }
             }
         }
     }
@@ -445,6 +462,7 @@ static DiffResult diff_one(const std::vector<uint8_t>& jpeg,
     if (out_Y)  *out_Y  = std::move(rY);
     if (out_Cb) *out_Cb = std::move(rCb);
     if (out_Cr) *out_Cr = std::move(rCr);
+    if (out_K)  *out_K  = std::move(rK);
     jpeg_free(&golden);
     // Leak TbCtx — cleaner than the mac libc++ thread teardown race.
     return R;

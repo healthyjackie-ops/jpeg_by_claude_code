@@ -25,20 +25,31 @@ module line_buffer #(
     input  wire [7:0]  wr_cb_data,
     input  wire [7:0]  wr_cr_data,
 
+    // Phase 12: CMYK K 写口 (8×MAX_W)
+    input  wire        wr_k_en,
+    input  wire [2:0]  wr_k_row,
+    input  wire [11:0] wr_k_col_abs,
+    input  wire [7:0]  wr_k_data,
+
     // 读侧 (raster)
     input  wire [3:0]  rd_y_row,
     input  wire [11:0] rd_y_col,
     input  wire [2:0]  rd_c_row,
     input  wire [11:0] rd_c_col,      // Phase 9: 扩宽至 12 位
+    input  wire [2:0]  rd_k_row,      // Phase 12
+    input  wire [11:0] rd_k_col,
     output wire [7:0]  rd_y_data,
     output wire [7:0]  rd_cb_data,
-    output wire [7:0]  rd_cr_data
+    output wire [7:0]  rd_cr_data,
+    output wire [7:0]  rd_k_data
 );
 
     // Phase 9: chroma 缓冲扩宽到 8 × MAX_W 以支持 4:4:4
+    // Phase 12: CMYK K 独立 8×MAX_W
     reg [7:0] ybuf  [0:16*MAX_W-1];
     reg [7:0] cbbuf [0:8*MAX_W-1];
     reg [7:0] crbuf [0:8*MAX_W-1];
+    reg [7:0] kbuf  [0:8*MAX_W-1];
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -50,12 +61,15 @@ module line_buffer #(
                 cbbuf[{wr_c_row, wr_c_col_abs}] <= wr_cb_data;
                 crbuf[{wr_c_row, wr_c_col_abs}] <= wr_cr_data;
             end
+            if (wr_k_en)
+                kbuf[{wr_k_row, wr_k_col_abs}] <= wr_k_data;
         end
     end
 
     assign rd_y_data  = ybuf[{rd_y_row, rd_y_col}];
     assign rd_cb_data = cbbuf[{rd_c_row, rd_c_col}];
     assign rd_cr_data = crbuf[{rd_c_row, rd_c_col}];
+    assign rd_k_data  = kbuf[{rd_k_row, rd_k_col}];
 
     // 防止 soft_reset 未使用告警
     wire _unused = soft_reset;

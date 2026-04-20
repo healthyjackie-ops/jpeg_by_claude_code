@@ -25,33 +25,37 @@ module mcu_buffer (
     input  wire        blk_done_in,
 
     // 控制：当前 block 类型 (由 block_sequencer 驱动)
-    //   0..3 = Y positions   4 = Cb   5 = Cr
+    //   0..3 = Y positions   4 = Cb   5 = Cr   6 = K (Phase 12 CMYK)
     input  wire [2:0]  blk_type,
     input  wire        is_411,         // Phase 11b: Y 布局为 32×8 横向 4 块
+    input  wire        is_cmyk,        // Phase 12: CMYK 模式 (最后一块为 K)
 
     // MCU 输出就绪 & 握手
     output reg         mcu_ready,
     input  wire        mcu_consume,    // 高电平时允许输出
 
-    // 读取 MCU 内容 (Y 最大 32×16, Cb 8×8, Cr 8×8) —— 按 (row, col) 地址读
+    // 读取 MCU 内容 (Y 最大 32×16, Cb 8×8, Cr 8×8, K 8×8) —— 按 (row, col) 地址读
     input  wire [3:0]  rd_y_row,       // 0..15
     input  wire [4:0]  rd_y_col,       // 0..31 (Phase 11b: 32 列支持)
     output wire [7:0]  rd_y_data,
     input  wire [2:0]  rd_c_row,       // 0..7
     input  wire [2:0]  rd_c_col,
     output wire [7:0]  rd_cb_data,
-    output wire [7:0]  rd_cr_data
+    output wire [7:0]  rd_cr_data,
+    output wire [7:0]  rd_k_data       // Phase 12: CMYK K 读口
 );
 
     // Y: 32×16 = 512 bytes (支持 4:1:1 32-wide 和 4:2:0 16×16)
     reg [7:0] ybuf [0:511];
-    // Cb, Cr: 8×8 = 64 bytes each
+    // Cb, Cr, K: 8×8 = 64 bytes each
     reg [7:0] cbbuf [0:63];
     reg [7:0] crbuf [0:63];
+    reg [7:0] kbuf  [0:63];
 
     assign rd_y_data  = ybuf[{rd_y_row, rd_y_col}];
     assign rd_cb_data = cbbuf[{rd_c_row, rd_c_col}];
     assign rd_cr_data = crbuf[{rd_c_row, rd_c_col}];
+    assign rd_k_data  = kbuf[{rd_c_row, rd_c_col}];
 
     // Y block 在 32×16 内的偏移（行偏移 0/8，列偏移 0/8/16/24）
     // 4:2:0 (!is_411): blk_type[1]=row bit (0=top,1=bot); blk_type[0]=col bit
@@ -98,16 +102,28 @@ module mcu_buffer (
                     crbuf[{pix_row, 3'd6}] <= pix6;
                     crbuf[{pix_row, 3'd7}] <= pix7;
                 end
+                3'd6: begin // Phase 12: CMYK K plane
+                    kbuf[{pix_row, 3'd0}] <= pix0;
+                    kbuf[{pix_row, 3'd1}] <= pix1;
+                    kbuf[{pix_row, 3'd2}] <= pix2;
+                    kbuf[{pix_row, 3'd3}] <= pix3;
+                    kbuf[{pix_row, 3'd4}] <= pix4;
+                    kbuf[{pix_row, 3'd5}] <= pix5;
+                    kbuf[{pix_row, 3'd6}] <= pix6;
+                    kbuf[{pix_row, 3'd7}] <= pix7;
+                end
                 default: ;
             endcase
         end
     end
 
     // mcu_ready FF — keep async reset
+    // Phase 12: YCbCr/GRAY/etc. 在 blk_type=5 (Cr) 末尾触发；CMYK 在 blk_type=6 (K) 末尾触发
+    wire mcu_last_blk = is_cmyk ? (blk_type == 3'd6) : (blk_type == 3'd5);
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n)               mcu_ready <= 1'b0;
         else if (soft_reset)      mcu_ready <= 1'b0;
-        else if (blk_done_in && blk_type == 3'd5)
+        else if (blk_done_in && mcu_last_blk)
                                   mcu_ready <= 1'b1;
         else if (mcu_consume)     mcu_ready <= 1'b0;
     end

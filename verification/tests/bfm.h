@@ -172,12 +172,15 @@ private:
 // ---------------------------------------------------------------------------
 // Pixel sink (m_px_*)
 //
-// Collects 24-bit Y|Cb|Cr pixels into three planes.  First pixel with tuser
-// marks SOF; each EOL bumps a row counter.
+// Phase 12: tdata 扩宽到 32b。
+//   YCbCr/GRAY: {Y[31:24], Cb[23:16], Cr[15:8], 0[7:0]}
+//   CMYK:        {C[31:24], M[23:16], Y[15:8], K[7:0]}
+// Sink 始终存储 4 个 plane (Y/Cb/Cr 与 K)。K 在非 CMYK 帧中是 0。
+// First pixel with tuser marks SOF; each EOL bumps a row counter.
 // ---------------------------------------------------------------------------
 class PixelSink {
 public:
-    std::vector<uint8_t> Y, Cb, Cr;
+    std::vector<uint8_t> Y, Cb, Cr, K;
     uint32_t width = 0;   // inferred from first EOL
     uint32_t height = 0;  // number of EOL pulses
     bool saw_sof = false;
@@ -196,10 +199,11 @@ public:
         for (uint32_t c = 0; c < max_cycles; ++c) {
             if (d->m_px_tvalid && d->m_px_tready) {
                 uint32_t px = d->m_px_tdata;
-                uint8_t y  = (px >> 16) & 0xFF;
-                uint8_t cb = (px >> 8)  & 0xFF;
-                uint8_t cr = (px >> 0)  & 0xFF;
-                Y.push_back(y); Cb.push_back(cb); Cr.push_back(cr);
+                uint8_t y  = (px >> 24) & 0xFF;
+                uint8_t cb = (px >> 16) & 0xFF;
+                uint8_t cr = (px >> 8)  & 0xFF;
+                uint8_t k  = (px >> 0)  & 0xFF;
+                Y.push_back(y); Cb.push_back(cb); Cr.push_back(cr); K.push_back(k);
                 if (d->m_px_tuser) saw_sof = true;
                 ++cur_row_len;
                 if (d->m_px_tlast) {
