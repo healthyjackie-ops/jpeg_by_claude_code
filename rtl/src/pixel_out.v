@@ -1,12 +1,15 @@
 // ---------------------------------------------------------------------------
-// pixel_out — Raster scan 扫描 line_buffer，输出 32-bit 流
+// pixel_out — Raster scan 扫描 line_buffer，输出 48-bit 流 (Phase 13)
 //
 // 依次扫 16 × image_width 像素 (一 MCU-row)，chroma 做 nearest-neighbor
 // 通过 AXI-Stream 风格接口 (tvalid/tready/tuser=SOF/tlast=EOL)
 //
-// Phase 12: tdata 扩宽至 32 位：
-//   - YCbCr/GRAY: {Y, Cb, Cr, 8'h00}
-//   - CMYK:       {C, M, Y_cmyk, K}
+// Phase 13: tdata 扩宽至 48 位 (4 × 12b)，每 12b 槽位存一个通道样本：
+//   - YCbCr/GRAY: {Y[11:0], Cb[11:0], Cr[11:0], 12'h000}
+//   - CMYK:       {C[11:0], M[11:0], Y[11:0], K[11:0]}
+// P=8 下样本 0..255 零扩 12b；P=12 下样本 0..4095 直接占 12b；
+// GRAY 模式下 Cb/Cr 填中性值 (P=8: 128=12'h080, P=12: 2048=12'h800).
+// 消费者通过 PIX_FMT CSR 或 img_info.precision 判定当前精度。
 // ---------------------------------------------------------------------------
 module pixel_out (
     input  wire        clk,
@@ -19,12 +22,13 @@ module pixel_out (
     input  wire [11:0] img_height,     // Phase 6: 像素高度，用于最后 MCU-row 行裁剪
     input  wire        is_first_row,
     input  wire        is_last_row,
-    input  wire        is_grayscale,   // Phase 8: 1=MCU-row 8 行, Cb/Cr 输出 0x80
+    input  wire        is_grayscale,   // Phase 8: 1=MCU-row 8 行, Cb/Cr 输出中性
     input  wire        is_444,         // Phase 9: 1=chroma 全分辨率，c_col=x_col, c_row=y_row[2:0]
     input  wire        is_422,         // Phase 10: 1=chroma 横半分辨率，c_col=x_col[11:1], c_row=y_row[2:0]
     input  wire        is_440,         // Phase 11a: 1=chroma 纵半分辨率，c_col=x_col, c_row=y_row[3:1]
     input  wire        is_411,         // Phase 11b: 1=chroma 横 1/4 分辨率，c_col=x_col[11:2], c_row=y_row[2:0]
     input  wire        is_cmyk,        // Phase 12: 1=CMYK {C,M,Y,K}
+    input  wire        precision,      // Phase 13: 0=P=8, 1=P=12 (决定 GRAY 中性值)
     output reg         row_done,
 
     // line_buffer 读口 — Phase 13: 数据 16b (低 12b 有效)
@@ -39,13 +43,16 @@ module pixel_out (
     input  wire [15:0] rd_cr_data,
     input  wire [15:0] rd_k_data,
 
-    // AXI-Stream 输出 (Phase 12: 32b)
+    // AXI-Stream 输出 (Phase 13: 48b = 4 × 12b)
     output reg         tvalid,
     input  wire        tready,
-    output reg  [31:0] tdata,
+    output reg  [47:0] tdata,
     output reg         tuser_sof,      // 帧第一像素
     output reg         tlast           // EOL
 );
+
+    // GRAY 中性 chroma: P=8 → 128, P=12 → 2048
+    wire [11:0] neutral_c = precision ? 12'h800 : 12'h080;
 
     // 扫描状态
     reg [3:0]  y_row;       // 0..15 within MCU row
@@ -73,7 +80,7 @@ module pixel_out (
         if (!rst_n) begin
             y_row <= 4'd0; x_col <= 12'd0;
             active <= 1'b0; row_done <= 1'b0;
-            tvalid <= 1'b0; tdata <= 32'd0;
+            tvalid <= 1'b0; tdata <= 48'd0;
             tuser_sof <= 1'b0; tlast <= 1'b0;
             rd_y_row <= 4'd0; rd_y_col <= 12'd0;
             rd_c_row <= 3'd0; rd_c_col <= 12'd0;
@@ -100,14 +107,15 @@ module pixel_out (
             if (active && (!tvalid || tready)) begin
                 // 驱动当前 (y_row, x_col) 像素
                 tvalid    <= 1'b1;
-                // Phase 12 packing (32b, P=8 only) — Phase 13 注：下游 16b bus 的
-                // 低 8b 即 P=8 样本；P=12 的高 4b 在此处被截断（13b.5 扩 48b 修复）
+                // Phase 13 packing (48b = 4 × 12b，每通道低 12b 有效)
                 if (is_cmyk)
-                    tdata <= {rd_y_data[7:0], rd_cb_data[7:0], rd_cr_data[7:0], rd_k_data[7:0]};
+                    tdata <= {rd_y_data[11:0], rd_cb_data[11:0],
+                              rd_cr_data[11:0], rd_k_data[11:0]};
                 else if (is_grayscale)
-                    tdata <= {rd_y_data[7:0], 8'h80, 8'h80, 8'h00};
+                    tdata <= {rd_y_data[11:0], neutral_c, neutral_c, 12'h000};
                 else
-                    tdata <= {rd_y_data[7:0], rd_cb_data[7:0], rd_cr_data[7:0], 8'h00};
+                    tdata <= {rd_y_data[11:0], rd_cb_data[11:0],
+                              rd_cr_data[11:0], 12'h000};
                 tuser_sof <= is_first_row && (y_row == 4'd0) && (x_col == 12'd0);
                 tlast     <= (x_col == (img_width - 12'd1));
 

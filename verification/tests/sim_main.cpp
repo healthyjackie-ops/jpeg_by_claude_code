@@ -191,10 +191,11 @@ struct DiffResult {
 static DiffResult diff_one(const std::vector<uint8_t>& jpeg,
                            bool verbose = false, uint32_t max_sim_cycles = 2'000'000,
                            const char* vcd_path = nullptr,
-                           std::vector<uint8_t>* out_Y  = nullptr,
-                           std::vector<uint8_t>* out_Cb = nullptr,
-                           std::vector<uint8_t>* out_Cr = nullptr,
-                           std::vector<uint8_t>* out_K  = nullptr) {
+                           std::vector<uint16_t>* out_Y  = nullptr,
+                           std::vector<uint16_t>* out_Cb = nullptr,
+                           std::vector<uint16_t>* out_Cr = nullptr,
+                           std::vector<uint16_t>* out_K  = nullptr,
+                           uint8_t* out_precision = nullptr) {
     DiffResult R;
 
     // --- Golden C decode --------------------------------------------------
@@ -230,7 +231,9 @@ static DiffResult diff_one(const std::vector<uint8_t>& jpeg,
     auto* d = tb->dut.get();
     d->m_px_tready = 1;
 
-    std::vector<uint8_t> rY, rCb, rCr, rK;
+    // Phase 13b.5: tdata widened to 48b (4 × 12b channel slots).
+    // Capture 12b samples per channel regardless of precision (P=8 sample zero-ext to 12b).
+    std::vector<uint16_t> rY, rCb, rCr, rK;
     rY.reserve(64 * 64); rCb.reserve(64 * 64); rCr.reserve(64 * 64); rK.reserve(64 * 64);
     uint32_t cur_row_len = 0;
     uint16_t rtl_w = 0;
@@ -248,12 +251,13 @@ static DiffResult diff_one(const std::vector<uint8_t>& jpeg,
     tb->on_tick_pre = [&](TbCtx& t) {
         auto* dd = t.dut.get();
         // 1) pixel capture (pre-edge handshake fires at this tick)
+        // Phase 13b.5: tdata = 48b = 4 × 12b slots (Y|Cb|Cr|0 or C|M|Y|K).
         if (dd->m_px_tvalid && dd->m_px_tready) {
-            uint32_t v = dd->m_px_tdata;
-            rY.push_back((v >> 24) & 0xFF);
-            rCb.push_back((v >> 16) & 0xFF);
-            rCr.push_back((v >> 8)  & 0xFF);
-            rK.push_back((v >> 0)  & 0xFF);
+            uint64_t v = dd->m_px_tdata;
+            rY.push_back (static_cast<uint16_t>((v >> 36) & 0xFFFu));
+            rCb.push_back(static_cast<uint16_t>((v >> 24) & 0xFFFu));
+            rCr.push_back(static_cast<uint16_t>((v >> 12) & 0xFFFu));
+            rK.push_back (static_cast<uint16_t>((v      ) & 0xFFFu));
             if (dd->m_px_tuser) saw_tuser = true;
             ++cur_row_len;
             if (dd->m_px_tlast) {
@@ -420,23 +424,46 @@ static DiffResult diff_one(const std::vector<uint8_t>& jpeg,
                    && (rY.size() == size_t(golden.width) * golden.height);
 
     // Pixel compare
-    //   CMYK  (golden.c_plane != null): rY=C rCb=M rCr=Y_cmyk rK=K
-    //   Gray  (golden.cb_plane == null): rCb/rCr are 0x80 padding, rK=0
+    //   CMYK  (golden.c_plane != null): rY=C rCb=M rCr=Y_cmyk rK=K (P=8 only)
+    //   Gray  (golden.cb_plane == null): rCb/rCr are neutral padding, rK=0
     //   YCbCr (else): rY/rCb/rCr from golden
+    // Phase 13b.5: rY/rCb/rCr/rK are native-precision samples carried in 12b
+    // slots (P=8 → 0..255 zero-ext into low 12b; P=12 → 0..4095 native).
+    // Compare directly against golden's matching-precision plane.
     const bool is_cmyk = (golden.c_plane != nullptr);
-    const bool is_gray = (!is_cmyk && golden.cb_plane == nullptr);
+    const bool is_p12  = (golden.precision == 12);
+    // P=8 populates cb_plane (8b); P=12 populates cb_plane16. Either being null = grayscale.
+    const bool is_gray = !is_cmyk &&
+                         (is_p12 ? (golden.cb_plane16 == nullptr)
+                                 : (golden.cb_plane   == nullptr));
+    const uint16_t neutral_c = is_p12 ? 0x800 : 0x080;
     if (R.match_geom) {
         for (size_t i = 0; i < rY.size(); ++i) {
             if (is_cmyk) {
+                // CMYK is P=8 only per C model; rY..rK carry 8b in 12b slot.
                 uint32_t dc_c = std::abs(int(rY[i])  - int(golden.c_plane[i]));
                 uint32_t dc_m = std::abs(int(rCb[i]) - int(golden.m_plane[i]));
                 uint32_t dc_y = std::abs(int(rCr[i]) - int(golden.y_plane_cmyk[i]));
                 uint32_t dc_k = std::abs(int(rK[i])  - int(golden.k_plane[i]));
-                // Reuse max_diff_y for C, max_diff_c for M/Y/K combined
                 if (dc_c > R.max_diff_y) R.max_diff_y = dc_c;
                 uint32_t dc = std::max(dc_m, std::max(dc_y, dc_k));
                 if (dc > R.max_diff_c) R.max_diff_c = dc;
+            } else if (is_p12) {
+                uint32_t dy = std::abs(int(rY[i]) - int(golden.y_plane16[i]));
+                if (dy > R.max_diff_y) R.max_diff_y = dy;
+                if (!is_gray) {
+                    uint32_t dcb = std::abs(int(rCb[i]) - int(golden.cb_plane16[i]));
+                    uint32_t dcr = std::abs(int(rCr[i]) - int(golden.cr_plane16[i]));
+                    uint32_t dc = std::max(dcb, dcr);
+                    if (dc > R.max_diff_c) R.max_diff_c = dc;
+                } else {
+                    uint32_t dcb = std::abs(int(rCb[i]) - int(neutral_c));
+                    uint32_t dcr = std::abs(int(rCr[i]) - int(neutral_c));
+                    uint32_t dc = std::max(dcb, dcr);
+                    if (dc > R.max_diff_c) R.max_diff_c = dc;
+                }
             } else {
+                // P=8 non-CMYK: rY[i] ∈ [0..255] directly.
                 uint8_t gy  = golden.y_plane[i];
                 uint32_t dy = std::abs(int(rY[i]) - int(gy));
                 if (dy > R.max_diff_y) R.max_diff_y = dy;
@@ -448,7 +475,7 @@ static DiffResult diff_one(const std::vector<uint8_t>& jpeg,
                     uint32_t dc = std::max(dcb, dcr);
                     if (dc > R.max_diff_c) R.max_diff_c = dc;
                 } else {
-                    // grayscale — RTL outputs Cb=Cr=0x80 padding
+                    // grayscale — RTL outputs Cb=Cr=0x080 padding (== 128 in P=8 zero-ext)
                     uint32_t dcb = std::abs(int(rCb[i]) - 0x80);
                     uint32_t dcr = std::abs(int(rCr[i]) - 0x80);
                     uint32_t dc = std::max(dcb, dcr);
@@ -463,22 +490,29 @@ static DiffResult diff_one(const std::vector<uint8_t>& jpeg,
     if (out_Cb) *out_Cb = std::move(rCb);
     if (out_Cr) *out_Cr = std::move(rCr);
     if (out_K)  *out_K  = std::move(rK);
+    if (out_precision) *out_precision = golden.precision;
     jpeg_free(&golden);
     // Leak TbCtx — cleaner than the mac libc++ thread teardown race.
     return R;
 }
 
 // Write YCbCr planes → PPM (P6 binary RGB) via JFIF YCbCr→RGB conversion.
+// Phase 13b.5: inputs are 12b samples (P=8 zero-ext, P=12 native);
+// we downshift to 8b for PPM (> can be extended to PPM16/P6 later).
 static bool write_ppm_from_ycbcr(const std::string& path,
-                                 const std::vector<uint8_t>& Y,
-                                 const std::vector<uint8_t>& Cb,
-                                 const std::vector<uint8_t>& Cr,
-                                 uint16_t w, uint16_t h) {
+                                 const std::vector<uint16_t>& Y,
+                                 const std::vector<uint16_t>& Cb,
+                                 const std::vector<uint16_t>& Cr,
+                                 uint16_t w, uint16_t h,
+                                 uint8_t precision = 8) {
     if (size_t(w) * h != Y.size() || Y.size() != Cb.size() || Y.size() != Cr.size()) {
         std::fprintf(stderr, "[PPM] geometry mismatch: w*h=%u Y=%zu Cb=%zu Cr=%zu\n",
                      unsigned(w) * h, Y.size(), Cb.size(), Cr.size());
         return false;
     }
+    // P=8: samples carry 8b value in low 12b slot (no scale) — shift=0.
+    // P=12: samples carry 12b value — drop 4 LSBs for 8b PPM.
+    const int shift = (precision == 12) ? 4 : 0;
     FILE* fp = std::fopen(path.c_str(), "wb");
     if (!fp) { std::fprintf(stderr, "[PPM] open %s failed\n", path.c_str()); return false; }
     std::fprintf(fp, "P6\n%u %u\n255\n", unsigned(w), unsigned(h));
@@ -486,9 +520,9 @@ static bool write_ppm_from_ycbcr(const std::string& path,
     for (uint32_t y = 0; y < h; ++y) {
         for (uint32_t x = 0; x < w; ++x) {
             size_t i = size_t(y) * w + x;
-            int yy = int(Y[i]);
-            int cb = int(Cb[i]) - 128;
-            int cr = int(Cr[i]) - 128;
+            int yy = int(Y[i])  >> shift;
+            int cb = (int(Cb[i]) >> shift) - 128;
+            int cr = (int(Cr[i]) >> shift) - 128;
             // JFIF integer approx (libjpeg identical): scale = 1<<16
             int r = yy + ((91881  * cr + 32768) >> 16);
             int g = yy - ((22554  * cb + 46802 * cr + 32768) >> 16);
@@ -511,7 +545,8 @@ int run_one(const Args& a) {
     if (path.empty()) { std::fprintf(stderr, "pass --dir=<file.jpg>\n"); return 2; }
     auto jpeg = slurp(path);
     std::printf("[ONE] %s (%zu bytes)\n", path.c_str(), jpeg.size());
-    std::vector<uint8_t> oY, oCb, oCr;
+    std::vector<uint16_t> oY, oCb, oCr;
+    uint8_t precision = 8;
     bool want_out = !a.out.empty();
     // When writing output, size cycle budget from image dimensions (pass 0).
     DiffResult r = diff_one(jpeg, /*verbose=*/true,
@@ -519,15 +554,18 @@ int run_one(const Args& a) {
                             /*vcd=*/ a.vcd.empty() ? nullptr : a.vcd.c_str(),
                             want_out ? &oY  : nullptr,
                             want_out ? &oCb : nullptr,
-                            want_out ? &oCr : nullptr);
+                            want_out ? &oCr : nullptr,
+                            /*out_K=*/ nullptr,
+                            &precision);
     bool ok = r.rtl_ok && r.c_ok && r.match_geom
               && r.max_diff_y == 0 && r.max_diff_c == 0;
-    std::printf("  %ux%u err=0x%02X ΔY=%u ΔC=%u -> %s\n",
-                r.width, r.height, r.err_code, r.max_diff_y, r.max_diff_c,
+    std::printf("  %ux%u P=%u err=0x%02X ΔY=%u ΔC=%u -> %s\n",
+                r.width, r.height, precision, r.err_code, r.max_diff_y, r.max_diff_c,
                 ok ? "OK" : "FAIL");
     if (want_out && !oY.empty() && r.match_geom) {
-        if (write_ppm_from_ycbcr(a.out, oY, oCb, oCr, r.width, r.height))
-            std::printf("  wrote PPM: %s (%ux%u)\n", a.out.c_str(), r.width, r.height);
+        if (write_ppm_from_ycbcr(a.out, oY, oCb, oCr, r.width, r.height, precision))
+            std::printf("  wrote PPM: %s (%ux%u P=%u)\n",
+                        a.out.c_str(), r.width, r.height, precision);
     }
     return ok ? 0 : 1;
 }

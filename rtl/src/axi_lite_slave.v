@@ -13,6 +13,7 @@
 //   0x020 ERROR_CODE (RO, sticky, SOFT_RESET 清零)
 //   0x024 CONFIG     (RW)
 //   0x028 SCRATCH    (RW)
+//   0x02C PIX_FMT    (RO, Phase 13: bit[0] = precision 0=P=8/1=P=12)
 //
 // 不支持 burst，按每次 1 beat 处理。
 // ---------------------------------------------------------------------------
@@ -72,7 +73,10 @@ module axi_lite_slave (
 
     input  wire [15:0] img_width_in,
     input  wire [15:0] img_height_in,
-    input  wire [31:0] pixel_count_in
+    input  wire [31:0] pixel_count_in,
+
+    // Phase 13
+    input  wire        precision_in        // 0 = P=8, 1 = P=12
 );
 
     // ---- AW/W/AR simple handshakes ------------------------------------
@@ -247,6 +251,7 @@ module axi_lite_slave (
                     12'h020: s_rdata <= err_word;
                     12'h024: s_rdata <= cfg_reg;
                     12'h028: s_rdata <= scratch_reg;
+                    12'h02C: s_rdata <= {31'd0, precision_in};   // Phase 13 PIX_FMT
                     default: s_rdata <= 32'd0;
                 endcase
             end else if (s_rvalid && s_rready) begin

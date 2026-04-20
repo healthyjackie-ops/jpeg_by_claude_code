@@ -45,8 +45,11 @@ module jpeg_axi_top (
     output wire        s_bs_tready,
     input  wire        s_bs_tlast,
 
-    // ---- AXI-Stream output pixel (Phase 12: 32b - CMYK {C,M,Y,K}) --
-    output wire [31:0] m_px_tdata,
+    // ---- AXI-Stream output pixel (Phase 13: 48b = 4 × 12b 通道槽位)
+    //   YCbCr/GRAY: {Y[11:0], Cb[11:0], Cr[11:0], 12'h000}
+    //   CMYK:       {C[11:0], M[11:0], Y[11:0], K[11:0]}
+    //   P=8 样本 0..255 零扩至 12b；P=12 样本占满 12b。
+    output wire [47:0] m_px_tdata,
     output wire        m_px_tvalid,
     input  wire        m_px_tready,
     output wire        m_px_tuser,
@@ -392,8 +395,8 @@ module jpeg_axi_top (
     wire        row_ready_w, row_done_w;
     wire        is_first_row_w, is_last_row_w;
 
-    // pixel_out → output FIFO slave 接口 (Phase 12: 32b)
-    wire [31:0] po_tdata;
+    // pixel_out → output FIFO slave 接口 (Phase 13: 48b)
+    wire [47:0] po_tdata;
     wire        po_tvalid;
     wire        po_tready;
     wire        po_tuser;
@@ -410,6 +413,7 @@ module jpeg_axi_top (
         .is_440(is_440_w),             // Phase 11a
         .is_411(is_411_w),             // Phase 11b
         .is_cmyk(is_cmyk_w),           // Phase 12
+        .precision(precision_w),       // Phase 13
         .row_done(row_done_w),
         .rd_y_row(po_rd_y_row_w), .rd_y_col(po_rd_y_col_w),
         .rd_c_row(po_rd_c_row_w), .rd_c_col(po_rd_c_col_w),
@@ -421,9 +425,9 @@ module jpeg_axi_top (
         .tuser_sof(po_tuser), .tlast(po_tlast)
     );
 
-    // ---------------- Output FIFO (Phase 12: DW=32) -----------------
+    // ---------------- Output FIFO (Phase 13: DW=48) -----------------
     wire out_fifo_empty, out_fifo_full;
-    axi_stream_fifo #(.DW(32), .UW(1), .DEPTH(32)) u_out_fifo (
+    axi_stream_fifo #(.DW(48), .UW(1), .DEPTH(32)) u_out_fifo (
         .clk(aclk), .rst_n(aresetn), .flush(softrst),
         .s_tdata(po_tdata),  .s_tuser(po_tuser),
         .s_tlast(po_tlast),  .s_tvalid(po_tvalid),
@@ -540,7 +544,8 @@ module jpeg_axi_top (
         .err_code_in(err_comb),
         .img_width_in(img_w_w),
         .img_height_in(img_h_w),
-        .pixel_count_in(pixel_cnt_r)
+        .pixel_count_in(pixel_cnt_r),
+        .precision_in(precision_w)      // Phase 13
     );
 
     // 防未使用告警

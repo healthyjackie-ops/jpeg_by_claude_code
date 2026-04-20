@@ -89,8 +89,8 @@ QTable / HTable **不通过 CSR 加载**，由 DQT/DHT 段自动填充。
 ### `0x020` ERROR_CODE (RO)
 | Bits | Name | Reset | 描述 |
 |---|---|---|---|
-| 0 | `ERR_UNSUP_SOF` | 0 | 非 SOF0 |
-| 1 | `ERR_UNSUP_PREC` | 0 | precision ≠ 8 |
+| 0 | `ERR_UNSUP_SOF` | 0 | 非 SOF0/SOF1（Phase 13 起接受 SOF1） |
+| 1 | `ERR_UNSUP_PREC` | 0 | precision ≠ 8 且 ≠ 12（Phase 13 起接受 P=12） |
 | 2 | `ERR_UNSUP_CHROMA` | 0 | 非 YUV420 / comp ≠ 3 |
 | 3 | `ERR_BAD_HUFFMAN` | 0 | Huffman 未命中 |
 | 4 | `ERR_BAD_MARKER` | 0 | 未知 marker |
@@ -113,6 +113,37 @@ QTable / HTable **不通过 CSR 加载**，由 DQT/DHT 段自动填充。
 | Bits | Name | Reset | 描述 |
 |---|---|---|---|
 | 31:0 | `SCRATCH` | 0 | 软件自用；硬件不读 |
+
+### `0x02C` PIX_FMT (RO) — Phase 13
+| Bits | Name | Reset | 描述 |
+|---|---|---|---|
+| 0 | `PRECISION` | 0 | 0 = P=8（SOF0 baseline）；1 = P=12（SOF1 extended sequential）。由 header_parser 在 SOF 解析完成时锁存；软件据此判断输出像素的有效位宽 |
+| 31:1 | reserved | 0 | |
+
+**用法**：软件读 `STATUS.HEADER_DONE=1` 后读 `PIX_FMT` 判断像素流格式。当 `PRECISION=1` 时，输出 AXI-Stream `tdata[47:0]` 的每个 12b 通道槽位填满 12b 有效样本（0..4095）；当 `PRECISION=0` 时，样本值占低 8b（0..255），高 4b 为零扩展。
+
+---
+
+## 2.1 输出像素流格式（m_px_*）
+
+| 信号 | 宽度 | 说明 |
+|---|---|---|
+| `m_px_tdata` | 48b | **Phase 13** — 4 × 12b 通道槽位，MSB→LSB: `{ch0, ch1, ch2, ch3}` |
+| `m_px_tuser` | 1b | SOF（帧首像素） |
+| `m_px_tlast` | 1b | EOL（每扫描线末像素） |
+| `m_px_tvalid/tready` | 1b | 标准 AXI-Stream 握手 |
+
+**通道映射**（由 header_parser 的 chroma_mode 决定）：
+
+| 模式 | ch0 | ch1 | ch2 | ch3 |
+|---|---|---|---|---|
+| Grayscale | Y | 0x080 (P=8) / 0x800 (P=12) | 同 ch1 | 0 |
+| YCbCr (4:4:4 / 4:2:0 / 4:2:2 / 4:4:0 / 4:1:1) | Y | Cb | Cr | 0 |
+| CMYK | C | M | Y | K |
+
+**精度编码**：
+- P=8: 样本值 0..255 写入每个 12b 槽位的低 8b（bits [7:0]），高 4b（bits [11:8]）零扩展。
+- P=12: 样本值 0..4095 直接写入 12b 槽位。
 
 ---
 
@@ -190,5 +221,5 @@ write(INT_STATUS, status);       // 清中断
 | RGB 输出 | `CONFIG.OUT_RGB` |
 | Planar 输出 | `CONFIG.OUT_FMT` |
 | DRI 支持 | ERROR bit 5 可清除 |
-| 12-bit 精度 | `CONFIG.PRECISION` |
+| 12-bit 精度 | `PIX_FMT.PRECISION` (0x02C, Phase 13 已实现) |
 | 多 slice 并行 | `0x100-0x1FF` 预留分片 base |
