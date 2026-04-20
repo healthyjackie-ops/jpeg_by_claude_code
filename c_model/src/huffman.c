@@ -49,7 +49,10 @@ int huff_decode_block(bitstream_t *bs,
 
     uint8_t size;
     if (huff_decode_symbol(bs, dc_tab, &size)) return -1;
-    if (size > 11) return -1;
+    /* Phase 13: DC category ≤ 15 for P=12 (was ≤ 11 for P=8); s=15 extend
+       yields ±32767 which still fits in int16 for DC pred accumulation on
+       real-world streams. */
+    if (size > 15) return -1;
 
     int32_t diff = 0;
     if (size > 0) {

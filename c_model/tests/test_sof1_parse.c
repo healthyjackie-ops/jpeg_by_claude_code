@@ -46,11 +46,21 @@ static int check_one(const char *path) {
     assert(info.num_components == 1 || info.num_components == 3);
     assert(info.qtables[info.components[0].qt_id].loaded);
 
-    /* jpeg_decode must refuse cleanly with JPEG_ERR_UNSUP_PREC (13a.2 guard). */
+    /* Phase 13a.3: jpeg_decode now succeeds for P=12 grayscale / 4:4:4 / 4:2:0. */
     jpeg_decoded_t d;
     int drc = jpeg_decode(buf, n, &d);
-    assert(drc != 0);
-    assert(d.err & JPEG_ERR_UNSUP_PREC);
+    if (drc != 0) {
+        fprintf(stderr, "  decode failed %s err=0x%X\n", path, d.err);
+        jpeg_free(&d);
+        free(buf);
+        return -1;
+    }
+    assert(d.precision == 12);
+    assert(d.y_plane16 != NULL);
+    /* Sanity: samples must be within 0..4095 */
+    for (uint32_t i = 0; i < (uint32_t)d.width * d.height; i++) {
+        assert(d.y_plane16[i] <= 4095);
+    }
     jpeg_free(&d);
     free(buf);
     return 0;

@@ -190,3 +190,39 @@ $ cjpeg -help 2>&1 | grep precision
 ---
 
 **下一步**：本 spec 冻结后开始 Phase 13a（C model + vectors），不触 RTL。
+
+## Phase 13a 执行后记
+
+### 关键坑点：IDCT `PASS1_BITS=1`（**不是** 2）
+
+libjpeg-turbo 的 `j12idctint.c` 在 P=12 时使用 `#define PASS1_BITS 1`（P=8 下是 2）。少丢 1b 的 pass-1 精度是为了避免 overflow。
+
+如果 C 模型直接从 P=8 的 `idct_islow` 继承 `PASS1_BITS=2`，则与 libjpeg-turbo 的 12-bit golden 会出现 **±1 偏差**（所测 20 张里 13/20 失败，maxDiff=1）。
+
+**修复**：为 P=12 单开一份 `idct_islow_p12()`，使用独立宏 `PASS1_BITS_P12=1`。中间累加器升到 `int64_t`（`(coef ±16384) × (q 16b) × FIX_*` 可溢 31b；8-tap 累加再加 3b → 34b，int32 已不足）。
+
+修正后 20/20 ΔY=0 ΔC=0。
+
+### 实际 IDCT 位宽核算（P=12）
+
+- `coef` dequant 后最坏 ±(1<<14)×(1<<16) ≈ ±1.6e9（~31b 有符号）
+- 乘 FIX_* (~15b) → ~46b
+- 行/列 8 次累加 +3b → ~49b
+- 最终 descale `(CONST_BITS + PASS1_BITS_P12 + 3) = 17` → ~32b → clamp 到 0..4095
+
+结论：**必须用 int64 中间量**；int32 不够。RTL 端需 `DATA_W ≥ 50` 的中间累加器或在两个 1D pass 之间做 rounded-shift 截断（后者更省资源，需仿真确认）。
+
+### 已落地接口
+
+- `jpeg_decoded_t` 新增 `precision` + `{y,cb,cr}_plane16`（P=8 路径不变；P=12 路径只填 u16 planes）
+- `header_parser` SOF0/SOF1 经 `parse_sof_common(..., allow_p12)` 统一；DQT `Pq=1` 读 128B
+- `huffman.c` DC size 上限从 11 升到 15
+- `golden_compare.c` 新增 P=12 分支，走 `jpeg12_read_raw_data` + `J12SAMPLE`（libjpeg-turbo 3.x @ Homebrew 已默认带）
+
+### 回归
+
+- P=8 phase06..phase12: 125/125 bit-exact（无回归）
+- P=12 phase13: 20/20 bit-exact
+- 总计 150/150
+
+Phase 13a 全部完成，RTL（13b/c）独立推进。

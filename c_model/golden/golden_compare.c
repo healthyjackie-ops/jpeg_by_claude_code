@@ -21,6 +21,7 @@ typedef struct {
     uint32_t height;
     int num_components;   /* 1=grayscale, 3=YCbCr, 4=CMYK */
     int chroma_mode;      /* 0=gray, 1=420, 2=444, 3=422, 4=440, 5=411, 6=CMYK */
+    int precision;        /* 8 or 12 */
     uint32_t cb_width;    /* native chroma plane width */
     uint32_t cb_height;   /* native chroma plane height */
     uint8_t *y;
@@ -31,6 +32,10 @@ typedef struct {
     uint8_t *m;
     uint8_t *y_cmyk;
     uint8_t *k;
+    /* Phase 13: P=12 uint16 planes (0..4095). Populated when precision==12. */
+    uint16_t *y16;
+    uint16_t *cb16;
+    uint16_t *cr16;
 } libjpeg_ycc_t;
 
 static int libjpeg_decode_ycc(const uint8_t *data, size_t size, libjpeg_ycc_t *out) {
@@ -76,12 +81,83 @@ static int libjpeg_decode_ycc(const uint8_t *data, size_t size, libjpeg_ycc_t *o
     out->width = W;
     out->height = H;
     out->num_components = is_gray ? 1 : (is_cmyk ? 4 : 3);
+    out->precision = cinfo.data_precision;
     out->chroma_mode = is_gray ? 0 :
                        is_cmyk ? 6 :
                        is_444  ? 2 :
                        is_422  ? 3 :
                        is_440  ? 4 :
                        is_411  ? 5 : 1;
+
+    /* Phase 13: P=12 path uses jpeg12_read_raw_data into J12SAMPLE (int16)
+       row buffers. Supports grayscale / 4:4:4 / 4:2:0 (matches C model scope).
+       Converts to uint16_t (0..4095) for plane storage. */
+    if (out->precision == 12 && !is_cmyk && (is_gray || is_444 || out->chroma_mode == 1)) {
+        int is_420_p = (out->chroma_mode == 1);
+        uint32_t Wp = (is_420_p) ? (((W + 15) / 16) * 16) : (((W + 7) / 8) * 8);
+        uint32_t Hp = (is_420_p) ? (((H + 15) / 16) * 16) : (((H + 7) / 8) * 8);
+        uint32_t CWp = is_420_p ? (Wp / 2) : Wp;
+        uint32_t CHp = is_420_p ? (Hp / 2) : Hp;
+
+        J12SAMPLE *y_pad  = (J12SAMPLE*)calloc((size_t)Wp * Hp, sizeof(J12SAMPLE));
+        J12SAMPLE *cb_pad = is_gray ? NULL : (J12SAMPLE*)calloc((size_t)CWp * CHp, sizeof(J12SAMPLE));
+        J12SAMPLE *cr_pad = is_gray ? NULL : (J12SAMPLE*)calloc((size_t)CWp * CHp, sizeof(J12SAMPLE));
+
+        int y_rows_per_call = is_420_p ? 16 : 8;
+        J12SAMPROW y_rowptrs[16];
+        J12SAMPROW cb_rowptrs[8];
+        J12SAMPROW cr_rowptrs[8];
+        J12SAMPARRAY arrays_gray[1] = { y_rowptrs };
+        J12SAMPARRAY arrays_3c[3]   = { y_rowptrs, cb_rowptrs, cr_rowptrs };
+
+        while (cinfo.output_scanline < H) {
+            uint32_t base_y = cinfo.output_scanline;
+            for (int i = 0; i < y_rows_per_call; i++) {
+                y_rowptrs[i] = y_pad + (size_t)(base_y + (uint32_t)i) * Wp;
+            }
+            if (!is_gray) {
+                uint32_t base_c = is_420_p ? (base_y >> 1) : base_y;
+                for (int i = 0; i < 8; i++) {
+                    cb_rowptrs[i] = cb_pad + (size_t)(base_c + (uint32_t)i) * CWp;
+                    cr_rowptrs[i] = cr_pad + (size_t)(base_c + (uint32_t)i) * CWp;
+                }
+                (void)jpeg12_read_raw_data(&cinfo, arrays_3c,
+                                           (JDIMENSION)y_rows_per_call);
+            } else {
+                (void)jpeg12_read_raw_data(&cinfo, arrays_gray,
+                                           (JDIMENSION)y_rows_per_call);
+            }
+        }
+
+        out->y16 = (uint16_t*)calloc((size_t)W * H, sizeof(uint16_t));
+        for (uint32_t r = 0; r < H; r++) {
+            for (uint32_t c = 0; c < W; c++) {
+                out->y16[(size_t)r * W + c] =
+                    (uint16_t)y_pad[(size_t)r * Wp + c];
+            }
+        }
+        if (!is_gray) {
+            uint32_t cW = is_420_p ? (W / 2) : W;
+            uint32_t cH = is_420_p ? (H / 2) : H;
+            out->cb16 = (uint16_t*)calloc((size_t)cW * cH, sizeof(uint16_t));
+            out->cr16 = (uint16_t*)calloc((size_t)cW * cH, sizeof(uint16_t));
+            out->cb_width  = cW;
+            out->cb_height = cH;
+            for (uint32_t r = 0; r < cH; r++) {
+                for (uint32_t c = 0; c < cW; c++) {
+                    out->cb16[(size_t)r * cW + c] =
+                        (uint16_t)cb_pad[(size_t)r * CWp + c];
+                    out->cr16[(size_t)r * cW + c] =
+                        (uint16_t)cr_pad[(size_t)r * CWp + c];
+                }
+            }
+        }
+        free(y_pad); free(cb_pad); free(cr_pad);
+
+        jpeg_finish_decompress(&cinfo);
+        jpeg_destroy_decompress(&cinfo);
+        return 0;
+    }
 
     if (is_cmyk) {
         /* Phase 12: CMYK — 4 components all 1x1. jpeg_read_raw_data returns
@@ -349,6 +425,7 @@ static int libjpeg_decode_ycc(const uint8_t *data, size_t size, libjpeg_ycc_t *o
 static void libjpeg_free(libjpeg_ycc_t *o) {
     free(o->y); free(o->cb); free(o->cr);
     free(o->c); free(o->m); free(o->y_cmyk); free(o->k);
+    free(o->y16); free(o->cb16); free(o->cr16);
     memset(o, 0, sizeof(*o));
 }
 
@@ -398,6 +475,38 @@ int main(int argc, char **argv) {
 
         int dy_max = 0, dc_max = 0;
         size_t npix = (size_t)gold.width * gold.height;
+        if (gold.precision == 12) {
+            /* Phase 13: compare 16-bit planes (0..4095). */
+            for (size_t i = 0; i < npix; i++) {
+                int d = (int)ours.y_plane16[i] - (int)gold.y16[i];
+                if (d < 0) d = -d;
+                if (d > dy_max) dy_max = d;
+            }
+            if (gold.chroma_mode == 1) {
+                /* 4:2:0 — compare pre-upsample (W/2)×(H/2) chroma */
+                size_t ncpix = (size_t)gold.cb_width * gold.cb_height;
+                for (size_t i = 0; i < ncpix; i++) {
+                    int d1 = (int)ours.cb_plane16_420[i] - (int)gold.cb16[i];
+                    int d2 = (int)ours.cr_plane16_420[i] - (int)gold.cr16[i];
+                    if (d1 < 0) d1 = -d1;
+                    if (d2 < 0) d2 = -d2;
+                    if (d1 > dc_max) dc_max = d1;
+                    if (d2 > dc_max) dc_max = d2;
+                }
+            } else if (gold.chroma_mode == 2) {
+                /* 4:4:4 — full-res uint16 chroma */
+                size_t ncpix = (size_t)gold.cb_width * gold.cb_height;
+                for (size_t i = 0; i < ncpix; i++) {
+                    int d1 = (int)ours.cb_plane16[i] - (int)gold.cb16[i];
+                    int d2 = (int)ours.cr_plane16[i] - (int)gold.cr16[i];
+                    if (d1 < 0) d1 = -d1;
+                    if (d2 < 0) d2 = -d2;
+                    if (d1 > dc_max) dc_max = d1;
+                    if (d2 > dc_max) dc_max = d2;
+                }
+            }
+            goto summary_emit;
+        }
         if (gold.chroma_mode != 6) {
             for (size_t i = 0; i < npix; i++) {
                 int d = (int)ours.y_plane[i] - (int)gold.y[i];
@@ -478,12 +587,20 @@ int main(int argc, char **argv) {
             }
         }
 
-        const char *tag = (gold.chroma_mode == 0) ? " [GRAY]" :
-                          (gold.chroma_mode == 2) ? " [444]"  :
-                          (gold.chroma_mode == 3) ? " [422]"  :
-                          (gold.chroma_mode == 4) ? " [440]"  :
-                          (gold.chroma_mode == 5) ? " [411]"  :
-                          (gold.chroma_mode == 6) ? " [CMYK]" : "";
+summary_emit: {
+        const char *chroma_tag =
+            (gold.chroma_mode == 0) ? "GRAY" :
+            (gold.chroma_mode == 2) ? "444"  :
+            (gold.chroma_mode == 3) ? "422"  :
+            (gold.chroma_mode == 4) ? "440"  :
+            (gold.chroma_mode == 5) ? "411"  :
+            (gold.chroma_mode == 6) ? "CMYK" : "420";
+        char tag[24];
+        if (gold.precision == 12) {
+            snprintf(tag, sizeof(tag), " [P12 %s]", chroma_tag);
+        } else {
+            snprintf(tag, sizeof(tag), " [%s]", chroma_tag);
+        }
         if (dy_max == 0 && dc_max == 0) {
             printf("[PASS] %s %ux%u exact%s\n", argv[a], gold.width, gold.height, tag);
             pass++;
@@ -491,6 +608,7 @@ int main(int argc, char **argv) {
             printf("[FAIL] %s %ux%u maxDiff Y=%d C=%d%s\n",
                    argv[a], gold.width, gold.height, dy_max, dc_max, tag);
             fail++;
+        }
         }
         if (dy_max > worst_diff_y) worst_diff_y = dy_max;
         if (dc_max > worst_diff_c) worst_diff_c = dc_max;
