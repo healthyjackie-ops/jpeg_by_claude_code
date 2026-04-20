@@ -17,7 +17,7 @@ module block_sequencer (
     input  wire [15:0] img_width,
     input  wire [15:0] img_height,
     input  wire [1:0]  num_components,// Phase 8: 1=grayscale, 3=YCbCr
-    input  wire [2:0]  chroma_mode,   // Phase 9/10/11a: 0=GRAY,1=420,2=444,3=422,4=440
+    input  wire [2:0]  chroma_mode,   // Phase 11b: 0=GRAY,1=420,2=444,3=422,4=440,5=411
     input  wire [1:0]  y_qt_sel,
     input  wire [1:0]  cb_qt_sel,
     input  wire [1:0]  cr_qt_sel,
@@ -86,15 +86,18 @@ module block_sequencer (
     wire is_444  = (chroma_mode == 3'd2);
     wire is_422  = (chroma_mode == 3'd3);
     wire is_440  = (chroma_mode == 3'd4);
-    // MCU 宽度 8: GRAY/444/440; MCU 宽度 16: 420/422
-    // MCU 高度 8: GRAY/444/422; MCU 高度 16: 420/440
-    wire mcu_w8 = is_gray | is_444 | is_440;
-    wire mcu_h8 = is_gray | is_444 | is_422;
-    wire [15:0] mcu_cols = mcu_w8 ? ((img_width  + 16'd7)  >> 3) :
-                                    ((img_width  + 16'd15) >> 4);
+    wire is_411  = (chroma_mode == 3'd5);
+    // MCU 宽度 8: GRAY/444/440; MCU 宽度 16: 420/422; MCU 宽度 32: 411
+    // MCU 高度 8: GRAY/444/422/411; MCU 高度 16: 420/440
+    wire mcu_w8  = is_gray | is_444 | is_440;
+    wire mcu_w32 = is_411;
+    wire mcu_h8  = is_gray | is_444 | is_422 | is_411;
+    wire [15:0] mcu_cols = mcu_w32 ? ((img_width  + 16'd31) >> 5) :
+                           mcu_w8  ? ((img_width  + 16'd7)  >> 3) :
+                                     ((img_width  + 16'd15) >> 4);
     wire [15:0] mcu_rows = mcu_h8 ? ((img_height + 16'd7)  >> 3) :
                                     ((img_height + 16'd15) >> 4);
-    // block 数: GRAY→1, 444→3, 422/440→4, 420→6
+    // block 数: GRAY→1, 444→3, 422/440→4, 420/411→6
     wire [2:0] last_blk = is_gray         ? 3'd0 :
                           is_444          ? 3'd2 :
                           (is_422|is_440) ? 3'd3 : 3'd5;

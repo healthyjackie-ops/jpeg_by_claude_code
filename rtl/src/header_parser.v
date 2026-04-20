@@ -55,7 +55,7 @@ module header_parser (
     output reg         frame_done,     // 遇 EOI
     output reg  [15:0] dri_interval,   // Phase 7: DRI 间隔 MCU 数（0=禁用）
     output reg  [1:0]  num_components_o,// Phase 8: 1=grayscale, 3=YCbCr
-    output reg  [2:0]  chroma_mode_o,  // Phase 9/10/11a: 0=GRAY,1=420,2=444,3=422,4=440
+    output reg  [2:0]  chroma_mode_o,  // Phase 11b: 0=GRAY,1=420,2=444,3=422,4=440,5=411
     output reg  [8:0]  err             // sticky
 );
 
@@ -457,6 +457,8 @@ module header_parser (
                                     chroma_mode_o <= 3'd3;   // Phase 10: 4:2:2
                                 end else if (byte_in == 8'h12) begin
                                     chroma_mode_o <= 3'd4;   // Phase 11a: 4:4:0
+                                end else if (byte_in == 8'h41) begin
+                                    chroma_mode_o <= 3'd5;   // Phase 11b: 4:1:1
                                 end else begin
                                     err[`ERR_UNSUP_CHROMA] <= 1'b1; state <= S_ERROR;
                                 end

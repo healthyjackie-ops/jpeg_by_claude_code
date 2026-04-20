@@ -172,6 +172,11 @@ static int parse_sof0(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
             info->chroma_mode = CHROMA_440;
             info->mcu_cols = (info->width  + 7)  / 8;
             info->mcu_rows = (info->height + 15) / 16;
+        } else if (info->components[0].h_samp == 4 && info->components[0].v_samp == 1) {
+            /* Phase 11b: 4:1:1 — MCU 32x8 (4 Y blocks horizontally + Cb + Cr) */
+            info->chroma_mode = CHROMA_411;
+            info->mcu_cols = (info->width  + 31) / 32;
+            info->mcu_rows = (info->height + 7)  / 8;
         } else {
             *err |= JPEG_ERR_UNSUP_CHROMA;
             return -1;

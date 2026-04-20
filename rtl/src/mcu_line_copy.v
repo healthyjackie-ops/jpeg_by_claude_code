@@ -15,11 +15,12 @@ module mcu_line_copy (
     input  wire        is_444,          // Phase 9: 1=4:4:4 (Y 8x8 + Cb/Cr 8x8 full-res)
     input  wire        is_422,          // Phase 10: 1=4:2:2 (Y 16x8 + Cb/Cr 8x8)
     input  wire        is_440,          // Phase 11a: 1=4:4:0 (Y 8x16 + Cb/Cr 8x8)
+    input  wire        is_411,          // Phase 11b: 1=4:1:1 (Y 32x8 + Cb/Cr 8x8)
     output reg         done,
 
     // 读 mcu_buffer
     output reg  [3:0]  mb_y_row,
-    output reg  [3:0]  mb_y_col,
+    output reg  [4:0]  mb_y_col,         // Phase 11b: 5 位支持 0..31
     output reg  [2:0]  mb_c_row,
     output reg  [2:0]  mb_c_col,
     input  wire [7:0]  mb_y_data,
@@ -40,7 +41,7 @@ module mcu_line_copy (
 
     // 扫描状态
     reg [4:0] y_cnt;      // 0..15 rows
-    reg [3:0] col_cnt;    // 0..15 cols
+    reg [4:0] col_cnt;    // 0..31 cols (Phase 11b: 扩至 5 位)
     reg       phase;      // 0 = Y, 1 = Chroma (扫完 Y 后扫 Chroma 8×8)
     reg       active;
 
@@ -48,27 +49,29 @@ module mcu_line_copy (
     // Phase 9: 4:4:4 → MCU 为 8×8 (Y + Cb + Cr 全分辨率), 基地址 mx*8
     // Phase 10: 4:2:2 → Y 为 16×8, 基地址 mx*16; chroma 8×8, 基地址 mx*8
     // Phase 11a: 4:4:0 → Y 为 8×16, 基地址 mx*8; chroma 8×8, 基地址 mx*8
+    // Phase 11b: 4:1:1 → Y 为 32×8, 基地址 mx*32; chroma 8×8, 基地址 mx*8
     wire mcu_y8_wide = is_grayscale | is_444 | is_440;      // Y 列 ≤ 7
-    wire mcu_y8_tall = is_grayscale | is_444 | is_422;      // Y 行 ≤ 7
-    wire [11:0] y_col_base = mcu_y8_wide ? {mcu_col_idx[8:0], 3'd0} :
-                                            {mcu_col_idx[7:0], 4'd0};
+    wire mcu_y8_tall = is_grayscale | is_444 | is_422 | is_411;  // Y 行 ≤ 7
+    wire [11:0] y_col_base = is_411       ? {mcu_col_idx[6:0], 5'd0} :  // mx*32
+                             mcu_y8_wide  ? {mcu_col_idx[8:0], 3'd0} :  // mx*8
+                                            {mcu_col_idx[7:0], 4'd0};   // mx*16
     // chroma 列基地址: 统一 mx*8
-    //   4:2:0/4:2:2 → mx*8 (横半分辨率)
-    //   4:4:4/4:4:0 → mx*8 (chroma 全分辨率，chroma 8 列对应 Y 8 列)
     wire [11:0] c_col_base = {mcu_col_idx[8:0], 3'd0};   // mx*8 (12b)
     wire _unused_mcu_hi = |mcu_col_idx[15:9];
     // Phase 8: Y 扫描范围 — grayscale 8 行 8 列, 彩色 16×16
     // Phase 9: 4:4:4 同 grayscale 的 8×8
     // Phase 10: 4:2:2 → 8 行 × 16 列
     // Phase 11a: 4:4:0 → 16 行 × 8 列
+    // Phase 11b: 4:1:1 → 8 行 × 32 列
     wire [4:0] y_cnt_max_Y   = mcu_y8_tall ? 5'd7  : 5'd15;
-    wire [3:0] col_cnt_max_Y = mcu_y8_wide ? 4'd7  : 4'd15;
+    wire [4:0] col_cnt_max_Y = is_411      ? 5'd31 :
+                               mcu_y8_wide ? 5'd7  : 5'd15;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            y_cnt <= 5'd0; col_cnt <= 4'd0; phase <= 1'b0; active <= 1'b0;
+            y_cnt <= 5'd0; col_cnt <= 5'd0; phase <= 1'b0; active <= 1'b0;
             done <= 1'b0;
-            mb_y_row <= 4'd0; mb_y_col <= 4'd0;
+            mb_y_row <= 4'd0; mb_y_col <= 5'd0;
             mb_c_row <= 3'd0; mb_c_col <= 3'd0;
             lb_y_wr <= 1'b0; lb_y_row <= 4'd0; lb_y_col <= 12'd0; lb_y_data <= 8'd0;
             lb_c_wr <= 1'b0; lb_c_row <= 3'd0; lb_c_col <= 12'd0;
@@ -85,21 +88,21 @@ module mcu_line_copy (
                 active <= 1'b1;
                 phase  <= 1'b0;
                 y_cnt  <= 5'd0;
-                col_cnt<= 4'd0;
+                col_cnt<= 5'd0;
                 mb_y_row <= 4'd0;
-                mb_y_col <= 4'd0;
+                mb_y_col <= 5'd0;
             end else if (active) begin
                 if (!phase) begin
-                    // Y phase: 16×16 (color) 或 8×8 (grayscale)
+                    // Y phase: up to 32×16 (4:1:1/4:2:0) 或 8×8 (grayscale)
                     // 本周期地址已送，写 (y_cnt, col_cnt) -1 的结果
                     // 简化：读写同周期，直接组合 forward
                     lb_y_wr   <= 1'b1;
                     lb_y_row  <= y_cnt[3:0];
-                    lb_y_col  <= y_col_base + {8'd0, col_cnt};
+                    lb_y_col  <= y_col_base + {7'd0, col_cnt};
                     lb_y_data <= mb_y_data;
 
                     if (col_cnt == col_cnt_max_Y) begin
-                        col_cnt <= 4'd0;
+                        col_cnt <= 5'd0;
                         if (y_cnt == y_cnt_max_Y) begin
                             // Phase 8: grayscale 跳过 chroma，直接结束
                             if (is_grayscale) begin
@@ -114,11 +117,11 @@ module mcu_line_copy (
                         end else begin
                             y_cnt <= y_cnt + 5'd1;
                             mb_y_row <= y_cnt[3:0] + 4'd1;
-                            mb_y_col <= 4'd0;
+                            mb_y_col <= 5'd0;
                         end
                     end else begin
-                        col_cnt <= col_cnt + 4'd1;
-                        mb_y_col <= col_cnt + 4'd1;
+                        col_cnt <= col_cnt + 5'd1;
+                        mb_y_col <= col_cnt + 5'd1;
                     end
                 end else begin
                     // Chroma phase: 8 rows × 8 cols
@@ -129,7 +132,7 @@ module mcu_line_copy (
                     lb_cr_data <= mb_cr_data;
 
                     if (col_cnt[2:0] == 3'd7) begin
-                        col_cnt <= 4'd0;
+                        col_cnt <= 5'd0;
                         if (y_cnt[2:0] == 3'd7) begin
                             active <= 1'b0;
                             done   <= 1'b1;
@@ -139,7 +142,7 @@ module mcu_line_copy (
                             mb_c_col <= 3'd0;
                         end
                     end else begin
-                        col_cnt  <= col_cnt + 4'd1;
+                        col_cnt  <= col_cnt + 5'd1;
                         mb_c_col <= col_cnt[2:0] + 3'd1;
                     end
                 end

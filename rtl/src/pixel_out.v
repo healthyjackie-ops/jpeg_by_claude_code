@@ -19,6 +19,7 @@ module pixel_out (
     input  wire        is_444,         // Phase 9: 1=chroma 全分辨率，c_col=x_col, c_row=y_row[2:0]
     input  wire        is_422,         // Phase 10: 1=chroma 横半分辨率，c_col=x_col[11:1], c_row=y_row[2:0]
     input  wire        is_440,         // Phase 11a: 1=chroma 纵半分辨率，c_col=x_col, c_row=y_row[3:1]
+    input  wire        is_411,         // Phase 11b: 1=chroma 横 1/4 分辨率，c_col=x_col[11:2], c_row=y_row[2:0]
     output reg         row_done,
 
     // line_buffer 读口
@@ -51,7 +52,8 @@ module pixel_out (
     // Phase 8: grayscale MCU-row 是 8 行；非对齐时 tail 由 img_height[2:0] 决定
     // Phase 9: 4:4:4 MCU-row 也是 8 行 — 与 grayscale 复用同一份 tail 判断
     // Phase 10: 4:2:2 MCU-row 也是 8 行 — 同样复用 tail 判断
-    wire mcu_8x8 = is_grayscale | is_444 | is_422;
+    // Phase 11b: 4:1:1 MCU-row 也是 8 行 — 同样复用 tail 判断
+    wire mcu_8x8 = is_grayscale | is_444 | is_422 | is_411;
     wire [3:0]  last_mcu_rows_color = (img_height[3:0] == 4'd0) ? 4'd15 : (img_height[3:0] - 4'd1);
     wire [3:0]  last_mcu_rows_8x8   = (img_height[2:0] == 3'd0) ? 4'd7  :
                                                                  {1'b0, img_height[2:0] - 3'd1};
@@ -116,7 +118,7 @@ module pixel_out (
                 if (x_col == (img_width - 12'd1)) begin
                     rd_y_row <= (y_row == y_row_max) ? 4'd0 : (y_row + 4'd1);
                     rd_y_col <= 12'd0;
-                    if (is_444 || is_422)
+                    if (is_444 || is_422 || is_411)
                         rd_c_row <= (y_row == y_row_max) ? 3'd0 : next_y_row[2:0];
                     else
                         // 4:2:0 / 4:4:0 → chroma 纵向半分: c_row=y_row[3:1]
@@ -131,6 +133,10 @@ module pixel_out (
                     end else if (is_422) begin
                         rd_c_row <= y_row[2:0];
                         rd_c_col <= {1'b0, next_x_col[11:1]};
+                    end else if (is_411) begin
+                        // chroma 横向 1/4 分 (c_col=x_col[11:2]) + 纵向全分 (c_row=y_row[2:0])
+                        rd_c_row <= y_row[2:0];
+                        rd_c_col <= {2'b00, next_x_col[11:2]};
                     end else if (is_440) begin
                         // chroma 纵向半分 (c_row=y_row[3:1]) + 横向全分 (c_col=x_col)
                         rd_c_row <= y_row[3:1];

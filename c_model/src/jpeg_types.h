@@ -49,7 +49,8 @@ typedef enum {
     CHROMA_420  = 1,   /* Nf=3, H0=V0=2, chroma H=V=1 -> MCU 16x16, 6 blocks */
     CHROMA_444  = 2,   /* Nf=3, H=V=1 all comps      -> MCU 8x8,  3 blocks */
     CHROMA_422  = 3,   /* Phase 10: Nf=3, H0=2,V0=1 -> MCU 16x8, 4 blocks */
-    CHROMA_440  = 4    /* Phase 11a: Nf=3, H0=1,V0=2 -> MCU 8x16, 4 blocks */
+    CHROMA_440  = 4,   /* Phase 11a: Nf=3, H0=1,V0=2 -> MCU 8x16, 4 blocks */
+    CHROMA_411  = 5    /* Phase 11b: Nf=3, H0=4,V0=1 -> MCU 32x8, 6 blocks */
 } chroma_mode_t;
 
 typedef struct {

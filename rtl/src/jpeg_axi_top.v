@@ -120,11 +120,12 @@ module jpeg_axi_top (
     wire        dc_restart_w;       // Phase 7: block_seq → dc_predictor
     wire        align_req_w;        // Phase 7: block_seq → bitstream_unpack (drain shreg)
     wire [1:0]  num_components_w;   // Phase 8: Nf (1=gray, 3=YCbCr)
-    wire [2:0]  chroma_mode_w;      // Phase 9/10/11a: 0=GRAY,1=420,2=444,3=422,4=440
+    wire [2:0]  chroma_mode_w;      // Phase 9/10/11a/11b: 0=GRAY,1=420,2=444,3=422,4=440,5=411
     wire        is_grayscale_w = (chroma_mode_w == 3'd0);
     wire        is_444_w       = (chroma_mode_w == 3'd2);
     wire        is_422_w       = (chroma_mode_w == 3'd3);
     wire        is_440_w       = (chroma_mode_w == 3'd4);
+    wire        is_411_w       = (chroma_mode_w == 3'd5);
 
     header_parser u_hp (
         .clk(aclk), .rst_n(aresetn), .start(start_pulse),
@@ -291,7 +292,8 @@ module jpeg_axi_top (
     // ---------------- MCU buffer ------------------------------------
     wire [2:0]  cur_blk_type_w;
 
-    wire [3:0]  mb_y_row_w, mb_y_col_w;
+    wire [3:0]  mb_y_row_w;
+    wire [4:0]  mb_y_col_w;            // Phase 11b: 5 位支持 0..31 (4:1:1 Y 32-wide)
     wire [2:0]  mb_c_row_w, mb_c_col_w;
     wire [7:0]  mb_y_data_w, mb_cb_data_w, mb_cr_data_w;
 
@@ -303,6 +305,7 @@ module jpeg_axi_top (
         .pix4(pix4_w), .pix5(pix5_w), .pix6(pix6_w), .pix7(pix7_w),
         .blk_done_in(idct_blk_done_w),
         .blk_type(cur_blk_type_w),
+        .is_411(is_411_w),                // Phase 11b: 4:1:1 Y 32x8 布局
         .mcu_ready(mb_ready_nc), .mcu_consume(1'b0),
         .rd_y_row(mb_y_row_w), .rd_y_col(mb_y_col_w),
         .rd_y_data(mb_y_data_w),
@@ -330,6 +333,7 @@ module jpeg_axi_top (
         .is_444(is_444_w),                // Phase 9
         .is_422(is_422_w),                // Phase 10
         .is_440(is_440_w),                // Phase 11a
+        .is_411(is_411_w),                // Phase 11b
         .mb_y_row(mb_y_row_w), .mb_y_col(mb_y_col_w),
         .mb_c_row(mb_c_row_w), .mb_c_col(mb_c_col_w),
         .mb_y_data(mb_y_data_w),
@@ -379,6 +383,7 @@ module jpeg_axi_top (
         .is_444(is_444_w),             // Phase 9
         .is_422(is_422_w),             // Phase 10
         .is_440(is_440_w),             // Phase 11a
+        .is_411(is_411_w),             // Phase 11b
         .row_done(row_done_w),
         .rd_y_row(po_rd_y_row_w), .rd_y_col(po_rd_y_col_w),
         .rd_c_row(po_rd_c_row_w), .rd_c_col(po_rd_c_col_w),
