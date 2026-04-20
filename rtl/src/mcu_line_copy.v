@@ -11,6 +11,7 @@ module mcu_line_copy (
 
     input  wire        start,
     input  wire [15:0] mcu_col_idx,      // 0..mcu_cols-1
+    input  wire        is_grayscale,    // Phase 8: 1=only Y 8x8, skip chroma
     output reg         done,
 
     // 读 mcu_buffer
@@ -40,9 +41,14 @@ module mcu_line_copy (
     reg       phase;      // 0 = Y, 1 = Chroma (扫完 Y 后扫 Chroma 8×8)
     reg       active;
 
-    wire [11:0] y_col_base = {mcu_col_idx[7:0], 4'd0};   // mx*16
+    // Phase 8: 灰度 → MCU 为 8×8, 基地址 mx*8; 彩色 → 16×16, 基地址 mx*16
+    wire [11:0] y_col_base = is_grayscale ? {mcu_col_idx[8:0], 3'd0} :
+                                             {mcu_col_idx[7:0], 4'd0};
     wire [10:0] c_col_base = {mcu_col_idx[7:0], 3'd0};   // mx*8
-    wire _unused_mcu_hi = |mcu_col_idx[15:8];
+    wire _unused_mcu_hi = |mcu_col_idx[15:9];
+    // Phase 8: Y 扫描范围 — grayscale 8 行 8 列, 彩色 16×16
+    wire [4:0] y_cnt_max_Y = is_grayscale ? 5'd7  : 5'd15;
+    wire [3:0] col_cnt_max_Y = is_grayscale ? 4'd7 : 4'd15;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -70,7 +76,7 @@ module mcu_line_copy (
                 mb_y_col <= 4'd0;
             end else if (active) begin
                 if (!phase) begin
-                    // Y phase: 16 rows × 16 cols
+                    // Y phase: 16×16 (color) 或 8×8 (grayscale)
                     // 本周期地址已送，写 (y_cnt, col_cnt) -1 的结果
                     // 简化：读写同周期，直接组合 forward
                     lb_y_wr   <= 1'b1;
@@ -78,13 +84,19 @@ module mcu_line_copy (
                     lb_y_col  <= y_col_base + {8'd0, col_cnt};
                     lb_y_data <= mb_y_data;
 
-                    if (col_cnt == 4'd15) begin
+                    if (col_cnt == col_cnt_max_Y) begin
                         col_cnt <= 4'd0;
-                        if (y_cnt == 5'd15) begin
-                            phase <= 1'b1;
-                            y_cnt <= 5'd0;
-                            mb_c_row <= 3'd0;
-                            mb_c_col <= 3'd0;
+                        if (y_cnt == y_cnt_max_Y) begin
+                            // Phase 8: grayscale 跳过 chroma，直接结束
+                            if (is_grayscale) begin
+                                active <= 1'b0;
+                                done   <= 1'b1;
+                            end else begin
+                                phase <= 1'b1;
+                                y_cnt <= 5'd0;
+                                mb_c_row <= 3'd0;
+                                mb_c_col <= 3'd0;
+                            end
                         end else begin
                             y_cnt <= y_cnt + 5'd1;
                             mb_y_row <= y_cnt[3:0] + 4'd1;

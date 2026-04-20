@@ -54,6 +54,7 @@ module header_parser (
     output reg         data_mode,      // 1=进入熵编码数据段
     output reg         frame_done,     // 遇 EOI
     output reg  [15:0] dri_interval,   // Phase 7: DRI 间隔 MCU 数（0=禁用）
+    output reg  [1:0]  num_components_o,// Phase 8: 1=grayscale, 3=YCbCr 4:2:0
     output reg  [8:0]  err             // sticky
 );
 
@@ -180,6 +181,7 @@ module header_parser (
             comp0_ta <= 2'd0; comp1_ta <= 2'd0; comp2_ta <= 2'd0;
             header_done <= 1'b0; data_mode <= 1'b0; frame_done <= 1'b0;
             dri_interval <= 16'd0;
+            num_components_o <= 2'd3;
             err <= 9'd0;
             qt_wr <= 1'b0; qt_sel <= 2'd0; qt_idx <= 6'd0; qt_val <= 8'd0;
             ht_bits_wr <= 1'b0; ht_val_wr <= 1'b0;
@@ -191,6 +193,7 @@ module header_parser (
             state <= S_IDLE;
             header_done <= 1'b0; data_mode <= 1'b0; frame_done <= 1'b0;
             dri_interval <= 16'd0;
+            num_components_o <= 2'd3;
             err <= 9'd0;
             qt_wr <= 1'b0; ht_bits_wr <= 1'b0; ht_val_wr <= 1'b0;
             ht_build_start <= 1'b0;
@@ -211,6 +214,7 @@ module header_parser (
                         data_mode   <= 1'b0;
                         frame_done  <= 1'b0;
                         dri_interval <= 16'd0;
+                        num_components_o <= 2'd3;
                         err         <= 9'd0;
                     end
                 end
@@ -410,13 +414,15 @@ module header_parser (
                     // 尺寸检查在下个 cycle 校验
                 end
                 S_SOF_NF: if (beat) begin
-                    if (byte_in != 8'd3) begin
+                    // Phase 8: accept Nf=1 (grayscale) or Nf=3 (4:2:0)
+                    if (byte_in != 8'd3 && byte_in != 8'd1) begin
                         err[`ERR_UNSUP_CHROMA] <= 1'b1; state <= S_ERROR;
                     end else if (img_width == 16'd0 || img_height == 16'd0 ||
                                  img_width > 16'd4096 || img_height > 16'd4096) begin
                         // Phase 6: 非 16 对齐尺寸由 decoder 自行裁剪，不再拒绝
                         err[`ERR_SIZE_OOR] <= 1'b1; state <= S_ERROR;
                     end else begin
+                        num_components_o <= byte_in[1:0];
                         remain <= remain - 16'd1;
                         sof_comp_idx <= 2'd0;
                         state <= S_SOF_COMP_ID;
@@ -428,13 +434,18 @@ module header_parser (
                     state <= S_SOF_COMP_HV;
                 end
                 S_SOF_COMP_HV: if (beat) begin
-                    // Y: H=2,V=2;  Cb/Cr: H=1,V=1 (YUV420)
-                    case (sof_comp_idx)
-                        2'd0: if (byte_in != 8'h22) begin err[`ERR_UNSUP_CHROMA] <= 1'b1; state <= S_ERROR; end
-                        2'd1: if (byte_in != 8'h11) begin err[`ERR_UNSUP_CHROMA] <= 1'b1; state <= S_ERROR; end
-                        2'd2: if (byte_in != 8'h11) begin err[`ERR_UNSUP_CHROMA] <= 1'b1; state <= S_ERROR; end
-                        default: ;
-                    endcase
+                    // Phase 8: Nf=1 grayscale → Y only H=1,V=1
+                    //         Nf=3 4:2:0    → Y 2x2, Cb/Cr 1x1
+                    if (num_components_o == 2'd1) begin
+                        if (byte_in != 8'h11) begin err[`ERR_UNSUP_CHROMA] <= 1'b1; state <= S_ERROR; end
+                    end else begin
+                        case (sof_comp_idx)
+                            2'd0: if (byte_in != 8'h22) begin err[`ERR_UNSUP_CHROMA] <= 1'b1; state <= S_ERROR; end
+                            2'd1: if (byte_in != 8'h11) begin err[`ERR_UNSUP_CHROMA] <= 1'b1; state <= S_ERROR; end
+                            2'd2: if (byte_in != 8'h11) begin err[`ERR_UNSUP_CHROMA] <= 1'b1; state <= S_ERROR; end
+                            default: ;
+                        endcase
+                    end
                     remain <= remain - 16'd1;
                     if (state != S_ERROR) state <= S_SOF_COMP_TQ;
                 end
@@ -446,7 +457,8 @@ module header_parser (
                         default: ;
                     endcase
                     remain <= remain - 16'd1;
-                    if (sof_comp_idx == 2'd2) begin
+                    // Phase 8: 终止条件按 num_components_o
+                    if (sof_comp_idx == num_components_o - 2'd1) begin
                         state <= S_FIND_FF;
                     end else begin
                         sof_comp_idx <= sof_comp_idx + 2'd1;
@@ -456,7 +468,8 @@ module header_parser (
 
                 // ------------------------------------------------------ SOS
                 S_SOS_NS: if (beat) begin
-                    if (byte_in != 8'd3) begin
+                    // Phase 8: Ns must match Nf from SOF (1 or 3)
+                    if (byte_in[7:0] != {6'd0, num_components_o}) begin
                         err[`ERR_UNSUP_CHROMA] <= 1'b1; state <= S_ERROR;
                     end else begin
                         sos_comp_idx <= 2'd0;
@@ -477,7 +490,7 @@ module header_parser (
                         default: ;
                     endcase
                     remain <= remain - 16'd1;
-                    if (sos_comp_idx == 2'd2) begin
+                    if (sos_comp_idx == num_components_o - 2'd1) begin
                         state <= S_SOS_SS;
                     end else begin
                         sos_comp_idx <= sos_comp_idx + 2'd1;

@@ -15,6 +15,7 @@ module pixel_out (
     input  wire [11:0] img_height,     // Phase 6: 像素高度，用于最后 MCU-row 行裁剪
     input  wire        is_first_row,
     input  wire        is_last_row,
+    input  wire        is_grayscale,   // Phase 8: 1=MCU-row 8 行, Cb/Cr 输出 0x80
     output reg         row_done,
 
     // line_buffer 读口
@@ -44,8 +45,13 @@ module pixel_out (
     wire _unused_pix = next_y_row[0];
 
     // Phase 6: 非 16 对齐 — 最后 MCU-row 可能只有 (img_height[3:0]) 行有效
-    wire [3:0]  last_mcu_rows  = (img_height[3:0] == 4'd0) ? 4'd15 : (img_height[3:0] - 4'd1);
-    wire [3:0]  y_row_max      = is_last_row ? last_mcu_rows : 4'd15;
+    // Phase 8: grayscale MCU-row 是 8 行；非对齐时 tail 由 img_height[2:0] 决定
+    wire [3:0]  last_mcu_rows_color = (img_height[3:0] == 4'd0) ? 4'd15 : (img_height[3:0] - 4'd1);
+    wire [3:0]  last_mcu_rows_gray  = (img_height[2:0] == 3'd0) ? 4'd7  :
+                                                                 {1'b0, img_height[2:0] - 3'd1};
+    wire [3:0]  full_mcu_rows = is_grayscale ? 4'd7 : 4'd15;
+    wire [3:0]  last_mcu_rows = is_grayscale ? last_mcu_rows_gray : last_mcu_rows_color;
+    wire [3:0]  y_row_max     = is_last_row ? last_mcu_rows : full_mcu_rows;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -75,7 +81,10 @@ module pixel_out (
             if (active && (!tvalid || tready)) begin
                 // 驱动当前 (y_row, x_col) 像素
                 tvalid    <= 1'b1;
-                tdata     <= {rd_y_data, rd_cb_data, rd_cr_data};
+                // Phase 8: grayscale 下 Cb/Cr 固定 0x80（中灰）
+                tdata     <= {rd_y_data,
+                              is_grayscale ? 8'h80 : rd_cb_data,
+                              is_grayscale ? 8'h80 : rd_cr_data};
                 tuser_sof <= is_first_row && (y_row == 4'd0) && (x_col == 12'd0);
                 tlast     <= (x_col == (img_width - 12'd1));
 

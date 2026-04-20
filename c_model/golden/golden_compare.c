@@ -19,6 +19,7 @@ static void err_exit(j_common_ptr cinfo) {
 typedef struct {
     uint32_t width;
     uint32_t height;
+    int num_components;  /* 1=grayscale, 3=YCbCr 4:2:0 */
     uint8_t *y;
     uint8_t *cb;
     uint8_t *cr;
@@ -36,10 +37,11 @@ static int libjpeg_decode_ycc(const uint8_t *data, size_t size, libjpeg_ycc_t *o
     jpeg_mem_src(&cinfo, (unsigned char*)data, size);
     jpeg_read_header(&cinfo, TRUE);
 
+    int is_gray = (cinfo.num_components == 1);
     cinfo.raw_data_out = TRUE;
     cinfo.do_fancy_upsampling = FALSE;
     cinfo.dct_method = JDCT_ISLOW;
-    cinfo.out_color_space = JCS_YCbCr;
+    cinfo.out_color_space = is_gray ? JCS_GRAYSCALE : JCS_YCbCr;
 
     if (!jpeg_start_decompress(&cinfo)) { jpeg_destroy_decompress(&cinfo); return -1; }
 
@@ -47,48 +49,71 @@ static int libjpeg_decode_ycc(const uint8_t *data, size_t size, libjpeg_ycc_t *o
     uint32_t H = cinfo.output_height;
     out->width = W;
     out->height = H;
+    out->num_components = is_gray ? 1 : 3;
 
-    /* raw_data_out 要求 MCU 对齐的行缓冲。每次调用 jpeg_read_raw_data
-       会填 16 行 Y / 8 行 Cb / 8 行 Cr，哪怕 H 不是 16 的倍数。
-       用 padded 临时缓冲，之后 crop 到 W×H。 */
-    uint32_t Wp = ((W + 15) / 16) * 16;
-    uint32_t Hp = ((H + 15) / 16) * 16;
-    uint32_t CWp = Wp / 2;
-    uint32_t CHp = Hp / 2;
-    uint8_t *y_pad  = (uint8_t*)calloc((size_t)Wp  * Hp,  1);
-    uint8_t *cb_pad = (uint8_t*)calloc((size_t)CWp * CHp, 1);
-    uint8_t *cr_pad = (uint8_t*)calloc((size_t)CWp * CHp, 1);
-
-    JSAMPROW y_rowptrs[16];
-    JSAMPROW cb_rowptrs[8];
-    JSAMPROW cr_rowptrs[8];
-    JSAMPARRAY arrays[3] = { y_rowptrs, cb_rowptrs, cr_rowptrs };
-
-    while (cinfo.output_scanline < H) {
-        uint32_t base_y = cinfo.output_scanline;
-        for (uint32_t i = 0; i < 16; i++) {
-            y_rowptrs[i]  = y_pad + (size_t)(base_y + i) * Wp;
+    if (is_gray) {
+        /* Phase 8: grayscale — raw_data_out fills 8 rows of Y per call.
+           MCU-aligned pad buffer, crop later. */
+        uint32_t Wp = ((W + 7) / 8) * 8;
+        uint32_t Hp = ((H + 7) / 8) * 8;
+        uint8_t *y_pad = (uint8_t*)calloc((size_t)Wp * Hp, 1);
+        JSAMPROW y_rowptrs[8];
+        JSAMPARRAY arrays[1] = { y_rowptrs };
+        while (cinfo.output_scanline < H) {
+            uint32_t base_y = cinfo.output_scanline;
+            for (uint32_t i = 0; i < 8; i++) {
+                y_rowptrs[i] = y_pad + (size_t)(base_y + i) * Wp;
+            }
+            (void)jpeg_read_raw_data(&cinfo, arrays, 8);
         }
-        uint32_t base_c = base_y >> 1;
-        for (uint32_t i = 0; i < 8; i++) {
-            cb_rowptrs[i] = cb_pad + (size_t)(base_c + i) * CWp;
-            cr_rowptrs[i] = cr_pad + (size_t)(base_c + i) * CWp;
+        out->y = (uint8_t*)calloc((size_t)W * H, 1);
+        for (uint32_t r = 0; r < H; r++) {
+            memcpy(out->y + (size_t)r * W, y_pad + (size_t)r * Wp, W);
         }
-        (void)jpeg_read_raw_data(&cinfo, arrays, 16);
-    }
+        free(y_pad);
+    } else {
+        /* raw_data_out 要求 MCU 对齐的行缓冲。每次调用 jpeg_read_raw_data
+           会填 16 行 Y / 8 行 Cb / 8 行 Cr，哪怕 H 不是 16 的倍数。
+           用 padded 临时缓冲，之后 crop 到 W×H。 */
+        uint32_t Wp = ((W + 15) / 16) * 16;
+        uint32_t Hp = ((H + 15) / 16) * 16;
+        uint32_t CWp = Wp / 2;
+        uint32_t CHp = Hp / 2;
+        uint8_t *y_pad  = (uint8_t*)calloc((size_t)Wp  * Hp,  1);
+        uint8_t *cb_pad = (uint8_t*)calloc((size_t)CWp * CHp, 1);
+        uint8_t *cr_pad = (uint8_t*)calloc((size_t)CWp * CHp, 1);
 
-    /* Crop padded buffers to actual W×H / (W/2)×(H/2). */
-    out->y  = (uint8_t*)calloc((size_t)W * H, 1);
-    out->cb = (uint8_t*)calloc((size_t)(W/2) * (H/2), 1);
-    out->cr = (uint8_t*)calloc((size_t)(W/2) * (H/2), 1);
-    for (uint32_t r = 0; r < H; r++) {
-        memcpy(out->y + (size_t)r * W, y_pad + (size_t)r * Wp, W);
+        JSAMPROW y_rowptrs[16];
+        JSAMPROW cb_rowptrs[8];
+        JSAMPROW cr_rowptrs[8];
+        JSAMPARRAY arrays[3] = { y_rowptrs, cb_rowptrs, cr_rowptrs };
+
+        while (cinfo.output_scanline < H) {
+            uint32_t base_y = cinfo.output_scanline;
+            for (uint32_t i = 0; i < 16; i++) {
+                y_rowptrs[i]  = y_pad + (size_t)(base_y + i) * Wp;
+            }
+            uint32_t base_c = base_y >> 1;
+            for (uint32_t i = 0; i < 8; i++) {
+                cb_rowptrs[i] = cb_pad + (size_t)(base_c + i) * CWp;
+                cr_rowptrs[i] = cr_pad + (size_t)(base_c + i) * CWp;
+            }
+            (void)jpeg_read_raw_data(&cinfo, arrays, 16);
+        }
+
+        /* Crop padded buffers to actual W×H / (W/2)×(H/2). */
+        out->y  = (uint8_t*)calloc((size_t)W * H, 1);
+        out->cb = (uint8_t*)calloc((size_t)(W/2) * (H/2), 1);
+        out->cr = (uint8_t*)calloc((size_t)(W/2) * (H/2), 1);
+        for (uint32_t r = 0; r < H; r++) {
+            memcpy(out->y + (size_t)r * W, y_pad + (size_t)r * Wp, W);
+        }
+        for (uint32_t r = 0; r < H/2; r++) {
+            memcpy(out->cb + (size_t)r * (W/2), cb_pad + (size_t)r * CWp, W/2);
+            memcpy(out->cr + (size_t)r * (W/2), cr_pad + (size_t)r * CWp, W/2);
+        }
+        free(y_pad); free(cb_pad); free(cr_pad);
     }
-    for (uint32_t r = 0; r < H/2; r++) {
-        memcpy(out->cb + (size_t)r * (W/2), cb_pad + (size_t)r * CWp, W/2);
-        memcpy(out->cr + (size_t)r * (W/2), cr_pad + (size_t)r * CWp, W/2);
-    }
-    free(y_pad); free(cb_pad); free(cr_pad);
 
     jpeg_finish_decompress(&cinfo);
     jpeg_destroy_decompress(&cinfo);
@@ -146,27 +171,30 @@ int main(int argc, char **argv) {
 
         int dy_max = 0, dc_max = 0;
         size_t npix = (size_t)gold.width * gold.height;
-        size_t ncpix = (size_t)(gold.width/2) * (gold.height/2);
         for (size_t i = 0; i < npix; i++) {
             int d = (int)ours.y_plane[i] - (int)gold.y[i];
             if (d < 0) d = -d;
             if (d > dy_max) dy_max = d;
         }
-        for (size_t i = 0; i < ncpix; i++) {
-            int d1 = (int)ours.cb_plane_420[i] - (int)gold.cb[i];
-            int d2 = (int)ours.cr_plane_420[i] - (int)gold.cr[i];
-            if (d1 < 0) d1 = -d1;
-            if (d2 < 0) d2 = -d2;
-            if (d1 > dc_max) dc_max = d1;
-            if (d2 > dc_max) dc_max = d2;
+        if (gold.num_components == 3) {
+            size_t ncpix = (size_t)(gold.width/2) * (gold.height/2);
+            for (size_t i = 0; i < ncpix; i++) {
+                int d1 = (int)ours.cb_plane_420[i] - (int)gold.cb[i];
+                int d2 = (int)ours.cr_plane_420[i] - (int)gold.cr[i];
+                if (d1 < 0) d1 = -d1;
+                if (d2 < 0) d2 = -d2;
+                if (d1 > dc_max) dc_max = d1;
+                if (d2 > dc_max) dc_max = d2;
+            }
         }
 
+        const char *tag = (gold.num_components == 1) ? " [GRAY]" : "";
         if (dy_max == 0 && dc_max == 0) {
-            printf("[PASS] %s %ux%u exact\n", argv[a], gold.width, gold.height);
+            printf("[PASS] %s %ux%u exact%s\n", argv[a], gold.width, gold.height, tag);
             pass++;
         } else {
-            printf("[FAIL] %s %ux%u maxDiff Y=%d C=%d\n",
-                   argv[a], gold.width, gold.height, dy_max, dc_max);
+            printf("[FAIL] %s %ux%u maxDiff Y=%d C=%d%s\n",
+                   argv[a], gold.width, gold.height, dy_max, dc_max, tag);
             fail++;
         }
         if (dy_max > worst_diff_y) worst_diff_y = dy_max;

@@ -417,18 +417,27 @@ static DiffResult diff_one(const std::vector<uint8_t>& jpeg,
     R.match_geom = (w_reg == golden.width) && (h_reg == golden.height)
                    && (rY.size() == size_t(golden.width) * golden.height);
 
-    // Pixel compare (Y, then Cb/Cr at 4:4:4 upsampled plane)
+    // Pixel compare (Y always; Cb/Cr only when 3-component 4:2:0 upsampled)
+    const bool is_gray = (golden.cb_plane == nullptr);
     if (R.match_geom) {
         for (size_t i = 0; i < rY.size(); ++i) {
             uint8_t gy  = golden.y_plane[i];
-            uint8_t gcb = golden.cb_plane[i];
-            uint8_t gcr = golden.cr_plane[i];
-            uint32_t dy  = std::abs(int(rY[i])  - int(gy));
-            uint32_t dcb = std::abs(int(rCb[i]) - int(gcb));
-            uint32_t dcr = std::abs(int(rCr[i]) - int(gcr));
-            if (dy  > R.max_diff_y) R.max_diff_y = dy;
-            uint32_t dc = std::max(dcb, dcr);
-            if (dc > R.max_diff_c) R.max_diff_c = dc;
+            uint32_t dy = std::abs(int(rY[i]) - int(gy));
+            if (dy > R.max_diff_y) R.max_diff_y = dy;
+            if (!is_gray) {
+                uint8_t gcb = golden.cb_plane[i];
+                uint8_t gcr = golden.cr_plane[i];
+                uint32_t dcb = std::abs(int(rCb[i]) - int(gcb));
+                uint32_t dcr = std::abs(int(rCr[i]) - int(gcr));
+                uint32_t dc = std::max(dcb, dcr);
+                if (dc > R.max_diff_c) R.max_diff_c = dc;
+            } else {
+                // Phase 8: grayscale — RTL outputs Cb=Cr=0x80 padding
+                uint32_t dcb = std::abs(int(rCb[i]) - 0x80);
+                uint32_t dcr = std::abs(int(rCr[i]) - 0x80);
+                uint32_t dc = std::max(dcb, dcr);
+                if (dc > R.max_diff_c) R.max_diff_c = dc;
+            }
         }
     }
 

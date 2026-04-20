@@ -16,6 +16,7 @@ module block_sequencer (
     input  wire        frame_start,    // header_parser.header_done 脉冲
     input  wire [15:0] img_width,
     input  wire [15:0] img_height,
+    input  wire [1:0]  num_components,// Phase 8: 1=grayscale(MCU 8x8, 1 block), 3=4:2:0(MCU 16x16, 6 blocks)
     input  wire [1:0]  y_qt_sel,
     input  wire [1:0]  cb_qt_sel,
     input  wire [1:0]  cr_qt_sel,
@@ -75,9 +76,16 @@ module block_sequencer (
     output reg         frame_done_o
 );
 
-    // 计算 mcu 行列数（Phase 6: 非 16 对齐尺寸向上取整）
-    wire [15:0] mcu_cols = (img_width  + 16'd15) >> 4;
-    wire [15:0] mcu_rows = (img_height + 16'd15) >> 4;
+    // 计算 mcu 行列数
+    // Phase 6: 非 16 对齐尺寸向上取整
+    // Phase 8: grayscale → MCU = 8x8；4:2:0 → MCU = 16x16
+    wire is_gray = (num_components == 2'd1);
+    wire [15:0] mcu_cols = is_gray ? ((img_width  + 16'd7) >> 3) :
+                                     ((img_width  + 16'd15) >> 4);
+    wire [15:0] mcu_rows = is_gray ? ((img_height + 16'd7) >> 3) :
+                                     ((img_height + 16'd15) >> 4);
+    // Phase 8: grayscale 每 MCU 只有 1 个 Y 块, 4:2:0 每 MCU 有 6 个块
+    wire [2:0] last_blk = is_gray ? 3'd0 : 3'd5;
 
     localparam [3:0]
         S_IDLE     = 4'd0,
@@ -193,7 +201,7 @@ module block_sequencer (
                 end
 
                 S_NEXT_BLK: begin
-                    if (blk_idx == 3'd5) begin
+                    if (blk_idx == last_blk) begin
                         // MCU 完成，触发搬运
                         mcu_col_idx <= mx;
                         mcu_copy_start <= 1'b1;

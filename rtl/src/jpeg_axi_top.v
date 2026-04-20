@@ -119,6 +119,8 @@ module jpeg_axi_top (
     wire        restart_ack_w;      // Phase 7: block_seq → bitstream_unpack
     wire        dc_restart_w;       // Phase 7: block_seq → dc_predictor
     wire        align_req_w;        // Phase 7: block_seq → bitstream_unpack (drain shreg)
+    wire [1:0]  num_components_w;   // Phase 8: Nf (1=gray, 3=4:2:0)
+    wire        is_grayscale_w = (num_components_w == 2'd1);
 
     header_parser u_hp (
         .clk(aclk), .rst_n(aresetn), .start(start_pulse),
@@ -139,6 +141,7 @@ module jpeg_axi_top (
         .header_done(header_done_w), .data_mode(data_mode),
         .frame_done(frame_done_hp),
         .dri_interval(dri_interval_w),   // Phase 7
+        .num_components_o(num_components_w), // Phase 8
         .err(err_w)
     );
 
@@ -318,6 +321,7 @@ module jpeg_axi_top (
     mcu_line_copy u_lc (
         .clk(aclk), .rst_n(aresetn), .soft_reset(softrst),
         .start(lc_start_w), .mcu_col_idx(lc_mcu_col_w), .done(lc_done_w),
+        .is_grayscale(is_grayscale_w),    // Phase 8
         .mb_y_row(mb_y_row_w), .mb_y_col(mb_y_col_w),
         .mb_c_row(mb_c_row_w), .mb_c_col(mb_c_col_w),
         .mb_y_data(mb_y_data_w),
@@ -363,6 +367,7 @@ module jpeg_axi_top (
         .row_start(row_ready_w), .img_width(img_w_w[11:0]),
         .img_height(img_h_w[11:0]),   // Phase 6: H 裁剪
         .is_first_row(is_first_row_w), .is_last_row(is_last_row_w),
+        .is_grayscale(is_grayscale_w), // Phase 8
         .row_done(row_done_w),
         .rd_y_row(po_rd_y_row_w), .rd_y_col(po_rd_y_col_w),
         .rd_c_row(po_rd_c_row_w), .rd_c_col(po_rd_c_col_w),
@@ -393,6 +398,7 @@ module jpeg_axi_top (
         .clk(aclk), .rst_n(aresetn), .soft_reset(softrst),
         .frame_start(header_done_w),
         .img_width(img_w_w), .img_height(img_h_w),
+        .num_components(num_components_w),  // Phase 8
         .y_qt_sel(comp0_qt), .cb_qt_sel(comp1_qt), .cr_qt_sel(comp2_qt),
         .y_dc_sel(comp0_td), .y_ac_sel(comp0_ta),
         .cb_dc_sel(comp1_td), .cb_ac_sel(comp1_ta),
