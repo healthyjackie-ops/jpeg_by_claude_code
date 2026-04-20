@@ -487,6 +487,28 @@ static DiffResult diff_one(const std::vector<uint8_t>& jpeg,
     }
 
     R.rtl_ok = (err == 0);
+
+    // Phase 16a: CSR SCAN_PARAMS sanity check. For baseline (SOF0/SOF1) the
+    // parser must have captured {Ss=0, Se=63, Ah=0, Al=0} and SofType matching
+    // precision. Any deviation would indicate the new plumbing mis-routed
+    // bits — fail the test so drift is caught immediately.
+    if (R.rtl_ok) {
+        uint32_t sp = csr.read32(REG_SCAN_PARAMS);
+        uint32_t ss_r       =  sp        & 0x3Fu;
+        uint32_t se_r       = (sp >> 8)  & 0x3Fu;
+        uint32_t ah_r       = (sp >> 16) & 0x0Fu;
+        uint32_t al_r       = (sp >> 20) & 0x0Fu;
+        uint32_t sof_type_r = (sp >> 24) & 0x03u;
+        uint32_t want_sof   = (golden.precision == 12) ? 1u : 0u;
+        if (ss_r != 0u || se_r != 63u || ah_r != 0u || al_r != 0u || sof_type_r != want_sof) {
+            std::fprintf(stderr,
+                "  SCAN_PARAMS mismatch: Ss=%u Se=%u Ah=%u Al=%u SofType=%u (want baseline)\n",
+                ss_r, se_r, ah_r, al_r, sof_type_r);
+            R.rtl_ok = false;
+            R.err_code |= 0x100u;  // synthetic bit 8 to signal TB-level fail
+        }
+    }
+
     if (out_Y)  *out_Y  = std::move(rY);
     if (out_Cb) *out_Cb = std::move(rCb);
     if (out_Cr) *out_Cr = std::move(rCr);

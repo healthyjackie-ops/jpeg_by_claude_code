@@ -30,6 +30,8 @@ enum : uint32_t {
     REG_ERROR_CODE  = 0x020,
     REG_CONFIG      = 0x024,
     REG_SCRATCH     = 0x028,
+    REG_PIX_FMT     = 0x02C,
+    REG_SCAN_PARAMS = 0x040,
 };
 
 enum : uint32_t {

@@ -125,6 +125,11 @@ module jpeg_axi_top (
     wire [2:0]  num_components_w;   // Phase 12: Nf (1=gray, 3=YCbCr, 4=CMYK)
     wire [2:0]  chroma_mode_w;      // Phase 12: 0=GRAY,1=420,2=444,3=422,4=440,5=411,6=CMYK
     wire        precision_w;        // Phase 13: 0=P=8, 1=P=12
+    wire [1:0]  sof_type_w;         // Phase 16a
+    wire [5:0]  sos_ss_w;
+    wire [5:0]  sos_se_w;
+    wire [3:0]  sos_ah_w;
+    wire [3:0]  sos_al_w;
     wire        is_grayscale_w = (chroma_mode_w == 3'd0);
     wire        is_444_w       = (chroma_mode_w == 3'd2);
     wire        is_422_w       = (chroma_mode_w == 3'd3);
@@ -154,6 +159,11 @@ module jpeg_axi_top (
         .num_components_o(num_components_w), // Phase 8
         .chroma_mode_o(chroma_mode_w),   // Phase 9
         .precision_o(precision_w),       // Phase 13
+        .sof_type_o(sof_type_w),         // Phase 16a
+        .sos_ss_o(sos_ss_w),
+        .sos_se_o(sos_se_w),
+        .sos_ah_o(sos_ah_w),
+        .sos_al_o(sos_al_w),
         .err(err_w)
     );
 
@@ -545,7 +555,12 @@ module jpeg_axi_top (
         .img_width_in(img_w_w),
         .img_height_in(img_h_w),
         .pixel_count_in(pixel_cnt_r),
-        .precision_in(precision_w)      // Phase 13
+        .precision_in(precision_w),     // Phase 13
+        .sof_type_in(sof_type_w),       // Phase 16a
+        .sos_ss_in(sos_ss_w),
+        .sos_se_in(sos_se_w),
+        .sos_ah_in(sos_ah_w),
+        .sos_al_in(sos_al_w)
     );
 
     // 防未使用告警

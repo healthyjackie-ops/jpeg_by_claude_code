@@ -14,6 +14,8 @@
 //   0x024 CONFIG     (RW)
 //   0x028 SCRATCH    (RW)
 //   0x02C PIX_FMT    (RO, Phase 13: bit[0] = precision 0=P=8/1=P=12)
+//   0x040 SCAN_PARAMS(RO, Phase 16a: {[25:24]=SofType, [23:20]=Al,
+//                                     [19:16]=Ah, [13:8]=Se, [5:0]=Ss})
 //
 // 不支持 burst，按每次 1 beat 处理。
 // ---------------------------------------------------------------------------
@@ -76,7 +78,14 @@ module axi_lite_slave (
     input  wire [31:0] pixel_count_in,
 
     // Phase 13
-    input  wire        precision_in        // 0 = P=8, 1 = P=12
+    input  wire        precision_in,       // 0 = P=8, 1 = P=12
+
+    // Phase 16a: SOF + SOS scan params (read-only visibility)
+    input  wire [1:0]  sof_type_in,
+    input  wire [5:0]  sos_ss_in,
+    input  wire [5:0]  sos_se_in,
+    input  wire [3:0]  sos_ah_in,
+    input  wire [3:0]  sos_al_in
 );
 
     // ---- AW/W/AR simple handshakes ------------------------------------
@@ -252,6 +261,12 @@ module axi_lite_slave (
                     12'h024: s_rdata <= cfg_reg;
                     12'h028: s_rdata <= scratch_reg;
                     12'h02C: s_rdata <= {31'd0, precision_in};   // Phase 13 PIX_FMT
+                    // Phase 16a SCAN_PARAMS: {[25:24]=SofType, [23:20]=Al,
+                    // [19:16]=Ah, [13:8]=Se, [5:0]=Ss}
+                    12'h040: s_rdata <= {6'd0, sof_type_in,
+                                         sos_al_in, sos_ah_in,
+                                         2'd0, sos_se_in,
+                                         2'd0, sos_ss_in};
                     default: s_rdata <= 32'd0;
                 endcase
             end else if (s_rvalid && s_rready) begin

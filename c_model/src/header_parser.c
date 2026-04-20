@@ -221,10 +221,12 @@ static int parse_sof_common(bitstream_t *bs, jpeg_info_t *info, uint32_t *err,
 }
 
 static int parse_sof0(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
+    info->sof_type = 0;
     return parse_sof_common(bs, info, err, 0);
 }
 
 static int parse_sof1(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
+    info->sof_type = 1;
     return parse_sof_common(bs, info, err, 1);
 }
 
@@ -254,9 +256,22 @@ static int parse_sos(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
     if (bs_read_byte(bs, &se)) { *err |= JPEG_ERR_STREAM_TRUNC; return -1; }
     if (bs_read_byte(bs, &ah_al)) { *err |= JPEG_ERR_STREAM_TRUNC; return -1; }
 
-    if (ss != 0 || se != 63 || ah_al != 0) {
-        *err |= JPEG_ERR_UNSUP_SOF;
-        return -1;
+    /* Phase 16a: capture scan params unconditionally so downstream (and future
+     * progressive decode) can inspect them. */
+    info->scan_ss = ss;
+    info->scan_se = se;
+    info->scan_ah = ah_al >> 4;
+    info->scan_al = ah_al & 0x0F;
+
+    /* Baseline (SOF0/SOF1) still requires the full-block scan. SOF2/SOF3 can
+     * never reach here today — the outer dispatch error-outs before SOS (Phase
+     * 14). When Phase 16b enables SOF2, this gate relaxes to allow DC-only
+     * (Ss=Se=0, Ah=0) and later AC ranges. */
+    if (info->sof_type != 2) {
+        if (ss != 0 || se != 63 || ah_al != 0) {
+            *err |= JPEG_ERR_UNSUP_SOF;
+            return -1;
+        }
     }
     return 0;
 }

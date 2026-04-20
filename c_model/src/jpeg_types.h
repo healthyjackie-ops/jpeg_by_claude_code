@@ -91,6 +91,11 @@ typedef struct {
     uint16_t mcu_cols;
     uint16_t mcu_rows;
     uint8_t  chroma_mode;   /* Phase 9: chroma_mode_t */
+    uint8_t  sof_type;      /* Phase 16a: 0=SOF0,1=SOF1,2=SOF2,3=SOF3 */
+    uint8_t  scan_ss;       /* Phase 16a: SOS Ss (0..63) */
+    uint8_t  scan_se;       /* Phase 16a: SOS Se (0..63) */
+    uint8_t  scan_ah;       /* Phase 16a: SOS Ah (0..13) */
+    uint8_t  scan_al;       /* Phase 16a: SOS Al (0..13) */
 } jpeg_info_t;
 
 typedef struct {

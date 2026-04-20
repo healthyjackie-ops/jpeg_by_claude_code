@@ -60,6 +60,15 @@ module header_parser (
     output reg  [2:0]  num_components_o,// Phase 12: 1=gray, 3=YCbCr, 4=CMYK (3b for Nf=4)
     output reg  [2:0]  chroma_mode_o,  // Phase 12: 0=GRAY,1=420,2=444,3=422,4=440,5=411,6=CMYK
     output reg         precision_o,    // Phase 13: 0=P=8, 1=P=12
+
+    // Phase 16a: SOF type + SOS scan params (captured for future progressive
+    // decode; baseline path still enforces Ss=0/Se=63/Ah=Al=0 as before)
+    output reg  [1:0]  sof_type_o,     // 0=SOF0, 1=SOF1, 2=SOF2, 3=SOF3
+    output reg  [5:0]  sos_ss_o,
+    output reg  [5:0]  sos_se_o,
+    output reg  [3:0]  sos_ah_o,
+    output reg  [3:0]  sos_al_o,
+
     output reg  [8:0]  err             // sticky
 );
 
@@ -193,6 +202,9 @@ module header_parser (
             num_components_o <= 3'd3;
             chroma_mode_o <= 3'd1;
             precision_o <= 1'b0;
+            sof_type_o <= 2'd0;
+            sos_ss_o <= 6'd0; sos_se_o <= 6'd63;
+            sos_ah_o <= 4'd0; sos_al_o <= 4'd0;
             err <= 9'd0;
             qt_wr <= 1'b0; qt_sel <= 2'd0; qt_idx <= 6'd0; qt_val <= 16'd0;
             ht_bits_wr <= 1'b0; ht_val_wr <= 1'b0;
@@ -207,6 +219,9 @@ module header_parser (
             num_components_o <= 3'd3;
             chroma_mode_o <= 3'd1;
             precision_o <= 1'b0;
+            sof_type_o <= 2'd0;
+            sos_ss_o <= 6'd0; sos_se_o <= 6'd63;
+            sos_ah_o <= 4'd0; sos_al_o <= 4'd0;
             err <= 9'd0;
             qt_wr <= 1'b0; ht_bits_wr <= 1'b0; ht_val_wr <= 1'b0;
             ht_build_start <= 1'b0;
@@ -261,13 +276,15 @@ module header_parser (
                 S_DISPATCH: begin
                     // 不消耗字节，纯分发
                     case (last_marker)
-                        `MARKER_SOF0:  state <= S_LEN_HI;
-                        `MARKER_SOF1:  state <= S_LEN_HI;   // Phase 13: extended sequential
+                        `MARKER_SOF0:  begin sof_type_o <= 2'd0; state <= S_LEN_HI; end
+                        `MARKER_SOF1:  begin sof_type_o <= 2'd1; state <= S_LEN_HI; end  // Phase 13: extended sequential
                         `MARKER_SOF2: begin                 // Phase 14: progressive — explicit recognize + error-out
+                            sof_type_o <= 2'd2;
                             err[`ERR_UNSUP_SOF] <= 1'b1;
                             state <= S_ERROR;
                         end
                         `MARKER_SOF3: begin                 // Reserved: Wave 5 lossless — error-out
+                            sof_type_o <= 2'd3;
                             err[`ERR_UNSUP_SOF] <= 1'b1;
                             state <= S_ERROR;
                         end
@@ -579,14 +596,18 @@ module header_parser (
                     end
                 end
                 S_SOS_SS: if (beat) begin
+                    sos_ss_o <= byte_in[5:0];                          // Phase 16a: capture
                     if (byte_in != 8'd0) begin err[`ERR_UNSUP_SOF] <= 1'b1; state <= S_ERROR; end
                     else begin remain <= remain - 16'd1; state <= S_SOS_SE; end
                 end
                 S_SOS_SE: if (beat) begin
+                    sos_se_o <= byte_in[5:0];                          // Phase 16a: capture
                     if (byte_in != 8'd63) begin err[`ERR_UNSUP_SOF] <= 1'b1; state <= S_ERROR; end
                     else begin remain <= remain - 16'd1; state <= S_SOS_AHAL; end
                 end
                 S_SOS_AHAL: if (beat) begin
+                    sos_ah_o <= byte_in[7:4];                          // Phase 16a: capture
+                    sos_al_o <= byte_in[3:0];
                     if (byte_in != 8'd0) begin err[`ERR_UNSUP_SOF] <= 1'b1; state <= S_ERROR; end
                     else begin
                         header_done <= 1'b1;
