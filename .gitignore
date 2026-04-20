@@ -1,7 +1,9 @@
 # Build artifacts
 c_model/build/
 verification/tests/obj_dir/
+verification/tests/obj_dir_coef/
 **/obj_dir/
+**/obj_dir_coef/
 *.o
 *.a
 *.so

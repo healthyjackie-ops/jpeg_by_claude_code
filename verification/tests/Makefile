@@ -78,5 +78,24 @@ unit: obj_dir/V$(TOP)
 errout: obj_dir/V$(TOP)
 	./obj_dir/V$(TOP) --mode=errout --dir=$(REPO)/verification/vectors/phase14
 
+# --- Phase 15 coef_buffer loop-back unit test --------------------------------
+# Built in its own obj_dir_coef (no C model dep, just a standalone Verilator sim).
+COEF_TOP := coef_buffer
+COEF_OBJ := obj_dir_coef/V$(COEF_TOP)
+COEF_VLT_FLAGS := --cc --exe --build -Wall -Wno-PINCONNECTEMPTY -Wno-fatal \
+                  -I$(INC_DIR) -y $(RTL_DIR) \
+                  -O3 --x-assign fast --x-initial fast --threads 1 \
+                  --top-module $(COEF_TOP) \
+                  --Mdir obj_dir_coef \
+                  -CFLAGS "-O2 -std=c++17"
+
+$(COEF_OBJ): $(RTL_DIR)/coef_buffer.v unit_coef_buffer.cpp
+	$(VERILATOR) $(COEF_VLT_FLAGS) \
+	    $(RTL_DIR)/coef_buffer.v unit_coef_buffer.cpp \
+	    -o V$(COEF_TOP)
+
+coef_unit: $(COEF_OBJ)
+	./$(COEF_OBJ)
+
 clean:
-	rm -rf obj_dir *.vcd *.log
+	rm -rf obj_dir obj_dir_coef *.vcd *.log
