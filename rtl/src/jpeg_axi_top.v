@@ -119,8 +119,10 @@ module jpeg_axi_top (
     wire        restart_ack_w;      // Phase 7: block_seq → bitstream_unpack
     wire        dc_restart_w;       // Phase 7: block_seq → dc_predictor
     wire        align_req_w;        // Phase 7: block_seq → bitstream_unpack (drain shreg)
-    wire [1:0]  num_components_w;   // Phase 8: Nf (1=gray, 3=4:2:0)
-    wire        is_grayscale_w = (num_components_w == 2'd1);
+    wire [1:0]  num_components_w;   // Phase 8: Nf (1=gray, 3=YCbCr)
+    wire [1:0]  chroma_mode_w;      // Phase 9: 0=GRAY,1=420,2=444
+    wire        is_grayscale_w = (chroma_mode_w == 2'd0);
+    wire        is_444_w       = (chroma_mode_w == 2'd2);
 
     header_parser u_hp (
         .clk(aclk), .rst_n(aresetn), .start(start_pulse),
@@ -142,6 +144,7 @@ module jpeg_axi_top (
         .frame_done(frame_done_hp),
         .dri_interval(dri_interval_w),   // Phase 7
         .num_components_o(num_components_w), // Phase 8
+        .chroma_mode_o(chroma_mode_w),   // Phase 9
         .err(err_w)
     );
 
@@ -315,13 +318,14 @@ module jpeg_axi_top (
     wire [7:0]  lb_y_data_w;
     wire        lb_c_wr_w;
     wire [2:0]  lb_c_row_w;
-    wire [10:0] lb_c_col_w;
+    wire [11:0] lb_c_col_w;            // Phase 9: 4:4:4 需 12b chroma 地址
     wire [7:0]  lb_cb_data_w, lb_cr_data_w;
 
     mcu_line_copy u_lc (
         .clk(aclk), .rst_n(aresetn), .soft_reset(softrst),
         .start(lc_start_w), .mcu_col_idx(lc_mcu_col_w), .done(lc_done_w),
         .is_grayscale(is_grayscale_w),    // Phase 8
+        .is_444(is_444_w),                // Phase 9
         .mb_y_row(mb_y_row_w), .mb_y_col(mb_y_col_w),
         .mb_c_row(mb_c_row_w), .mb_c_col(mb_c_col_w),
         .mb_y_data(mb_y_data_w),
@@ -335,7 +339,7 @@ module jpeg_axi_top (
     wire [3:0]  po_rd_y_row_w;
     wire [11:0] po_rd_y_col_w;
     wire [2:0]  po_rd_c_row_w;
-    wire [10:0] po_rd_c_col_w;
+    wire [11:0] po_rd_c_col_w;         // Phase 9: 4:4:4 需 12b chroma 地址
     wire [7:0]  po_rd_y_data_w, po_rd_cb_data_w, po_rd_cr_data_w;
 
     line_buffer u_lb (
@@ -368,6 +372,7 @@ module jpeg_axi_top (
         .img_height(img_h_w[11:0]),   // Phase 6: H 裁剪
         .is_first_row(is_first_row_w), .is_last_row(is_last_row_w),
         .is_grayscale(is_grayscale_w), // Phase 8
+        .is_444(is_444_w),             // Phase 9
         .row_done(row_done_w),
         .rd_y_row(po_rd_y_row_w), .rd_y_col(po_rd_y_col_w),
         .rd_c_row(po_rd_c_row_w), .rd_c_col(po_rd_c_col_w),
@@ -399,6 +404,7 @@ module jpeg_axi_top (
         .frame_start(header_done_w),
         .img_width(img_w_w), .img_height(img_h_w),
         .num_components(num_components_w),  // Phase 8
+        .chroma_mode(chroma_mode_w),        // Phase 9
         .y_qt_sel(comp0_qt), .cb_qt_sel(comp1_qt), .cr_qt_sel(comp2_qt),
         .y_dc_sel(comp0_td), .y_ac_sel(comp0_ta),
         .cb_dc_sel(comp1_td), .cb_ac_sel(comp1_ta),

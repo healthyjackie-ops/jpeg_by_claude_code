@@ -39,37 +39,45 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
     out->height = info.height;
     uint16_t W  = info.width;
     uint16_t H  = info.height;
-    int is_gray = (info.num_components == 1);
+    int is_gray = (info.chroma_mode == CHROMA_GRAY);
+    int is_444  = (info.chroma_mode == CHROMA_444);
+    int is_420  = (info.chroma_mode == CHROMA_420);
     /* Phase 6: 内部用 MCU 对齐的 padded 尺寸解码，结束再 crop 到 W×H
-       Phase 8: 灰度 MCU=8x8, 彩色 MCU=16x16 */
-    uint16_t mcu_dim = is_gray ? 8 : 16;
+       Phase 8: 灰度 MCU=8x8, 彩色 4:2:0 MCU=16x16
+       Phase 9: 4:4:4 MCU=8x8 */
+    uint16_t mcu_dim = is_420 ? 16 : 8;
     uint16_t Wp = info.mcu_cols * mcu_dim;
     uint16_t Hp = info.mcu_rows * mcu_dim;
-    uint16_t CWp = Wp >> 1;
-    uint16_t CHp = Hp >> 1;
+    uint16_t CWp = is_420 ? (Wp >> 1) : Wp;
+    uint16_t CHp = is_420 ? (Hp >> 1) : Hp;
 
     uint8_t *y_pad       = (uint8_t*)calloc((size_t)Wp  * Hp,  1);
-    uint8_t *cb_pad_420  = is_gray ? NULL : (uint8_t*)calloc((size_t)CWp * CHp, 1);
-    uint8_t *cr_pad_420  = is_gray ? NULL : (uint8_t*)calloc((size_t)CWp * CHp, 1);
+    uint8_t *cb_pad_420  = is_420 ? (uint8_t*)calloc((size_t)CWp * CHp, 1) : NULL;
+    uint8_t *cr_pad_420  = is_420 ? (uint8_t*)calloc((size_t)CWp * CHp, 1) : NULL;
     uint8_t *cb_pad      = is_gray ? NULL : (uint8_t*)calloc((size_t)Wp  * Hp,  1);
     uint8_t *cr_pad      = is_gray ? NULL : (uint8_t*)calloc((size_t)Wp  * Hp,  1);
     out->y_plane       = (uint8_t*)calloc((size_t)W  * H,  1);
     if (!is_gray) {
-        out->cb_plane_420  = (uint8_t*)calloc((size_t)(W >> 1) * (H >> 1), 1);
-        out->cr_plane_420  = (uint8_t*)calloc((size_t)(W >> 1) * (H >> 1), 1);
         out->cb_plane      = (uint8_t*)calloc((size_t)W  * H,  1);
         out->cr_plane      = (uint8_t*)calloc((size_t)W  * H,  1);
+        if (is_420) {
+            out->cb_plane_420 = (uint8_t*)calloc((size_t)(W >> 1) * (H >> 1), 1);
+            out->cr_plane_420 = (uint8_t*)calloc((size_t)(W >> 1) * (H >> 1), 1);
+        }
     }
     int alloc_ok = y_pad && out->y_plane &&
                    (is_gray ||
-                    (cb_pad_420 && cr_pad_420 && cb_pad && cr_pad &&
-                     out->cb_plane_420 && out->cr_plane_420 &&
-                     out->cb_plane && out->cr_plane));
+                    (cb_pad && cr_pad &&
+                     out->cb_plane && out->cr_plane &&
+                     (!is_420 ||
+                      (cb_pad_420 && cr_pad_420 &&
+                       out->cb_plane_420 && out->cr_plane_420))));
     if (!alloc_ok) {
         free(y_pad); free(cb_pad_420); free(cr_pad_420); free(cb_pad); free(cr_pad);
         out->err = (uint32_t)JPEG_ERR_INTERNAL;
         return -1;
     }
+    (void)is_444;
 
     info.components[0].dc_pred = 0;
     if (!is_gray) {
@@ -108,7 +116,7 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
                 idct_islow(coef, y_blk[0]);
                 uint8_t *y_dst = y_pad + (size_t)(my * 8) * Wp + (mx * 8);
                 copy_block_8x8(y_blk[0], y_dst, Wp);
-            } else {
+            } else if (is_420) {
                 for (int i = 0; i < 4; i++) {
                     if (huff_decode_block(&bs, y_dc, y_ac,
                                           &info.components[0].dc_pred, coef)) {
@@ -141,6 +149,38 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
                 uint8_t *cr_dst = cr_pad_420 + (size_t)(my * 8) * CWp + (mx * 8);
                 copy_block_8x8(cb_blk, cb_dst, CWp);
                 copy_block_8x8(cr_blk, cr_dst, CWp);
+            } else {
+                /* Phase 9: 4:4:4 — 3 blocks/MCU, 8x8 each, chroma full-res */
+                if (huff_decode_block(&bs, y_dc, y_ac,
+                                      &info.components[0].dc_pred, coef)) {
+                    out->err = JPEG_ERR_BAD_HUFFMAN;
+                    return -1;
+                }
+                dequant_block(coef, y_qt);
+                idct_islow(coef, y_blk[0]);
+
+                if (huff_decode_block(&bs, cb_dc, cb_ac,
+                                      &info.components[1].dc_pred, coef)) {
+                    out->err = JPEG_ERR_BAD_HUFFMAN;
+                    return -1;
+                }
+                dequant_block(coef, cb_qt);
+                idct_islow(coef, cb_blk);
+
+                if (huff_decode_block(&bs, cr_dc, cr_ac,
+                                      &info.components[2].dc_pred, coef)) {
+                    out->err = JPEG_ERR_BAD_HUFFMAN;
+                    return -1;
+                }
+                dequant_block(coef, cr_qt);
+                idct_islow(coef, cr_blk);
+
+                uint8_t *y_dst  = y_pad  + (size_t)(my * 8) * Wp + (mx * 8);
+                uint8_t *cb_dst = cb_pad + (size_t)(my * 8) * Wp + (mx * 8);
+                uint8_t *cr_dst = cr_pad + (size_t)(my * 8) * Wp + (mx * 8);
+                copy_block_8x8(y_blk[0], y_dst,  Wp);
+                copy_block_8x8(cb_blk,   cb_dst, Wp);
+                copy_block_8x8(cr_blk,   cr_dst, Wp);
             }
 
             /* Phase 7: DRI 边界 — 每 N 个 MCU 一个 RSTn。
@@ -184,10 +224,11 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
         }
     }
 
-    if (!is_gray) {
+    if (is_420) {
         chroma_upsample_nn(cb_pad_420, cb_pad, Wp, Hp);
         chroma_upsample_nn(cr_pad_420, cr_pad, Wp, Hp);
     }
+    /* Phase 9: 4:4:4 → cb_pad/cr_pad 已写为全分辨率，无需 upsample */
 
     /* Phase 6: crop padded planes → actual W×H output planes */
     for (uint16_t r = 0; r < H; r++) {
@@ -197,7 +238,7 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
             memcpy(out->cr_plane + (size_t)r * W, cr_pad + (size_t)r * Wp, W);
         }
     }
-    if (!is_gray) {
+    if (is_420) {
         /* 4:2:0 chroma planes: only fill the top-left (W/2)×(H/2) portion; caller
            may inspect these when needed. MCU-aligned W/H were previously assumed,
            so we pack conservatively for non-aligned: copy (W>>1) cols from padded. */

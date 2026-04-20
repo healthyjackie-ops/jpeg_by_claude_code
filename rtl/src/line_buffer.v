@@ -21,7 +21,7 @@ module line_buffer #(
 
     input  wire        wr_c_en,
     input  wire [2:0]  wr_c_row,      // 0..7 within chroma MCU row
-    input  wire [10:0] wr_c_col_abs,  // 0..CW-1
+    input  wire [11:0] wr_c_col_abs,  // Phase 9: 4:4:4 → 0..W-1 (12b); 4:2:0 → 0..CW-1
     input  wire [7:0]  wr_cb_data,
     input  wire [7:0]  wr_cr_data,
 
@@ -29,16 +29,16 @@ module line_buffer #(
     input  wire [3:0]  rd_y_row,
     input  wire [11:0] rd_y_col,
     input  wire [2:0]  rd_c_row,
-    input  wire [10:0] rd_c_col,
+    input  wire [11:0] rd_c_col,      // Phase 9: 扩宽至 12 位
     output wire [7:0]  rd_y_data,
     output wire [7:0]  rd_cb_data,
     output wire [7:0]  rd_cr_data
 );
 
-    // 16 rows × MAX_W = 64K 最大
+    // Phase 9: chroma 缓冲扩宽到 8 × MAX_W 以支持 4:4:4
     reg [7:0] ybuf  [0:16*MAX_W-1];
-    reg [7:0] cbbuf [0:8*(MAX_W/2)-1];
-    reg [7:0] crbuf [0:8*(MAX_W/2)-1];
+    reg [7:0] cbbuf [0:8*MAX_W-1];
+    reg [7:0] crbuf [0:8*MAX_W-1];
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin

@@ -43,6 +43,14 @@ typedef enum {
     JPEG_ERR_INTERNAL        = 1 << 31,
 } jpeg_err_t;
 
+/* Phase 9: chroma subsampling mode enum, shared with RTL */
+typedef enum {
+    CHROMA_GRAY = 0,   /* Nf=1, H=V=1 -> MCU 8x8, 1 block */
+    CHROMA_420  = 1,   /* Nf=3, H0=V0=2, chroma H=V=1 -> MCU 16x16, 6 blocks */
+    CHROMA_444  = 2,   /* Nf=3, H=V=1 all comps      -> MCU 8x8,  3 blocks */
+    CHROMA_422  = 3    /* reserved for Phase 10 */
+} chroma_mode_t;
+
 typedef struct {
     uint16_t q[64];
     int loaded;
@@ -79,6 +87,7 @@ typedef struct {
     htable_t htables_ac[4];
     uint16_t mcu_cols;
     uint16_t mcu_rows;
+    uint8_t  chroma_mode;   /* Phase 9: chroma_mode_t */
 } jpeg_info_t;
 
 typedef struct {

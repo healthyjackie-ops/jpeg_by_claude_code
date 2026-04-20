@@ -147,21 +147,32 @@ static int parse_sof0(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
     }
 
     if (nf == 3) {
-        if (info->components[0].h_samp != 2 || info->components[0].v_samp != 2 ||
-            info->components[1].h_samp != 1 || info->components[1].v_samp != 1 ||
+        /* Chroma 必须 H=V=1；Y 允许 H=V=2 (4:2:0) 或 H=V=1 (4:4:4) */
+        if (info->components[1].h_samp != 1 || info->components[1].v_samp != 1 ||
             info->components[2].h_samp != 1 || info->components[2].v_samp != 1) {
             *err |= JPEG_ERR_UNSUP_CHROMA;
             return -1;
         }
-        /* Phase 6: 向上取整支持非对齐尺寸 */
-        info->mcu_cols = (info->width  + 15) / 16;
-        info->mcu_rows = (info->height + 15) / 16;
+        if (info->components[0].h_samp == 2 && info->components[0].v_samp == 2) {
+            info->chroma_mode = CHROMA_420;
+            info->mcu_cols = (info->width  + 15) / 16;
+            info->mcu_rows = (info->height + 15) / 16;
+        } else if (info->components[0].h_samp == 1 && info->components[0].v_samp == 1) {
+            /* Phase 9: 4:4:4 — MCU 8x8 */
+            info->chroma_mode = CHROMA_444;
+            info->mcu_cols = (info->width  + 7) / 8;
+            info->mcu_rows = (info->height + 7) / 8;
+        } else {
+            *err |= JPEG_ERR_UNSUP_CHROMA;
+            return -1;
+        }
     } else {
         /* Phase 8: grayscale requires H=V=1; MCU=8x8 */
         if (info->components[0].h_samp != 1 || info->components[0].v_samp != 1) {
             *err |= JPEG_ERR_UNSUP_CHROMA;
             return -1;
         }
+        info->chroma_mode = CHROMA_GRAY;
         info->mcu_cols = (info->width  + 7) / 8;
         info->mcu_rows = (info->height + 7) / 8;
     }

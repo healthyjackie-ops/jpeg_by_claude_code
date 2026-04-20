@@ -16,13 +16,14 @@ module pixel_out (
     input  wire        is_first_row,
     input  wire        is_last_row,
     input  wire        is_grayscale,   // Phase 8: 1=MCU-row 8 行, Cb/Cr 输出 0x80
+    input  wire        is_444,         // Phase 9: 1=chroma 全分辨率，c_col=x_col, c_row=y_row[2:0]
     output reg         row_done,
 
     // line_buffer 读口
     output reg  [3:0]  rd_y_row,
     output reg  [11:0] rd_y_col,
     output reg  [2:0]  rd_c_row,
-    output reg  [10:0] rd_c_col,
+    output reg  [11:0] rd_c_col,       // Phase 9: 扩宽至 12 位
     input  wire [7:0]  rd_y_data,
     input  wire [7:0]  rd_cb_data,
     input  wire [7:0]  rd_cr_data,
@@ -46,11 +47,13 @@ module pixel_out (
 
     // Phase 6: 非 16 对齐 — 最后 MCU-row 可能只有 (img_height[3:0]) 行有效
     // Phase 8: grayscale MCU-row 是 8 行；非对齐时 tail 由 img_height[2:0] 决定
+    // Phase 9: 4:4:4 MCU-row 也是 8 行 — 与 grayscale 复用同一份 tail 判断
+    wire mcu_8x8 = is_grayscale | is_444;
     wire [3:0]  last_mcu_rows_color = (img_height[3:0] == 4'd0) ? 4'd15 : (img_height[3:0] - 4'd1);
-    wire [3:0]  last_mcu_rows_gray  = (img_height[2:0] == 3'd0) ? 4'd7  :
+    wire [3:0]  last_mcu_rows_8x8   = (img_height[2:0] == 3'd0) ? 4'd7  :
                                                                  {1'b0, img_height[2:0] - 3'd1};
-    wire [3:0]  full_mcu_rows = is_grayscale ? 4'd7 : 4'd15;
-    wire [3:0]  last_mcu_rows = is_grayscale ? last_mcu_rows_gray : last_mcu_rows_color;
+    wire [3:0]  full_mcu_rows = mcu_8x8 ? 4'd7 : 4'd15;
+    wire [3:0]  last_mcu_rows = mcu_8x8 ? last_mcu_rows_8x8 : last_mcu_rows_color;
     wire [3:0]  y_row_max     = is_last_row ? last_mcu_rows : full_mcu_rows;
 
     always @(posedge clk or negedge rst_n) begin
@@ -60,7 +63,7 @@ module pixel_out (
             tvalid <= 1'b0; tdata <= 24'd0;
             tuser_sof <= 1'b0; tlast <= 1'b0;
             rd_y_row <= 4'd0; rd_y_col <= 12'd0;
-            rd_c_row <= 3'd0; rd_c_col <= 11'd0;
+            rd_c_row <= 3'd0; rd_c_col <= 12'd0;
         end else if (soft_reset) begin
             active <= 1'b0; tvalid <= 1'b0;
             row_done <= 1'b0;
@@ -74,7 +77,7 @@ module pixel_out (
                 rd_y_row <= 4'd0;
                 rd_y_col <= 12'd0;
                 rd_c_row <= 3'd0;
-                rd_c_col <= 11'd0;
+                rd_c_col <= 12'd0;
             end
 
             // 组合读：本周期地址对应的数据可在下 cycle 使用
@@ -103,16 +106,27 @@ module pixel_out (
                 end
 
                 // 读地址前送 (下 cycle 的数据)
+                // Phase 9: 4:4:4 下 chroma 与 Y 同分辨率：c_row=y_row[2:0], c_col=x_col
+                //         4:2:0 下 c_row=y_row[3:1], c_col=x_col[11:1]
+                //         grayscale 下 c_* 不使用 (tdata Cb/Cr 被 0x80 覆盖)
                 if (x_col == (img_width - 12'd1)) begin
                     rd_y_row <= (y_row == y_row_max) ? 4'd0 : (y_row + 4'd1);
                     rd_y_col <= 12'd0;
-                    rd_c_row <= (y_row == y_row_max) ? 3'd0 : next_y_row[3:1];
-                    rd_c_col <= 11'd0;
+                    if (is_444)
+                        rd_c_row <= (y_row == y_row_max) ? 3'd0 : next_y_row[2:0];
+                    else
+                        rd_c_row <= (y_row == y_row_max) ? 3'd0 : next_y_row[3:1];
+                    rd_c_col <= 12'd0;
                 end else begin
                     rd_y_row <= y_row;
                     rd_y_col <= next_x_col;
-                    rd_c_row <= y_row[3:1];
-                    rd_c_col <= next_x_col[11:1];
+                    if (is_444) begin
+                        rd_c_row <= y_row[2:0];
+                        rd_c_col <= next_x_col;
+                    end else begin
+                        rd_c_row <= y_row[3:1];
+                        rd_c_col <= {1'b0, next_x_col[11:1]};
+                    end
                 end
             end else if (tready && tvalid) begin
                 tvalid <= 1'b0;

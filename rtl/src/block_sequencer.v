@@ -16,7 +16,8 @@ module block_sequencer (
     input  wire        frame_start,    // header_parser.header_done 脉冲
     input  wire [15:0] img_width,
     input  wire [15:0] img_height,
-    input  wire [1:0]  num_components,// Phase 8: 1=grayscale(MCU 8x8, 1 block), 3=4:2:0(MCU 16x16, 6 blocks)
+    input  wire [1:0]  num_components,// Phase 8: 1=grayscale, 3=YCbCr
+    input  wire [1:0]  chroma_mode,   // Phase 9: 0=GRAY, 1=420, 2=444, 3=422(rsv)
     input  wire [1:0]  y_qt_sel,
     input  wire [1:0]  cb_qt_sel,
     input  wire [1:0]  cr_qt_sel,
@@ -79,13 +80,19 @@ module block_sequencer (
     // 计算 mcu 行列数
     // Phase 6: 非 16 对齐尺寸向上取整
     // Phase 8: grayscale → MCU = 8x8；4:2:0 → MCU = 16x16
-    wire is_gray = (num_components == 2'd1);
-    wire [15:0] mcu_cols = is_gray ? ((img_width  + 16'd7) >> 3) :
+    // Phase 9: 4:4:4 → MCU = 8x8, 3 blocks (Y, Cb, Cr)
+    wire is_gray = (chroma_mode == 2'd0);
+    wire is_444  = (chroma_mode == 2'd2);
+    wire is_420  = (chroma_mode == 2'd1);
+    wire mcu_8x8 = is_gray | is_444;       // MCU 尺寸 8x8
+    wire [15:0] mcu_cols = mcu_8x8 ? ((img_width  + 16'd7)  >> 3) :
                                      ((img_width  + 16'd15) >> 4);
-    wire [15:0] mcu_rows = is_gray ? ((img_height + 16'd7) >> 3) :
+    wire [15:0] mcu_rows = mcu_8x8 ? ((img_height + 16'd7)  >> 3) :
                                      ((img_height + 16'd15) >> 4);
-    // Phase 8: grayscale 每 MCU 只有 1 个 Y 块, 4:2:0 每 MCU 有 6 个块
-    wire [2:0] last_blk = is_gray ? 3'd0 : 3'd5;
+    // block 数: GRAY→1, 444→3, 420→6
+    wire [2:0] last_blk = is_gray ? 3'd0 :
+                          is_444  ? 3'd2 : 3'd5;
+    wire _unused_ncomp = |num_components;  // 保留端口以备 sanity check
 
     localparam [3:0]
         S_IDLE     = 4'd0,
@@ -108,31 +115,58 @@ module block_sequencer (
     reg pending_idct_done;
 
     // 当前 block 的参数选择
+    // Phase 9: 4:4:4 下 blk_idx 0/1/2 = Y/Cb/Cr；4:2:0 下 0..3=Y,4=Cb,5=Cr
+    //         cur_blk_type 给 mcu_buffer 用以选择子 buffer (mcu_buffer 仍按 4:2:0
+    //         的 0..3=Y,4=Cb,5=Cr 语义)，444 下 Y 用 0、Cb 用 4、Cr 用 5 以保持
+    //         mcu_buffer 接口不变。
     always @(*) begin
-        case (blk_idx)
-            3'd0, 3'd1, 3'd2, 3'd3: begin
-                h_dc_sel   = y_dc_sel;
-                h_ac_sel   = y_ac_sel;
-                qt_sel_out = y_qt_sel;
-                dcp_sel    = 2'd0;
-                h_dc_pred_in = dcp_y;
-            end
-            3'd4: begin
-                h_dc_sel   = cb_dc_sel;
-                h_ac_sel   = cb_ac_sel;
-                qt_sel_out = cb_qt_sel;
-                dcp_sel    = 2'd1;
-                h_dc_pred_in = dcp_cb;
-            end
-            default: begin // 5
-                h_dc_sel   = cr_dc_sel;
-                h_ac_sel   = cr_ac_sel;
-                qt_sel_out = cr_qt_sel;
-                dcp_sel    = 2'd2;
-                h_dc_pred_in = dcp_cr;
-            end
-        endcase
-        cur_blk_type = blk_idx;
+        if (is_444) begin
+            case (blk_idx)
+                3'd0: begin
+                    h_dc_sel   = y_dc_sel;   h_ac_sel   = y_ac_sel;
+                    qt_sel_out = y_qt_sel;   dcp_sel    = 2'd0;
+                    h_dc_pred_in = dcp_y;
+                    cur_blk_type = 3'd0;
+                end
+                3'd1: begin
+                    h_dc_sel   = cb_dc_sel;  h_ac_sel   = cb_ac_sel;
+                    qt_sel_out = cb_qt_sel;  dcp_sel    = 2'd1;
+                    h_dc_pred_in = dcp_cb;
+                    cur_blk_type = 3'd4;
+                end
+                default: begin // blk_idx == 2
+                    h_dc_sel   = cr_dc_sel;  h_ac_sel   = cr_ac_sel;
+                    qt_sel_out = cr_qt_sel;  dcp_sel    = 2'd2;
+                    h_dc_pred_in = dcp_cr;
+                    cur_blk_type = 3'd5;
+                end
+            endcase
+        end else begin
+            case (blk_idx)
+                3'd0, 3'd1, 3'd2, 3'd3: begin
+                    h_dc_sel   = y_dc_sel;
+                    h_ac_sel   = y_ac_sel;
+                    qt_sel_out = y_qt_sel;
+                    dcp_sel    = 2'd0;
+                    h_dc_pred_in = dcp_y;
+                end
+                3'd4: begin
+                    h_dc_sel   = cb_dc_sel;
+                    h_ac_sel   = cb_ac_sel;
+                    qt_sel_out = cb_qt_sel;
+                    dcp_sel    = 2'd1;
+                    h_dc_pred_in = dcp_cb;
+                end
+                default: begin // 5
+                    h_dc_sel   = cr_dc_sel;
+                    h_ac_sel   = cr_ac_sel;
+                    qt_sel_out = cr_qt_sel;
+                    dcp_sel    = 2'd2;
+                    h_dc_pred_in = dcp_cr;
+                end
+            endcase
+            cur_blk_type = blk_idx;
+        end
     end
 
     always @(posedge clk or negedge rst_n) begin

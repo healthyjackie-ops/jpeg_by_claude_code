@@ -54,7 +54,8 @@ module header_parser (
     output reg         data_mode,      // 1=进入熵编码数据段
     output reg         frame_done,     // 遇 EOI
     output reg  [15:0] dri_interval,   // Phase 7: DRI 间隔 MCU 数（0=禁用）
-    output reg  [1:0]  num_components_o,// Phase 8: 1=grayscale, 3=YCbCr 4:2:0
+    output reg  [1:0]  num_components_o,// Phase 8: 1=grayscale, 3=YCbCr
+    output reg  [1:0]  chroma_mode_o,  // Phase 9: 0=GRAY,1=420,2=444,3=422(rsv)
     output reg  [8:0]  err             // sticky
 );
 
@@ -182,6 +183,7 @@ module header_parser (
             header_done <= 1'b0; data_mode <= 1'b0; frame_done <= 1'b0;
             dri_interval <= 16'd0;
             num_components_o <= 2'd3;
+            chroma_mode_o <= 2'd1;
             err <= 9'd0;
             qt_wr <= 1'b0; qt_sel <= 2'd0; qt_idx <= 6'd0; qt_val <= 8'd0;
             ht_bits_wr <= 1'b0; ht_val_wr <= 1'b0;
@@ -194,6 +196,7 @@ module header_parser (
             header_done <= 1'b0; data_mode <= 1'b0; frame_done <= 1'b0;
             dri_interval <= 16'd0;
             num_components_o <= 2'd3;
+            chroma_mode_o <= 2'd1;
             err <= 9'd0;
             qt_wr <= 1'b0; ht_bits_wr <= 1'b0; ht_val_wr <= 1'b0;
             ht_build_start <= 1'b0;
@@ -215,6 +218,7 @@ module header_parser (
                         frame_done  <= 1'b0;
                         dri_interval <= 16'd0;
                         num_components_o <= 2'd3;
+                        chroma_mode_o <= 2'd1;
                         err         <= 9'd0;
                     end
                 end
@@ -414,7 +418,7 @@ module header_parser (
                     // 尺寸检查在下个 cycle 校验
                 end
                 S_SOF_NF: if (beat) begin
-                    // Phase 8: accept Nf=1 (grayscale) or Nf=3 (4:2:0)
+                    // Phase 8: accept Nf=1 (grayscale) or Nf=3 (4:2:0 / 4:4:4)
                     if (byte_in != 8'd3 && byte_in != 8'd1) begin
                         err[`ERR_UNSUP_CHROMA] <= 1'b1; state <= S_ERROR;
                     end else if (img_width == 16'd0 || img_height == 16'd0 ||
@@ -423,6 +427,9 @@ module header_parser (
                         err[`ERR_SIZE_OOR] <= 1'b1; state <= S_ERROR;
                     end else begin
                         num_components_o <= byte_in[1:0];
+                        // Phase 9: Nf=1 -> GRAY; Nf=3 待 comp0 HV 再判定 420 vs 444
+                        if (byte_in == 8'd1)
+                            chroma_mode_o <= 2'd0;   // GRAY
                         remain <= remain - 16'd1;
                         sof_comp_idx <= 2'd0;
                         state <= S_SOF_COMP_ID;
@@ -435,12 +442,21 @@ module header_parser (
                 end
                 S_SOF_COMP_HV: if (beat) begin
                     // Phase 8: Nf=1 grayscale → Y only H=1,V=1
-                    //         Nf=3 4:2:0    → Y 2x2, Cb/Cr 1x1
+                    // Phase 9: Nf=3 → comp0 可为 0x22 (4:2:0) 或 0x11 (4:4:4);
+                    //                  comp1/2 必须 0x11
                     if (num_components_o == 2'd1) begin
                         if (byte_in != 8'h11) begin err[`ERR_UNSUP_CHROMA] <= 1'b1; state <= S_ERROR; end
                     end else begin
                         case (sof_comp_idx)
-                            2'd0: if (byte_in != 8'h22) begin err[`ERR_UNSUP_CHROMA] <= 1'b1; state <= S_ERROR; end
+                            2'd0: begin
+                                if (byte_in == 8'h22) begin
+                                    chroma_mode_o <= 2'd1;   // 4:2:0
+                                end else if (byte_in == 8'h11) begin
+                                    chroma_mode_o <= 2'd2;   // 4:4:4
+                                end else begin
+                                    err[`ERR_UNSUP_CHROMA] <= 1'b1; state <= S_ERROR;
+                                end
+                            end
                             2'd1: if (byte_in != 8'h11) begin err[`ERR_UNSUP_CHROMA] <= 1'b1; state <= S_ERROR; end
                             2'd2: if (byte_in != 8'h11) begin err[`ERR_UNSUP_CHROMA] <= 1'b1; state <= S_ERROR; end
                             default: ;
