@@ -75,5 +75,8 @@ diff-full: obj_dir/V$(TOP)
 unit: obj_dir/V$(TOP)
 	./obj_dir/V$(TOP) --mode=unit
 
+errout: obj_dir/V$(TOP)
+	./obj_dir/V$(TOP) --mode=errout --dir=$(REPO)/verification/vectors/phase14
+
 clean:
 	rm -rf obj_dir *.vcd *.log

@@ -9,6 +9,8 @@
 `define MARKER_EOI    8'hD9
 `define MARKER_SOF0   8'hC0
 `define MARKER_SOF1   8'hC1    // Phase 13: extended sequential, P=8 or 12
+`define MARKER_SOF2   8'hC2    // Phase 14: progressive DCT (recognized, error-out for now; Wave 3 target)
+`define MARKER_SOF3   8'hC3    // Reserved: Wave 5 lossless
 `define MARKER_DHT    8'hC4
 `define MARKER_DQT    8'hDB
 `define MARKER_DRI    8'hDD

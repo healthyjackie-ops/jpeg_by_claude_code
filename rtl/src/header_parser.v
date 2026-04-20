@@ -263,6 +263,14 @@ module header_parser (
                     case (last_marker)
                         `MARKER_SOF0:  state <= S_LEN_HI;
                         `MARKER_SOF1:  state <= S_LEN_HI;   // Phase 13: extended sequential
+                        `MARKER_SOF2: begin                 // Phase 14: progressive — explicit recognize + error-out
+                            err[`ERR_UNSUP_SOF] <= 1'b1;
+                            state <= S_ERROR;
+                        end
+                        `MARKER_SOF3: begin                 // Reserved: Wave 5 lossless — error-out
+                            err[`ERR_UNSUP_SOF] <= 1'b1;
+                            state <= S_ERROR;
+                        end
                         `MARKER_DQT:   state <= S_LEN_HI;
                         `MARKER_DHT:   state <= S_LEN_HI;
                         `MARKER_DRI:   state <= S_LEN_HI;

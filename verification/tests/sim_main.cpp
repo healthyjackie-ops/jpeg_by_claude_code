@@ -25,7 +25,7 @@ extern "C" {
 
 namespace {
 
-enum class Mode { Idle, Csr, Diff, One, Unit };
+enum class Mode { Idle, Csr, Diff, One, Unit, ErrOut };
 
 struct Args {
     Mode mode = Mode::Idle;
@@ -47,6 +47,7 @@ Args parse_args(int argc, char** argv) {
             else if (m == "diff") a.mode = Mode::Diff;
             else if (m == "one")  a.mode = Mode::One;
             else if (m == "unit") a.mode = Mode::Unit;
+            else if (m == "errout") a.mode = Mode::ErrOut;
             else { std::fprintf(stderr, "unknown mode: %s\n", m.c_str()); std::exit(1); }
         } else if (s.rfind("--dir=", 0) == 0) {
             a.dir = s.substr(6);
@@ -625,6 +626,120 @@ int run_unit() {
     return 77;
 }
 
+// --------------------------------------------------------------------------
+// Phase 14: negative-path runner.
+// Each JPEG in --dir must trigger STATUS.ERROR=1 with ERR_UNSUP_SOF set,
+// and must not produce pixels or hang. Used for SOF2 recognition (phase14/).
+// --------------------------------------------------------------------------
+struct ErrOutResult {
+    bool error_raised = false;  // STATUS.ERROR became 1 within budget
+    bool unsup_sof    = false;  // ERROR_CODE bit 0 set
+    bool no_pixels    = true;   // no m_px handshake observed
+    bool no_hang      = false;  // loop exited before timeout
+    uint32_t err_code = 0;
+    uint32_t status   = 0;
+    uint64_t cycles   = 0;
+};
+
+static ErrOutResult errout_one(const std::vector<uint8_t>& jpeg, bool verbose,
+                               uint32_t max_cycles = 200'000) {
+    ErrOutResult R;
+    TbCtx* tb = new TbCtx(/*vcd=*/nullptr);
+    tb->timeout_cycles = static_cast<uint64_t>(max_cycles) + 256;
+    tb->reset(12);
+    AxiLiteBfm csr(tb);
+
+    csr.write32(REG_CTRL, CTRL_SOFT_RESET);
+    csr.wait_status(STATUS_BUSY, 0, 128);
+    csr.write32(REG_CTRL, CTRL_START);
+
+    auto* d = tb->dut.get();
+    d->m_px_tready = 1;
+
+    size_t bi = 0;
+    bool pending_bi_adv = false;
+    bool saw_pixel = false;
+    tb->on_tick_pre = [&](TbCtx& t) {
+        auto* dd = t.dut.get();
+        if (dd->m_px_tvalid && dd->m_px_tready) saw_pixel = true;
+        if (pending_bi_adv) ++bi;
+        pending_bi_adv = false;
+        if (bi < jpeg.size()) {
+            dd->s_bs_tdata  = jpeg[bi];
+            dd->s_bs_tvalid = 1;
+            dd->s_bs_tlast  = (bi == jpeg.size() - 1);
+        } else {
+            dd->s_bs_tvalid = 0;
+            dd->s_bs_tlast  = 0;
+        }
+        pending_bi_adv = (dd->s_bs_tvalid && dd->s_bs_tready);
+    };
+
+    uint32_t c = 0;
+    for (; c < max_cycles; ++c) {
+        tb->tick();
+        if ((c & 0xFF) == 0xFF) {
+            uint32_t s = csr.read32(REG_STATUS);
+            if (s & STATUS_ERROR) {
+                R.error_raised = true;
+                R.no_hang = true;
+                break;
+            }
+            if ((s & STATUS_FRAME_DONE) && !(s & STATUS_BUSY)) {
+                // Unexpected success — but no hang, caller will mark FAIL.
+                R.no_hang = true;
+                break;
+            }
+        }
+    }
+    R.cycles = c;
+    R.err_code = csr.read32(REG_ERROR_CODE);
+    R.status   = csr.read32(REG_STATUS);
+    R.unsup_sof = (R.err_code & 0x1u) != 0;  // bit 0 = ERR_UNSUP_SOF
+    R.no_pixels = !saw_pixel;
+
+    if (verbose) {
+        std::printf("  status=0x%X err=0x%X pixels=%s cycles=%llu\n",
+                    R.status, R.err_code, saw_pixel ? "YES" : "no",
+                    (unsigned long long)R.cycles);
+    }
+    // Leak TbCtx (same reason as diff_one: macOS libc++ thread teardown race).
+    return R;
+}
+
+int run_errout(const Args& a) {
+    std::string dir = a.dir.empty() ? "../vectors/phase14" : a.dir;
+    auto files = list_jpegs(dir);
+    if (files.empty()) {
+        std::fprintf(stderr, "[ERROUT] no JPEGs in %s\n", dir.c_str());
+        return 2;
+    }
+    std::printf("[ERROUT] %zu vectors from %s\n", files.size(), dir.c_str());
+
+    int pass = 0, fail = 0;
+    std::vector<std::string> fail_names;
+    for (const auto& f : files) {
+        auto jpeg = slurp(f);
+        bool verbose = (pass + fail == 0);
+        ErrOutResult r = errout_one(jpeg, verbose);
+        bool ok = r.error_raised && r.unsup_sof && r.no_pixels && r.no_hang;
+        std::printf("  %-40s  err=0x%02X status=0x%X pixels=%s hang=%s  %s\n",
+                    f.substr(f.find_last_of('/') + 1).c_str(),
+                    r.err_code, r.status,
+                    r.no_pixels ? "0" : "LEAK",
+                    r.no_hang ? "no" : "YES",
+                    ok ? "OK" : "FAIL");
+        if (ok) ++pass;
+        else { ++fail; fail_names.push_back(f); }
+    }
+    std::printf("[ERROUT] %d/%zu passed\n", pass, files.size());
+    if (!fail_names.empty()) {
+        std::printf("[ERROUT] failures:\n");
+        for (const auto& n : fail_names) std::printf("  FAIL %s\n", n.c_str());
+    }
+    return fail ? 1 : 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -637,6 +752,7 @@ int main(int argc, char** argv) {
         case Mode::Diff: rc = run_diff(a); break;
         case Mode::One:  rc = run_one(a); break;
         case Mode::Unit: rc = run_unit(); break;
+        case Mode::ErrOut: rc = run_errout(a); break;
     }
     std::fflush(stdout);
     std::fflush(stderr);
