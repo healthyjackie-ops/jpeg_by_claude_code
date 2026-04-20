@@ -243,8 +243,18 @@ static int parse_sos(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
     if (bs_read_u16(bs, &len)) { *err |= JPEG_ERR_STREAM_TRUNC; return -1; }
     uint8_t ns;
     if (bs_read_byte(bs, &ns)) { *err |= JPEG_ERR_STREAM_TRUNC; return -1; }
-    /* Phase 8: Ns must match num_components (1 or 3) */
-    if (ns != info->num_components) { *err |= JPEG_ERR_UNSUP_CHROMA; return -1; }
+    /* Phase 8: baseline requires Ns == num_components.
+     * Phase 17a: SOF2 progressive allows non-interleaved AC scans (Ns=1).
+     *            ISO G.1.1.1 also permits Ns <= 4 for interleaved scans. */
+    if (info->sof_type != 2 && ns != info->num_components) {
+        *err |= JPEG_ERR_UNSUP_CHROMA; return -1;
+    }
+    if (info->sof_type == 2) {
+        if (ns == 0 || ns > info->num_components) {
+            *err |= JPEG_ERR_UNSUP_CHROMA; return -1;
+        }
+    }
+    info->scan_num_comps = ns;
 
     for (int i = 0; i < ns; i++) {
         uint8_t cs, tdta;
@@ -257,6 +267,7 @@ static int parse_sos(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
         if (comp_idx < 0) { *err |= JPEG_ERR_BAD_MARKER; return -1; }
         info->components[comp_idx].td = tdta >> 4;
         info->components[comp_idx].ta = tdta & 0xF;
+        info->scan_comp_idx[i] = (uint8_t)comp_idx;
     }
 
     uint8_t ss, se, ah_al;
@@ -297,6 +308,71 @@ static int skip_segment(bitstream_t *bs, uint32_t *err) {
     if (bs_read_u16(bs, &len)) { *err |= JPEG_ERR_STREAM_TRUNC; return -1; }
     bs_skip(bs, len - 2);
     return 0;
+}
+
+/* Phase 17a: between-scan marker loop. Consumes DHT/DQT/DRI/COM/APPn and stops
+ * at EOI (returns 1) or SOS (returns 0, info->scan_* updated). */
+int jpeg_parse_between_scans(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
+    /* If a marker is already pending in the bitstream (entropy decoder hit
+     * 0xFF followed by a non-stuff byte), consume it first. */
+    uint8_t first_marker = 0;
+    int have_marker = 0;
+    if (bs->marker_pending) {
+        first_marker = bs->last_marker;
+        bs->marker_pending = 0;
+        bs->last_marker    = 0;
+        have_marker = 1;
+    } else {
+        bs_align_to_byte(bs);
+    }
+
+    while (1) {
+        uint8_t marker;
+        if (have_marker) {
+            marker = first_marker;
+            have_marker = 0;
+        } else {
+            uint8_t b;
+            if (bs_read_byte(bs, &b)) { *err |= JPEG_ERR_STREAM_TRUNC; return -1; }
+            while (b != 0xFF) {
+                if (bs_read_byte(bs, &b)) { *err |= JPEG_ERR_STREAM_TRUNC; return -1; }
+            }
+            while (b == 0xFF) {
+                if (bs_read_byte(bs, &b)) { *err |= JPEG_ERR_STREAM_TRUNC; return -1; }
+            }
+            if (b == 0x00) continue; /* stuffed byte in rare mis-aligned path */
+            marker = b;
+        }
+
+        switch (marker) {
+            case MARKER_EOI:
+                return 1;
+            case MARKER_SOS:
+                if (parse_sos(bs, info, err)) return -1;
+                return 0;
+            case MARKER_DHT:
+                if (parse_dht(bs, info, err)) return -1;
+                break;
+            case MARKER_DQT:
+                if (parse_dqt(bs, info, err)) return -1;
+                break;
+            case MARKER_DRI:
+                if (parse_dri(bs, info, err)) return -1;
+                break;
+            case MARKER_COM:
+                if (skip_segment(bs, err)) return -1;
+                break;
+            default:
+                if (marker >= MARKER_APP0 && marker <= MARKER_APP15) {
+                    if (skip_segment(bs, err)) return -1;
+                } else {
+                    /* SOF/RST/etc between scans is not allowed. */
+                    *err |= JPEG_ERR_BAD_MARKER;
+                    return -1;
+                }
+                break;
+        }
+    }
 }
 
 int jpeg_parse_headers(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {

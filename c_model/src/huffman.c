@@ -128,3 +128,87 @@ int huff_decode_block_dc_only(bitstream_t *bs,
     coef[0] = (int16_t)((int32_t)(*dc_pred) << al_shift);
     return 0;
 }
+
+/* Phase 17a: DC-only first scan, but does NOT clear coef[1..63]. Used inside
+ * decode_progressive() where coef_buf is pre-cleared and subsequent AC scans
+ * fill in band-by-band. */
+int huff_decode_dc_progressive(bitstream_t *bs,
+                               const htable_t *dc_tab,
+                               int16_t *dc_pred,
+                               int16_t coef[64],
+                               uint8_t al_shift) {
+    uint8_t size;
+    if (huff_decode_symbol(bs, dc_tab, &size)) return -1;
+    if (size > 15) return -1;
+
+    int32_t diff = 0;
+    if (size > 0) {
+        if (bs_get_bits(bs, size, &diff)) return -1;
+    }
+    *dc_pred += (int16_t)diff;
+    coef[0] = (int16_t)((int32_t)(*dc_pred) << al_shift);
+    return 0;
+}
+
+/* Phase 17a: AC spectral-selection first scan (Ah=0).
+ * ISO/IEC 10918-1 G.1.2.2 (Decode_AC_coefficients).
+ *
+ * eob_run counts how many additional blocks must be skipped before decoding
+ * the next symbol. Caller resets to 0 before each scan.
+ */
+int huff_decode_ac_progressive(bitstream_t *bs,
+                               const htable_t *ac_tab,
+                               int16_t coef[64],
+                               uint8_t ss, uint8_t se,
+                               uint8_t al_shift,
+                               uint32_t *eob_run) {
+    static int trace_enabled = -1;
+    if (trace_enabled < 0) trace_enabled = (getenv("AC_TRACE") != NULL) ? 1 : 0;
+    if (ss == 0 || ss > se || se > 63) return -1;
+
+    if (*eob_run > 0) {
+        (*eob_run)--;
+        return 0;
+    }
+
+    int k = (int)ss;
+    while (k <= (int)se) {
+        uint8_t rs;
+        if (huff_decode_symbol(bs, ac_tab, &rs)) return -1;
+        int r = rs >> 4;
+        int s = rs & 0xF;
+        if (trace_enabled) fprintf(stderr, "   [ac] k=%d rs=0x%02X r=%d s=%d bp=%zu bc=%d\n",
+                                   k, rs, r, s, bs->byte_pos, bs->bit_cnt);
+
+        if (s == 0) {
+            if (r < 15) {
+                /* EOBn: EOB run of (2^r + extra) blocks starting from this one.
+                 * Extra bits are read as unsigned — bs_get_bits would sign-
+                 * extend and produce garbage for r>0. */
+                uint32_t extra = 0;
+                if (r > 0) {
+                    if (bs_get_bits_u(bs, r, &extra)) return -1;
+                }
+                *eob_run = ((uint32_t)1u << r) + extra - 1u;
+                if (trace_enabled) fprintf(stderr, "   [ac] EOB r=%d extra=%u eob_run=%u\n",
+                                           r, extra, *eob_run);
+                break;
+            } else {
+                /* ZRL: skip 16 zero coefficients */
+                k += 16;
+                continue;
+            }
+        }
+
+        k += r;
+        if (k > (int)se) return -1;
+
+        int32_t amp;
+        if (bs_get_bits(bs, (uint8_t)s, &amp)) return -1;
+        coef[ZIGZAG[k]] = (int16_t)((int32_t)amp << al_shift);
+        if (trace_enabled) fprintf(stderr, "   [ac] amp=%d store coef[%d]=%d\n",
+                                   amp, ZIGZAG[k], coef[ZIGZAG[k]]);
+        k++;
+    }
+    return 0;
+}

@@ -5,6 +5,7 @@
 #include "dequant.h"
 #include "idct.h"
 #include "chroma.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -46,6 +47,8 @@ static void copy_block_16x16_y_u16(const uint16_t y_blk[4][64],
 }
 
 static int decode_p12(bitstream_t *bs, jpeg_info_t *info, jpeg_decoded_t *out);
+static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
+                              jpeg_decoded_t *out);
 
 /* Phase 16b: progressive SOF2 first-scan dispatch state. Set from info before
  * entering the MCU loop; consulted by dec_blk(). Not thread-safe — jpeg_decode
@@ -85,24 +88,18 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
         return decode_p12(&bs, &info, out);
     }
 
-    /* Phase 16b: progressive SOF2 support is limited to a single DC-only scan
-     * (Ss=Se=0, Ah=0). Al is permitted but our current generator only exercises
-     * Al=0. Multi-scan progressive (AC or refinement) is deferred to Phase 17+.
-     * DRI + progressive is also deferred — most DC-only vectors never carry DRI.
-     */
+    /* Phase 17a: SOF2 handled via a dedicated multi-scan decoder that supports
+     * DC + spectral-selection AC scans (Ah=0). The legacy single-scan DC-only
+     * path (Phase 16b) is a degenerate sub-case and remains covered by the same
+     * routine. */
     g_dc_only = 0;
     g_al      = 0;
     if (info.sof_type == 2) {
-        if (info.scan_ss != 0 || info.scan_se != 0 || info.scan_ah != 0) {
-            out->err = JPEG_ERR_UNSUP_SOF;
-            return -1;
-        }
         if (info.dri != 0) {
             out->err = JPEG_ERR_UNSUP_SOF;
             return -1;
         }
-        g_dc_only = 1;
-        g_al      = info.scan_al;
+        return decode_progressive(&bs, &info, out);
     }
 
     out->width  = info.width;
@@ -893,6 +890,359 @@ static int decode_p12(bitstream_t *bs, jpeg_info_t *info, jpeg_decoded_t *out) {
 
 fail:
     free(y_pad); free(cb_pad_sub); free(cr_pad_sub); free(cb_pad); free(cr_pad);
+    return -1;
+}
+
+/* ========================================================================= */
+/* Phase 17a: progressive SOF2 decoder (gray / 4:4:4 / 4:2:0, Ah=0 only)     */
+/* ========================================================================= */
+
+/* Per-component block-grid dimensions (in blocks).
+ *
+ * blk_rows/blk_cols are the MCU-padded extents used as the stride for
+ * coef_buf indexing. Interleaved DC scans walk MCU-major and fill every
+ * MCU block (including those beyond natural extent).
+ *
+ * nat_rows/nat_cols are the "natural" component block extents per ISO
+ * 10918-1 A.2.3: ceil(Xi/8) × ceil(Yi/8). Non-interleaved AC scans traverse
+ * only the natural extent; the edge MCU-pad blocks (DC-only) keep zero AC.
+ */
+typedef struct {
+    uint32_t blk_rows;
+    uint32_t blk_cols;
+    uint32_t nat_rows;
+    uint32_t nat_cols;
+    uint32_t base;
+} comp_grid_t;
+
+static int pdbg_enabled(void) {
+    static int v = -1;
+    if (v < 0) v = (getenv("PROG_DBG") != NULL) ? 1 : 0;
+    return v;
+}
+
+static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
+                              jpeg_decoded_t *out) {
+    int dbg = pdbg_enabled();
+    int is_gray = (info->chroma_mode == CHROMA_GRAY);
+    int is_444  = (info->chroma_mode == CHROMA_444);
+    int is_420  = (info->chroma_mode == CHROMA_420);
+    if (!is_gray && !is_444 && !is_420) {
+        /* Phase 17a: scope limited to gray / 4:4:4 / 4:2:0 */
+        out->err = JPEG_ERR_UNSUP_CHROMA;
+        return -1;
+    }
+    if (info->precision != 8) {
+        /* SOF2 + P=12 out of scope */
+        out->err = JPEG_ERR_UNSUP_PREC;
+        return -1;
+    }
+
+    uint16_t W  = info->width;
+    uint16_t H  = info->height;
+    uint16_t mcu_w = is_420 ? 16 : 8;
+    uint16_t mcu_h = is_420 ? 16 : 8;
+    uint16_t Wp = info->mcu_cols * mcu_w;
+    uint16_t Hp = info->mcu_rows * mcu_h;
+    uint16_t CWp_sub = is_420 ? (Wp >> 1) : Wp;
+    uint16_t CHp_sub = is_420 ? (Hp >> 1) : Hp;
+
+    out->width  = W;
+    out->height = H;
+    out->precision = info->precision;
+
+    int num_comps = is_gray ? 1 : 3;
+
+    /* Block grid per component.
+     *
+     * MCU-padded dims (blk_rows/blk_cols) serve as coef_buf stride. Natural
+     * dims (nat_rows/nat_cols) per ISO 10918-1 A.2.3 drive non-interleaved
+     * AC scan traversal:
+     *   x_i = ceil(X * Hi / Hmax), y_i = ceil(Y * Vi / Vmax)
+     *   natural blocks = ceil(x_i/8) × ceil(y_i/8)
+     * For gray and 4:4:4 natural == MCU-padded. For 4:2:0 the Y component
+     * can differ when image width/height is not a multiple of 16.
+     */
+    uint32_t yw_nat = (uint32_t)((W + 7u) / 8u);
+    uint32_t yh_nat = (uint32_t)((H + 7u) / 8u);
+    comp_grid_t cg[3] = {0};
+    uint32_t total_blocks = 0;
+    if (is_gray) {
+        cg[0].blk_rows = info->mcu_rows;
+        cg[0].blk_cols = info->mcu_cols;
+        cg[0].nat_rows = yh_nat;
+        cg[0].nat_cols = yw_nat;
+    } else if (is_444) {
+        for (int c = 0; c < 3; c++) {
+            cg[c].blk_rows = info->mcu_rows;
+            cg[c].blk_cols = info->mcu_cols;
+            cg[c].nat_rows = yh_nat;
+            cg[c].nat_cols = yw_nat;
+        }
+    } else { /* 4:2:0 */
+        uint32_t cw = (uint32_t)((W + 1u) / 2u);
+        uint32_t ch = (uint32_t)((H + 1u) / 2u);
+        uint32_t cw_nat = (cw + 7u) / 8u;
+        uint32_t ch_nat = (ch + 7u) / 8u;
+        cg[0].blk_rows = info->mcu_rows * 2u;
+        cg[0].blk_cols = info->mcu_cols * 2u;
+        cg[0].nat_rows = yh_nat;
+        cg[0].nat_cols = yw_nat;
+        for (int c = 1; c < 3; c++) {
+            cg[c].blk_rows = info->mcu_rows;
+            cg[c].blk_cols = info->mcu_cols;
+            cg[c].nat_rows = ch_nat;
+            cg[c].nat_cols = cw_nat;
+        }
+    }
+    for (int c = 0; c < num_comps; c++) {
+        cg[c].base = total_blocks;
+        total_blocks += cg[c].blk_rows * cg[c].blk_cols;
+    }
+
+    int16_t (*coef_buf)[64] = (int16_t(*)[64])calloc(total_blocks, 64 * sizeof(int16_t));
+    if (!coef_buf) { out->err = (uint32_t)JPEG_ERR_INTERNAL; return -1; }
+
+    /* Zero DC predictors for first DC scan. */
+    for (int c = 0; c < num_comps; c++) info->components[c].dc_pred = 0;
+
+    /* -------------------------------------------------------------------- */
+    /* Scan loop                                                            */
+    /* -------------------------------------------------------------------- */
+
+    int saw_eoi = 0;
+    int scan_no = 0;
+    for (;;) {
+        if (info->scan_ah != 0) {
+            /* Refinement scans: Phase 18. */
+            out->err = JPEG_ERR_UNSUP_SOF;
+            goto fail;
+        }
+
+        int is_dc = (info->scan_ss == 0 && info->scan_se == 0);
+        int is_ac = (info->scan_ss >= 1 && info->scan_se >= info->scan_ss &&
+                     info->scan_se <= 63);
+        if (!is_dc && !is_ac) {
+            out->err = JPEG_ERR_UNSUP_SOF;
+            goto fail;
+        }
+        uint8_t al = info->scan_al;
+        if (dbg) fprintf(stderr,
+            "[prog] scan=%d Ss=%u Se=%u Ah=%u Al=%u Ns=%u bytepos=%zu bitcnt=%d\n",
+            scan_no, info->scan_ss, info->scan_se, info->scan_ah,
+            info->scan_al, info->scan_num_comps, bs->byte_pos, bs->bit_cnt);
+        scan_no++;
+
+        if (is_dc) {
+            /* Interleaved DC scan (Ns = num_comps). Walk MCU-major. DC preds
+             * reset at scan start. */
+            for (int c = 0; c < num_comps; c++) info->components[c].dc_pred = 0;
+            for (uint32_t my = 0; my < info->mcu_rows; my++) {
+                for (uint32_t mx = 0; mx < info->mcu_cols; mx++) {
+                    if (is_gray) {
+                        uint32_t blk = cg[0].base + my * cg[0].blk_cols + mx;
+                        const htable_t *dc_tab =
+                            &info->htables_dc[info->components[0].td];
+                        if (huff_decode_dc_progressive(
+                                bs, dc_tab,
+                                &info->components[0].dc_pred,
+                                coef_buf[blk], al)) {
+                            out->err = JPEG_ERR_BAD_HUFFMAN; goto fail;
+                        }
+                    } else if (is_444) {
+                        for (int c = 0; c < 3; c++) {
+                            uint32_t blk = cg[c].base + my * cg[c].blk_cols + mx;
+                            const htable_t *dc_tab =
+                                &info->htables_dc[info->components[c].td];
+                            if (huff_decode_dc_progressive(
+                                    bs, dc_tab,
+                                    &info->components[c].dc_pred,
+                                    coef_buf[blk], al)) {
+                                out->err = JPEG_ERR_BAD_HUFFMAN; goto fail;
+                            }
+                        }
+                    } else { /* 4:2:0 */
+                        uint32_t y_by0 = my * 2u, y_bx0 = mx * 2u;
+                        for (int iy = 0; iy < 2; iy++) {
+                            for (int ix = 0; ix < 2; ix++) {
+                                uint32_t blk = cg[0].base +
+                                    (y_by0 + (uint32_t)iy) * cg[0].blk_cols +
+                                    (y_bx0 + (uint32_t)ix);
+                                const htable_t *dc_tab =
+                                    &info->htables_dc[info->components[0].td];
+                                if (huff_decode_dc_progressive(
+                                        bs, dc_tab,
+                                        &info->components[0].dc_pred,
+                                        coef_buf[blk], al)) {
+                                    out->err = JPEG_ERR_BAD_HUFFMAN; goto fail;
+                                }
+                            }
+                        }
+                        for (int c = 1; c < 3; c++) {
+                            uint32_t blk = cg[c].base + my * cg[c].blk_cols + mx;
+                            const htable_t *dc_tab =
+                                &info->htables_dc[info->components[c].td];
+                            if (huff_decode_dc_progressive(
+                                    bs, dc_tab,
+                                    &info->components[c].dc_pred,
+                                    coef_buf[blk], al)) {
+                                out->err = JPEG_ERR_BAD_HUFFMAN; goto fail;
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            /* AC scan: must be non-interleaved (Ns=1). The SOS parser stored
+             * the scan's tables into components[?].ta — we need to find which
+             * component this scan addresses.  ISO G.1.1.1 requires Ns=1 for
+             * AC scans; the current parse_sos still enforces Ns == num_components.
+             * So for Phase 17a, libjpeg-turbo's default progressive script
+             * actually starts with an interleaved DC scan and then single-comp
+             * AC scans whose SOS has Ns=1.  Loosen parse_sos to permit Ns=1
+             * for SOF2 is a prerequisite — see header_parser patch.
+             *
+             * We identify the component by the one whose td/ta was updated
+             * during parse_sos: parse_sos writes td=tdta>>4, ta=tdta&0xF for
+             * the component(s) listed in this scan's SOS.  The AC table index
+             * "ta" carries the per-scan setting, while the other components'
+             * ta still reflects their previous scan's value — so we cannot
+             * disambiguate reliably that way.  Simplest solution: extend
+             * parse_sos to record the scan's component list in info. */
+            if (info->scan_num_comps != 1) {
+                out->err = JPEG_ERR_UNSUP_SOF; goto fail;
+            }
+            int scan_comp = info->scan_comp_idx[0];
+            const htable_t *ac_tab =
+                &info->htables_ac[info->components[scan_comp].ta];
+            uint32_t eob_run = 0;
+            uint32_t nat_rows = cg[scan_comp].nat_rows;
+            uint32_t nat_cols = cg[scan_comp].nat_cols;
+            uint32_t stride   = cg[scan_comp].blk_cols;
+            uint32_t n_blk    = nat_rows * nat_cols;
+            uint32_t b = 0;
+            for (uint32_t by = 0; by < nat_rows; by++) {
+                for (uint32_t bx = 0; bx < nat_cols; bx++) {
+                    uint32_t blk = cg[scan_comp].base + by * stride + bx;
+                    if (huff_decode_ac_progressive(
+                            bs, ac_tab, coef_buf[blk],
+                            info->scan_ss, info->scan_se,
+                            al, &eob_run)) {
+                        if (dbg) fprintf(stderr,
+                            "[prog] AC FAIL comp=%d b=%u/%u (by=%u bx=%u) eob_run=%u bytepos=%zu bitcnt=%d\n",
+                            scan_comp, b, n_blk, by, bx,
+                            eob_run, bs->byte_pos, bs->bit_cnt);
+                        out->err = JPEG_ERR_BAD_HUFFMAN; goto fail;
+                    }
+                    b++;
+                }
+            }
+            if (dbg) fprintf(stderr,
+                "[prog] AC OK comp=%d n_blk=%u final_eob_run=%u bytepos=%zu bitcnt=%d\n",
+                scan_comp, n_blk, eob_run, bs->byte_pos, bs->bit_cnt);
+        }
+
+        /* End of scan. Peek next marker. */
+        uint32_t e = 0;
+        int r = jpeg_parse_between_scans(bs, info, &e);
+        if (r < 0) { out->err = e ? e : (uint32_t)JPEG_ERR_BAD_MARKER; goto fail; }
+        if (r == 1) { saw_eoi = 1; break; }
+        /* r == 0: another SOS, loop */
+    }
+
+    if (!saw_eoi) { out->err = JPEG_ERR_STREAM_TRUNC; goto fail; }
+
+    /* -------------------------------------------------------------------- */
+    /* Drain: dequant + IDCT per block, place into pad planes              */
+    /* -------------------------------------------------------------------- */
+
+    uint8_t *y_pad      = (uint8_t*)calloc((size_t)Wp * Hp, 1);
+    uint8_t *cb_pad_sub = is_420 ? (uint8_t*)calloc((size_t)CWp_sub * CHp_sub, 1) : NULL;
+    uint8_t *cr_pad_sub = is_420 ? (uint8_t*)calloc((size_t)CWp_sub * CHp_sub, 1) : NULL;
+    uint8_t *cb_pad     = is_gray ? NULL : (uint8_t*)calloc((size_t)Wp * Hp, 1);
+    uint8_t *cr_pad     = is_gray ? NULL : (uint8_t*)calloc((size_t)Wp * Hp, 1);
+
+    out->y_plane = (uint8_t*)calloc((size_t)W * H, 1);
+    if (!is_gray) {
+        out->cb_plane = (uint8_t*)calloc((size_t)W * H, 1);
+        out->cr_plane = (uint8_t*)calloc((size_t)W * H, 1);
+        if (is_420) {
+            out->cb_plane_420 = (uint8_t*)calloc((size_t)(W >> 1) * (H >> 1), 1);
+            out->cr_plane_420 = (uint8_t*)calloc((size_t)(W >> 1) * (H >> 1), 1);
+        }
+    }
+    int alloc_ok = y_pad && out->y_plane &&
+                   (is_gray ||
+                    (cb_pad && cr_pad && out->cb_plane && out->cr_plane &&
+                     (!is_420 || (cb_pad_sub && cr_pad_sub &&
+                                  out->cb_plane_420 && out->cr_plane_420))));
+    if (!alloc_ok) {
+        free(y_pad); free(cb_pad_sub); free(cr_pad_sub); free(cb_pad); free(cr_pad);
+        out->err = (uint32_t)JPEG_ERR_INTERNAL; goto fail;
+    }
+
+    uint8_t blk_out[64];
+    for (int c = 0; c < num_comps; c++) {
+        const uint16_t *qt = info->qtables[info->components[c].qt_id].q;
+        uint32_t blk_rows = cg[c].blk_rows;
+        uint32_t blk_cols = cg[c].blk_cols;
+        uint32_t base = cg[c].base;
+        uint8_t *pad;
+        uint16_t pad_stride;
+        if (c == 0) {
+            pad = y_pad;
+            pad_stride = Wp;
+        } else if (is_420) {
+            pad = (c == 1) ? cb_pad_sub : cr_pad_sub;
+            pad_stride = CWp_sub;
+        } else { /* 4:4:4 */
+            pad = (c == 1) ? cb_pad : cr_pad;
+            pad_stride = Wp;
+        }
+
+        for (uint32_t by = 0; by < blk_rows; by++) {
+            for (uint32_t bx = 0; bx < blk_cols; bx++) {
+                uint32_t blk = base + by * blk_cols + bx;
+                dequant_block(coef_buf[blk], qt);
+                idct_islow(coef_buf[blk], blk_out);
+                uint8_t *dst = pad + ((size_t)by * 8u) * pad_stride + (bx * 8u);
+                copy_block_8x8(blk_out, dst, pad_stride);
+            }
+        }
+    }
+
+    free(coef_buf);
+
+    /* Chroma upsample (4:2:0 NN, same as baseline) */
+    if (is_420) {
+        chroma_upsample_nn(cb_pad_sub, cb_pad, Wp, Hp);
+        chroma_upsample_nn(cr_pad_sub, cr_pad, Wp, Hp);
+    }
+
+    /* Crop padded → output planes */
+    for (uint16_t r = 0; r < H; r++) {
+        memcpy(out->y_plane + (size_t)r * W, y_pad + (size_t)r * Wp, W);
+        if (!is_gray) {
+            memcpy(out->cb_plane + (size_t)r * W, cb_pad + (size_t)r * Wp, W);
+            memcpy(out->cr_plane + (size_t)r * W, cr_pad + (size_t)r * Wp, W);
+        }
+    }
+    if (is_420) {
+        for (uint16_t r = 0; r < (H >> 1); r++) {
+            memcpy(out->cb_plane_420 + (size_t)r * (W >> 1),
+                   cb_pad_sub + (size_t)r * CWp_sub, (W >> 1));
+            memcpy(out->cr_plane_420 + (size_t)r * (W >> 1),
+                   cr_pad_sub + (size_t)r * CWp_sub, (W >> 1));
+        }
+    }
+
+    free(y_pad); free(cb_pad_sub); free(cr_pad_sub); free(cb_pad); free(cr_pad);
+
+    out->err = 0;
+    return 0;
+
+fail:
+    free(coef_buf);
     return -1;
 }
 

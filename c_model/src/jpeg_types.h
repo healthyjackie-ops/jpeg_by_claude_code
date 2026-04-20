@@ -96,6 +96,8 @@ typedef struct {
     uint8_t  scan_se;       /* Phase 16a: SOS Se (0..63) */
     uint8_t  scan_ah;       /* Phase 16a: SOS Ah (0..13) */
     uint8_t  scan_al;       /* Phase 16a: SOS Al (0..13) */
+    uint8_t  scan_num_comps;                       /* Phase 17a: Ns of current scan */
+    uint8_t  scan_comp_idx[JPEG_MAX_COMPONENTS];   /* Phase 17a: component indexes in scan order */
 } jpeg_info_t;
 
 typedef struct {
