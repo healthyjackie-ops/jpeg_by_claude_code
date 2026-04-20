@@ -75,4 +75,18 @@ int huff_decode_ac_refine(bitstream_t *bs,
                           uint8_t al,
                           uint32_t *eob_run);
 
+/* Phase 25a: lossless (SOF3) single-sample difference decode.
+ *   - Symbol SSSS ∈ {0..16} (ISO H.1.2.2 Table H.1).
+ *   - SSSS == 0: diff = 0.
+ *   - SSSS ∈ {1..15}: read SSSS extra bits, sign-extend like DC (positive
+ *     if MSB=1, else value - ((1 << SSSS) - 1)).
+ *   - SSSS == 16: special — diff = 32768 (no extra bits), used when the
+ *     prediction differs from the sample by exactly 2^15. Valid only for
+ *     precision P ≥ 16 in general, but appears in the code table regardless.
+ * Returns 0 on success, -1 on bitstream error.
+ */
+int huff_decode_lossless_diff(bitstream_t *bs,
+                              const htable_t *dc_tab,
+                              int32_t *diff_out);
+
 #endif

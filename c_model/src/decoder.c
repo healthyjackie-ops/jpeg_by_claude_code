@@ -49,6 +49,8 @@ static void copy_block_16x16_y_u16(const uint16_t y_blk[4][64],
 static int decode_p12(bitstream_t *bs, jpeg_info_t *info, jpeg_decoded_t *out);
 static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
                               jpeg_decoded_t *out);
+static int decode_lossless(bitstream_t *bs, jpeg_info_t *info,
+                           jpeg_decoded_t *out);
 
 /* Phase 16b: progressive SOF2 first-scan dispatch state. Set from info before
  * entering the MCU loop; consulted by dec_blk(). Not thread-safe — jpeg_decode
@@ -97,6 +99,11 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
     g_al      = 0;
     if (info.sof_type == 2) {
         return decode_progressive(&bs, &info, out);
+    }
+    /* Phase 25a: SOF3 lossless. Scope = Nf=1 gray, P=8, Pt 0..15, Ps 1..7,
+     * DRI=0 (multi-component + DRI is Phase 25b/c). */
+    if (info.sof_type == 3) {
+        return decode_lossless(&bs, &info, out);
     }
 
     out->width  = info.width;
@@ -1334,6 +1341,156 @@ static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
 fail:
     free(coef_buf);
     return -1;
+}
+
+/* ========================================================================== */
+/* Phase 25a: Lossless (SOF3) decode — predictor + Huffman, no DCT            */
+/* ========================================================================== */
+/*
+ * Scope (Phase 25a):
+ *   - Nf=1 grayscale only
+ *   - P=8
+ *   - Pt ∈ {0..15}  (point transform: output = reconstructed << Pt)
+ *   - Ps ∈ {1..7}   (predictors P1..P7 per ISO H.1.2.1)
+ *   - Ns=1, DRI=0
+ *
+ * Prediction rules (ISO H.1.2.1):
+ *   - First sample of the scan: predictor = 2^(P-Pt-1)
+ *   - First sample of any other row (x=0, y>0): predictor = Rb
+ *   - Other samples on the first row (y=0, x>0): predictor = Ra
+ *   - All other samples: select Ps-indexed predictor
+ *       Ps=1: Ra           Ps=2: Rb           Ps=3: Rc
+ *       Ps=4: Ra+Rb-Rc
+ *       Ps=5: Ra + (Rb-Rc)>>1
+ *       Ps=6: Rb + (Ra-Rc)>>1
+ *       Ps=7: (Ra+Rb)>>1
+ *
+ * Reconstruction:
+ *   diff = huff_decode_lossless_diff(dc_tab)
+ *   sample_p = (Px + diff) & ((1 << P) - 1)       (modulo 2^P wraparound)
+ *   output   = (uint8_t)(sample_p << Pt)          (P=8, Pt=0 → identity)
+ *
+ * Output: out->y_plane = reconstructed W×H uint8 sample array.
+ */
+static int decode_lossless(bitstream_t *bs, jpeg_info_t *info,
+                           jpeg_decoded_t *out) {
+    if (info->chroma_mode != CHROMA_GRAY) {
+        /* Phase 25a scope: gray only. Multi-component lossless → Phase 25b. */
+        out->err = JPEG_ERR_UNSUP_CHROMA;
+        return -1;
+    }
+    if (info->precision != 8) {
+        /* Phase 25a scope: P=8 only. Phase 27 extends to 2..16. */
+        out->err = JPEG_ERR_UNSUP_PREC;
+        return -1;
+    }
+    if (info->dri != 0) {
+        /* Phase 25c will add RSTn handling. */
+        out->err = JPEG_ERR_UNSUP_SOF;
+        return -1;
+    }
+
+    uint16_t W = info->width;
+    uint16_t H = info->height;
+    uint8_t  Ps = info->scan_ss;         /* predictor selection */
+    uint8_t  Pt = info->scan_al;         /* point transform */
+    uint8_t  P  = info->precision;       /* 8 */
+
+    if (Ps < 1 || Ps > 7) {
+        out->err = JPEG_ERR_UNSUP_SOF;
+        return -1;
+    }
+    if (Pt > 15) {
+        out->err = JPEG_ERR_UNSUP_SOF;
+        return -1;
+    }
+
+    out->width     = W;
+    out->height    = H;
+    out->precision = P;
+
+    out->y_plane = (uint8_t*)calloc((size_t)W * H, 1);
+    if (!out->y_plane) {
+        out->err = (uint32_t)JPEG_ERR_INTERNAL;
+        return -1;
+    }
+
+    /* DC Huffman table used for difference SSSS symbols. Td = scan's DC index
+     * for this component, set by parse_sos. */
+    const htable_t *dc_tab = &info->htables_dc[info->components[0].td];
+
+    int32_t mask = (int32_t)(((uint32_t)1u << P) - 1u);   /* 0xFF for P=8 */
+    int32_t initial_pred = (int32_t)1 << (P - Pt - 1);    /* 128 for P=8/Pt=0 */
+
+    uint8_t *row = out->y_plane;
+    for (uint16_t y = 0; y < H; y++) {
+        uint8_t *cur  = row;
+        const uint8_t *prev = (y > 0) ? row - W : NULL;
+
+        for (uint16_t x = 0; x < W; x++) {
+            int32_t Px;
+            if (y == 0 && x == 0) {
+                Px = initial_pred;
+            } else if (y == 0) {
+                Px = (int32_t)cur[x - 1];              /* Ra */
+            } else if (x == 0) {
+                Px = (int32_t)prev[0];                 /* Rb */
+            } else {
+                int32_t Ra = (int32_t)cur[x - 1];
+                int32_t Rb = (int32_t)prev[x];
+                int32_t Rc = (int32_t)prev[x - 1];
+                switch (Ps) {
+                    case 1: Px = Ra;                      break;
+                    case 2: Px = Rb;                      break;
+                    case 3: Px = Rc;                      break;
+                    case 4: Px = Ra + Rb - Rc;            break;
+                    case 5: Px = Ra + ((Rb - Rc) >> 1);   break;
+                    case 6: Px = Rb + ((Ra - Rc) >> 1);   break;
+                    case 7: Px = (Ra + Rb) >> 1;          break;
+                    default: Px = 0;                      break;  /* unreachable */
+                }
+            }
+
+            int32_t diff = 0;
+            if (huff_decode_lossless_diff(bs, dc_tab, &diff)) {
+                out->err = JPEG_ERR_BAD_HUFFMAN;
+                return -1;
+            }
+
+            int32_t sample = (Px + diff) & mask;
+            /* P=8, Pt=0: sample directly; if Pt>0 the reconstructed sample is
+             * scaled back by shifting left (ISO H.1.2: output = sample << Pt).
+             * For P=8 any Pt>0 saturates, but djpeg outputs saturated samples
+             * too so we follow. */
+            int32_t out_val = sample << Pt;
+            if (out_val > 255) out_val = 255;
+            cur[x] = (uint8_t)out_val;
+        }
+
+        row += W;
+    }
+
+    /* Consume any pending marker up to EOI. */
+    bs_align_to_byte(bs);
+    uint8_t b;
+    int saw_eoi = 0;
+    if (bs->marker_pending && bs->last_marker == MARKER_EOI) {
+        saw_eoi = 1;
+    } else {
+        while (bs_read_byte(bs, &b) == 0) {
+            if (b == 0xFF) {
+                while (bs_read_byte(bs, &b) == 0 && b == 0xFF) {}
+                if (b == MARKER_EOI) { saw_eoi = 1; break; }
+            }
+        }
+    }
+    if (!saw_eoi) {
+        out->err = JPEG_ERR_STREAM_TRUNC;
+        return -1;
+    }
+
+    out->err = 0;
+    return 0;
 }
 
 void jpeg_free(jpeg_decoded_t *out) {

@@ -22,6 +22,7 @@ typedef struct {
     int num_components;   /* 1=grayscale, 3=YCbCr, 4=CMYK */
     int chroma_mode;      /* 0=gray, 1=420, 2=444, 3=422, 4=440, 5=411, 6=CMYK */
     int precision;        /* 8 or 12 */
+    int is_lossless;      /* Phase 25a: SOF3 — bypasses raw_data path */
     uint32_t cb_width;    /* native chroma plane width */
     uint32_t cb_height;   /* native chroma plane height */
     uint8_t *y;
@@ -37,6 +38,80 @@ typedef struct {
     uint16_t *cb16;
     uint16_t *cr16;
 } libjpeg_ycc_t;
+
+/* Phase 25a: detect SOF marker type by scanning the JPEG header segments
+ * until we hit SOF0/1/2/3. Returns 0..3 on success, -1 on malformed header
+ * or SOF not found before SOS. */
+static int peek_sof_type(const uint8_t *data, size_t size) {
+    if (size < 4 || data[0] != 0xFF || data[1] != 0xD8) return -1;
+    size_t i = 2;
+    while (i + 1 < size) {
+        while (i < size && data[i] == 0xFF) i++;
+        if (i >= size) return -1;
+        uint8_t m = data[i++];
+        if (m == 0xC0) return 0;
+        if (m == 0xC1) return 1;
+        if (m == 0xC2) return 2;
+        if (m == 0xC3) return 3;
+        if (m == 0xDA) return -1;              /* SOS before SOF */
+        if (m == 0xD8 || m == 0xD9 || m == 0x01) continue;
+        if (m >= 0xD0 && m <= 0xD7) continue;  /* RST (shouldn't appear pre-SOS) */
+        if (i + 1 >= size) return -1;
+        uint16_t len = (uint16_t)(((uint32_t)data[i] << 8) | data[i+1]);
+        if (len < 2 || i + len > size) return -1;
+        i += len;
+    }
+    return -1;
+}
+
+/* Phase 25a: decode a lossless (SOF3) JPEG via libjpeg-turbo's standard
+ * scanline API (raw_data_out=FALSE, no color conversion). Gray-only scope
+ * matches the C model's Phase 25a scope. */
+static int libjpeg_decode_lossless(const uint8_t *data, size_t size,
+                                   libjpeg_ycc_t *out) {
+    struct jpeg_decompress_struct cinfo;
+    struct err_mgr jerr;
+    memset(&cinfo, 0, sizeof(cinfo));
+    memset(out, 0, sizeof(*out));
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = err_exit;
+    if (setjmp(jerr.jb)) { jpeg_destroy_decompress(&cinfo); return -1; }
+    jpeg_create_decompress(&cinfo);
+    jpeg_mem_src(&cinfo, (unsigned char*)data, size);
+    jpeg_read_header(&cinfo, TRUE);
+
+    if (cinfo.num_components != 1) {
+        /* Phase 25a: gray only. */
+        jpeg_destroy_decompress(&cinfo);
+        return -1;
+    }
+    cinfo.out_color_space = JCS_GRAYSCALE;
+    if (!jpeg_start_decompress(&cinfo)) {
+        jpeg_destroy_decompress(&cinfo);
+        return -1;
+    }
+
+    uint32_t W = cinfo.output_width;
+    uint32_t H = cinfo.output_height;
+    out->width          = W;
+    out->height         = H;
+    out->num_components = 1;
+    out->chroma_mode    = 0;
+    out->precision      = cinfo.data_precision;
+    out->is_lossless    = 1;
+
+    out->y = (uint8_t*)calloc((size_t)W * H, 1);
+    if (!out->y) { jpeg_destroy_decompress(&cinfo); return -1; }
+
+    while (cinfo.output_scanline < H) {
+        JSAMPROW rows[1];
+        rows[0] = out->y + (size_t)cinfo.output_scanline * W;
+        (void)jpeg_read_scanlines(&cinfo, rows, 1);
+    }
+    jpeg_finish_decompress(&cinfo);
+    jpeg_destroy_decompress(&cinfo);
+    return 0;
+}
 
 static int libjpeg_decode_ycc(const uint8_t *data, size_t size, libjpeg_ycc_t *out) {
     struct jpeg_decompress_struct cinfo;
@@ -461,7 +536,11 @@ int main(int argc, char **argv) {
         if (!buf) { fprintf(stderr, "[SKIP] %s: read fail\n", argv[a]); skip++; continue; }
 
         libjpeg_ycc_t gold;
-        if (libjpeg_decode_ycc(buf, sz, &gold)) {
+        int sof_type = peek_sof_type(buf, sz);
+        int rc_gold = (sof_type == 3)
+                          ? libjpeg_decode_lossless(buf, sz, &gold)
+                          : libjpeg_decode_ycc(buf, sz, &gold);
+        if (rc_gold) {
             fprintf(stderr, "[SKIP] %s: libjpeg reject\n", argv[a]);
             skip++; free(buf); continue;
         }

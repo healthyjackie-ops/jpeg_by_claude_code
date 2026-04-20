@@ -347,3 +347,27 @@ int huff_decode_ac_refine(bitstream_t *bs,
     }
     return 0;
 }
+
+/* Phase 25a: Lossless (SOF3) single difference symbol (ISO H.1.2.2). */
+int huff_decode_lossless_diff(bitstream_t *bs,
+                              const htable_t *dc_tab,
+                              int32_t *diff_out) {
+    uint8_t size;
+    if (huff_decode_symbol(bs, dc_tab, &size)) return -1;
+    if (size > 16) return -1;
+    if (size == 0) {
+        *diff_out = 0;
+        return 0;
+    }
+    if (size == 16) {
+        /* ISO H.1.2.2: SSSS=16 encodes the single special value 32768
+         * with no extra bits (used when the predicted-vs-actual diff is
+         * exactly +2^15 in a P=16 lossless stream). */
+        *diff_out = 32768;
+        return 0;
+    }
+    int32_t v;
+    if (bs_get_bits(bs, size, &v)) return -1;
+    *diff_out = v;
+    return 0;
+}

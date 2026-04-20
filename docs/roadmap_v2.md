@@ -61,9 +61,11 @@
 
 | Phase | Spec | 时长 | 验收 |
 |---|---|---|---|
-| **25** | [SOF3 预测器 (P1..P7)](spec_phase25.md) | 5d | 预测器单元 |
-| **26** | [Lossless Huffman (1–16 sizes)](spec_phase26.md) | 2d | SOF3 8-bit |
-| **27** | [Lossless 2–16 bit precision](spec_phase27.md) | 3d | SOF3 16-bit |
+| **25a** ✅ | [SOF3 gray P=8 Pt=0 — C model](spec_phase25.md) | 1d | 28/28 phase25 向量 bit-exact（Ps 1-7 × grad/check/noise × 32/48/73/97/128/192），phase06-18 + phase_prog_dri 零退步 |
+| **25b** | [SOF3 multi-comp + Pt>0 — C model](spec_phase25.md) | 2d | Nf∈{1,2,3,4} lossless，Pt∈{0..15} |
+| **25c** | [SOF3 + DRI — C model](spec_phase25.md) | 1d | lossless restart markers |
+| **26** | [Lossless Huffman (1–16 sizes) — RTL](spec_phase26.md) | 2d | RTL lossless path |
+| **27** | [Lossless 2–16 bit precision](spec_phase27.md) | 3d | SOF3 P∈{2..16} |
 | **28** | [SOF11 (lossless + arith)](spec_phase28.md) | 3d | SOF11 |
 
 ### Wave 6 — Hierarchical

@@ -238,6 +238,16 @@ static int parse_sof2(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
     return parse_sof_common(bs, info, err, 0);
 }
 
+/* Phase 25a: SOF3 lossless. Component layout identical to SOF0/1/2. Precision
+ * P ∈ {2..16} per ISO H.1 (Phase 25a: P=8 only; Phase 27 extends). Scan-level
+ * params (Ss=predictor 1-7, Se=0, Ah=0, Al=point-transform) validated in
+ * parse_sos. Chroma is "gray" (Nf=1) for Phase 25a; multi-component lossless
+ * is Phase 25b. */
+static int parse_sof3(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
+    info->sof_type = 3;
+    return parse_sof_common(bs, info, err, 0);
+}
+
 static int parse_sos(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
     uint16_t len;
     if (bs_read_u16(bs, &len)) { *err |= JPEG_ERR_STREAM_TRUNC; return -1; }
@@ -282,11 +292,15 @@ static int parse_sos(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
     info->scan_ah = ah_al >> 4;
     info->scan_al = ah_al & 0x0F;
 
-    /* Baseline (SOF0/SOF1) still requires the full-block scan. SOF2/SOF3 can
-     * never reach here today — the outer dispatch error-outs before SOS (Phase
-     * 14). When Phase 16b enables SOF2, this gate relaxes to allow DC-only
-     * (Ss=Se=0, Ah=0) and later AC ranges. */
-    if (info->sof_type != 2) {
+    /* Baseline (SOF0/SOF1) requires the full-block scan. SOF2 is validated
+     * inside decode_progressive. SOF3 (Phase 25a) uses Ss as predictor Ps
+     * ∈ {1..7}, Se=0, Ah=0, Al=Pt (0..15). */
+    if (info->sof_type == 3) {
+        if (ss < 1 || ss > 7 || se != 0 || (ah_al >> 4) != 0) {
+            *err |= JPEG_ERR_UNSUP_SOF;
+            return -1;
+        }
+    } else if (info->sof_type != 2) {
         if (ss != 0 || se != 63 || ah_al != 0) {
             *err |= JPEG_ERR_UNSUP_SOF;
             return -1;
@@ -406,6 +420,10 @@ int jpeg_parse_headers(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
                 if (parse_sof2(bs, info, err)) return -1;
                 got_sof = 1;
                 break;
+            case MARKER_SOF3:
+                if (parse_sof3(bs, info, err)) return -1;
+                got_sof = 1;
+                break;
             case MARKER_DQT:
                 if (parse_dqt(bs, info, err)) return -1;
                 break;
@@ -428,10 +446,11 @@ int jpeg_parse_headers(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
             default:
                 if (marker >= MARKER_APP0 && marker <= MARKER_APP15) {
                     if (skip_segment(bs, err)) return -1;
-                } else if (marker == MARKER_SOF3 ||
-                           (marker >= MARKER_SOF5 && marker <= MARKER_SOF15)) {
+                } else if (marker >= MARKER_SOF5 && marker <= MARKER_SOF15) {
                     /* Phase 16b: SOF2 (progressive) now handled above.
-                     * SOF3 (lossless) / SOF5..SOF15 remain unsupported. */
+                     * Phase 25a: SOF3 (lossless) now handled above.
+                     * SOF5..SOF15 (hierarchical / arith / lossless+arith) remain
+                     * unsupported — Waves 4/5/6. */
                     *err |= JPEG_ERR_UNSUP_SOF;
                     return -1;
                 } else {

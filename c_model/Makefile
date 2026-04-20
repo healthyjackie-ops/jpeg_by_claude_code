@@ -23,7 +23,7 @@ TEST_BINS := $(patsubst $(TEST_DIR)/test_%.c,$(BUILD_DIR)/test_%,$(TEST_SRCS))
 GOLDEN_SRC := $(GOLDEN_DIR)/golden_compare.c
 GOLDEN_BIN := $(BUILD_DIR)/golden_compare
 
-.PHONY: all test golden phase16 phase17 phase18 phase_prog_dri clean
+.PHONY: all test golden phase16 phase17 phase18 phase_prog_dri phase25 clean
 all: $(BUILD_DIR)/jpeg_decode $(GOLDEN_BIN)
 
 VECTORS_ROOT ?= ../verification/vectors
@@ -31,6 +31,7 @@ PHASE16_DIR  := $(VECTORS_ROOT)/phase16
 PHASE17_DIR  := $(VECTORS_ROOT)/phase17
 PHASE18_DIR  := $(VECTORS_ROOT)/phase18
 PHASE_PROG_DRI_DIR := $(VECTORS_ROOT)/phase_prog_dri
+PHASE25_DIR  := $(VECTORS_ROOT)/phase25
 
 phase16: $(GOLDEN_BIN)
 	@if ls $(PHASE16_DIR)/*.jpg >/dev/null 2>&1; then \
@@ -61,6 +62,14 @@ phase_prog_dri: $(GOLDEN_BIN)
 	  $(GOLDEN_BIN) $(PHASE_PROG_DRI_DIR)/*.jpg; \
 	else \
 	  echo "[phase_prog_dri] no vectors in $(PHASE_PROG_DRI_DIR) — run tools/gen_phase_prog_dri.py" >&2; \
+	  exit 2; \
+	fi
+
+phase25: $(GOLDEN_BIN)
+	@if ls $(PHASE25_DIR)/*.jpg >/dev/null 2>&1; then \
+	  $(GOLDEN_BIN) $(PHASE25_DIR)/*.jpg; \
+	else \
+	  echo "[phase25] no vectors in $(PHASE25_DIR) — run tools/gen_phase25.py" >&2; \
 	  exit 2; \
 	fi
 
