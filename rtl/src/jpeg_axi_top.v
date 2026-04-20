@@ -280,11 +280,13 @@ module jpeg_axi_top (
 
     wire        pix_valid_w;
     wire [2:0]  pix_row_w;
-    wire [7:0]  pix0_w, pix1_w, pix2_w, pix3_w, pix4_w, pix5_w, pix6_w, pix7_w;
+    // Phase 13: pix 宽度 16b (低 12b 有效)
+    wire [15:0] pix0_w, pix1_w, pix2_w, pix3_w, pix4_w, pix5_w, pix6_w, pix7_w;
     wire        idct_blk_done_w;
 
     idct_2d u_idct (
         .clk(aclk), .rst_n(aresetn), .soft_reset(softrst),
+        .precision(precision_w),         // Phase 13
         .dq_start(dq_start_w), .dq_wr(dq_wr_w),
         .dq_idx(dq_idx_w), .dq_val(dq_val_w), .dq_done(dq_done_w),
         .pix_valid(pix_valid_w), .pix_row(pix_row_w),
@@ -299,7 +301,8 @@ module jpeg_axi_top (
     wire [3:0]  mb_y_row_w;
     wire [4:0]  mb_y_col_w;            // Phase 11b: 5 位支持 0..31 (4:1:1 Y 32-wide)
     wire [2:0]  mb_c_row_w, mb_c_col_w;
-    wire [7:0]  mb_y_data_w, mb_cb_data_w, mb_cr_data_w, mb_k_data_w;
+    // Phase 13: 16b 样本
+    wire [15:0] mb_y_data_w, mb_cb_data_w, mb_cr_data_w, mb_k_data_w;
 
     wire mb_ready_nc;
     mcu_buffer u_mb (
@@ -323,18 +326,19 @@ module jpeg_axi_top (
     wire        lc_start_w, lc_done_w;
     wire [15:0] lc_mcu_col_w;
 
+    // Phase 13: line_buffer 样本宽度 16b
     wire        lb_y_wr_w;
     wire [3:0]  lb_y_row_w;
     wire [11:0] lb_y_col_w;
-    wire [7:0]  lb_y_data_w;
+    wire [15:0] lb_y_data_w;
     wire        lb_c_wr_w;
     wire [2:0]  lb_c_row_w;
     wire [11:0] lb_c_col_w;            // Phase 9: 4:4:4 需 12b chroma 地址
-    wire [7:0]  lb_cb_data_w, lb_cr_data_w;
+    wire [15:0] lb_cb_data_w, lb_cr_data_w;
     wire        lb_k_wr_w;              // Phase 12
     wire [2:0]  lb_k_row_w;
     wire [11:0] lb_k_col_w;
-    wire [7:0]  lb_k_data_w;
+    wire [15:0] lb_k_data_w;
 
     mcu_line_copy u_lc (
         .clk(aclk), .rst_n(aresetn), .soft_reset(softrst),
@@ -364,7 +368,8 @@ module jpeg_axi_top (
     wire [11:0] po_rd_c_col_w;         // Phase 9: 4:4:4 需 12b chroma 地址
     wire [2:0]  po_rd_k_row_w;
     wire [11:0] po_rd_k_col_w;
-    wire [7:0]  po_rd_y_data_w, po_rd_cb_data_w, po_rd_cr_data_w, po_rd_k_data_w;
+    // Phase 13: 16b 样本
+    wire [15:0] po_rd_y_data_w, po_rd_cb_data_w, po_rd_cr_data_w, po_rd_k_data_w;
 
     line_buffer u_lb (
         .clk(aclk), .rst_n(aresetn), .soft_reset(softrst),
@@ -544,7 +549,6 @@ module jpeg_axi_top (
                      cfg_reg_w, scratch_reg_w, int_en_w,
                      fifo_byte_tlast, in_fifo_full, out_fifo_empty,
                      in_fifo_tuser_nc, peek_valid_nc, mb_ready_nc,
-                     precision_w,  // Phase 13: driven by header_parser, 下一阶段 RTL 消费
                      1'b0};
 
 endmodule

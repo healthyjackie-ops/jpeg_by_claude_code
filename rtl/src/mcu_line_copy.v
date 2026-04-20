@@ -19,30 +19,30 @@ module mcu_line_copy (
     input  wire        is_cmyk,         // Phase 12: 1=CMYK (C/M/Y/K 四个 8x8 full-res)
     output reg         done,
 
-    // 读 mcu_buffer
+    // 读 mcu_buffer — Phase 13: 数据 16b (低 12b 有效)
     output reg  [3:0]  mb_y_row,
     output reg  [4:0]  mb_y_col,         // Phase 11b: 5 位支持 0..31
     output reg  [2:0]  mb_c_row,
     output reg  [2:0]  mb_c_col,
-    input  wire [7:0]  mb_y_data,
-    input  wire [7:0]  mb_cb_data,
-    input  wire [7:0]  mb_cr_data,
-    input  wire [7:0]  mb_k_data,       // Phase 12: CMYK K read
+    input  wire [15:0] mb_y_data,
+    input  wire [15:0] mb_cb_data,
+    input  wire [15:0] mb_cr_data,
+    input  wire [15:0] mb_k_data,       // Phase 12: CMYK K read
 
-    // 写 line_buffer
+    // 写 line_buffer — Phase 13: 数据 16b
     output reg         lb_y_wr,
     output reg  [3:0]  lb_y_row,
     output reg  [11:0] lb_y_col,
-    output reg  [7:0]  lb_y_data,
+    output reg  [15:0] lb_y_data,
     output reg         lb_c_wr,
     output reg  [2:0]  lb_c_row,
     output reg  [11:0] lb_c_col,       // Phase 9: 4:4:4 需 12b chroma 地址
-    output reg  [7:0]  lb_cb_data,
-    output reg  [7:0]  lb_cr_data,
+    output reg  [15:0] lb_cb_data,
+    output reg  [15:0] lb_cr_data,
     output reg         lb_k_wr,        // Phase 12: CMYK K write
     output reg  [2:0]  lb_k_row,
     output reg  [11:0] lb_k_col,
-    output reg  [7:0]  lb_k_data
+    output reg  [15:0] lb_k_data
 );
 
     // 扫描状态
@@ -79,10 +79,10 @@ module mcu_line_copy (
             done <= 1'b0;
             mb_y_row <= 4'd0; mb_y_col <= 5'd0;
             mb_c_row <= 3'd0; mb_c_col <= 3'd0;
-            lb_y_wr <= 1'b0; lb_y_row <= 4'd0; lb_y_col <= 12'd0; lb_y_data <= 8'd0;
+            lb_y_wr <= 1'b0; lb_y_row <= 4'd0; lb_y_col <= 12'd0; lb_y_data <= 16'd0;
             lb_c_wr <= 1'b0; lb_c_row <= 3'd0; lb_c_col <= 12'd0;
-            lb_cb_data <= 8'd0; lb_cr_data <= 8'd0;
-            lb_k_wr <= 1'b0; lb_k_row <= 3'd0; lb_k_col <= 12'd0; lb_k_data <= 8'd0;
+            lb_cb_data <= 16'd0; lb_cr_data <= 16'd0;
+            lb_k_wr <= 1'b0; lb_k_row <= 3'd0; lb_k_col <= 12'd0; lb_k_data <= 16'd0;
         end else if (soft_reset) begin
             active <= 1'b0; done <= 1'b0;
             lb_y_wr <= 1'b0; lb_c_wr <= 1'b0; lb_k_wr <= 1'b0;

@@ -16,6 +16,9 @@ module idct_2d (
     input  wire        rst_n,
     input  wire        soft_reset,
 
+    // Phase 13: 0=P=8, 1=P=12 — 选择 PASS1_BITS / bias / clamp
+    input  wire        precision,
+
     // 来自 dequant_izz (Phase 13: 32b signed 以承载 16×16 乘积)
     input  wire        dq_start,
     input  wire        dq_wr,
@@ -24,9 +27,10 @@ module idct_2d (
     input  wire        dq_done,
 
     // 输出 8 像素/cyc (pass2 过程中)
+    // Phase 13: 像素宽度 16b (低 12b 有效)。P=8 路径高 4b=0；P=12 路径可达 4095。
     output reg         pix_valid,
     output reg  [2:0]  pix_row,         // 0..7
-    output reg  [7:0]  pix0, pix1, pix2, pix3, pix4, pix5, pix6, pix7,
+    output reg  [15:0] pix0, pix1, pix2, pix3, pix4, pix5, pix6, pix7,
     output reg         blk_done_out
 );
 
@@ -113,25 +117,34 @@ module idct_2d (
         end
     end
 
-    // DESCALE 宏化
-    // Pass1: shift = 11 (CONST_BITS - PASS1_BITS)，round bias = 1<<10
-    // Pass2: shift = 18 (CONST_BITS + PASS1_BITS + 3)，round bias = 1<<17
+    // DESCALE 宏化 — Phase 13 起按 precision 选择 P=8 / P=12 路径
+    //   P=8:  PASS1_BITS=2 → Pass1 shift=11, Pass2 shift=18, bias +128, clamp 0..255
+    //   P=12: PASS1_BITS=1 → Pass1 shift=12, Pass2 shift=17, bias +2048, clamp 0..4095
     function signed [31:0] desc_p1;
+        input             p;    // precision: 0=P8, 1=P12
         input signed [31:0] x;
         begin
-            desc_p1 = (x + 32'sd1024) >>> 11;
+            desc_p1 = p ? ((x + 32'sd2048)  >>> 12)
+                        : ((x + 32'sd1024)  >>> 11);
         end
     endfunction
 
-    function [7:0] desc_p2;
+    function [15:0] desc_p2;
+        input             p;    // precision: 0=P8, 1=P12
         input signed [31:0] x;
         reg signed [31:0] y;
+        reg signed [31:0] clamp_hi;
         begin
-            y = (x + 32'sd131072) >>> 18;
-            y = y + 32'sd128;
-            if (y < 0) desc_p2 = 8'd0;
-            else if (y > 32'sd255) desc_p2 = 8'd255;
-            else desc_p2 = y[7:0];
+            if (p) begin
+                y        = ((x + 32'sd65536) >>> 17) + 32'sd2048;
+                clamp_hi = 32'sd4095;
+            end else begin
+                y        = ((x + 32'sd131072) >>> 18) + 32'sd128;
+                clamp_hi = 32'sd255;
+            end
+            if (y < 0)              desc_p2 = 16'd0;
+            else if (y > clamp_hi)  desc_p2 = clamp_hi[15:0];
+            else                    desc_p2 = y[15:0];
         end
     endfunction
 
@@ -142,14 +155,14 @@ module idct_2d (
         if (dq_wr)
             inbuf[dq_idx] <= dq_val;
         if (wr_en_p1_r2) begin
-            ws[{3'd0, wr_col_r2}] <= desc_p1(p1_o0);
-            ws[{3'd1, wr_col_r2}] <= desc_p1(p1_o1);
-            ws[{3'd2, wr_col_r2}] <= desc_p1(p1_o2);
-            ws[{3'd3, wr_col_r2}] <= desc_p1(p1_o3);
-            ws[{3'd4, wr_col_r2}] <= desc_p1(p1_o4);
-            ws[{3'd5, wr_col_r2}] <= desc_p1(p1_o5);
-            ws[{3'd6, wr_col_r2}] <= desc_p1(p1_o6);
-            ws[{3'd7, wr_col_r2}] <= desc_p1(p1_o7);
+            ws[{3'd0, wr_col_r2}] <= desc_p1(precision, p1_o0);
+            ws[{3'd1, wr_col_r2}] <= desc_p1(precision, p1_o1);
+            ws[{3'd2, wr_col_r2}] <= desc_p1(precision, p1_o2);
+            ws[{3'd3, wr_col_r2}] <= desc_p1(precision, p1_o3);
+            ws[{3'd4, wr_col_r2}] <= desc_p1(precision, p1_o4);
+            ws[{3'd5, wr_col_r2}] <= desc_p1(precision, p1_o5);
+            ws[{3'd6, wr_col_r2}] <= desc_p1(precision, p1_o6);
+            ws[{3'd7, wr_col_r2}] <= desc_p1(precision, p1_o7);
         end
     end
 
@@ -159,8 +172,8 @@ module idct_2d (
             st <= S_IDLE;
             pass_cnt <= 4'd0;
             pix_valid <= 1'b0; pix_row <= 3'd0;
-            pix0<=8'd0; pix1<=8'd0; pix2<=8'd0; pix3<=8'd0;
-            pix4<=8'd0; pix5<=8'd0; pix6<=8'd0; pix7<=8'd0;
+            pix0<=16'd0; pix1<=16'd0; pix2<=16'd0; pix3<=16'd0;
+            pix4<=16'd0; pix5<=16'd0; pix6<=16'd0; pix7<=16'd0;
             blk_done_out <= 1'b0;
         end else if (soft_reset) begin
             st <= S_IDLE; pass_cnt <= 4'd0;
@@ -189,14 +202,14 @@ module idct_2d (
                     if (wr_en_p2_r2) begin
                         pix_valid <= 1'b1;
                         pix_row   <= wr_col_r2;    // 2 拍之前喂的 row
-                        pix0 <= desc_p2(p2_o0);
-                        pix1 <= desc_p2(p2_o1);
-                        pix2 <= desc_p2(p2_o2);
-                        pix3 <= desc_p2(p2_o3);
-                        pix4 <= desc_p2(p2_o4);
-                        pix5 <= desc_p2(p2_o5);
-                        pix6 <= desc_p2(p2_o6);
-                        pix7 <= desc_p2(p2_o7);
+                        pix0 <= desc_p2(precision, p2_o0);
+                        pix1 <= desc_p2(precision, p2_o1);
+                        pix2 <= desc_p2(precision, p2_o2);
+                        pix3 <= desc_p2(precision, p2_o3);
+                        pix4 <= desc_p2(precision, p2_o4);
+                        pix5 <= desc_p2(precision, p2_o5);
+                        pix6 <= desc_p2(precision, p2_o6);
+                        pix7 <= desc_p2(precision, p2_o7);
                     end
                     if (pass_cnt == 4'd9) begin
                         pass_cnt <= 4'd0;

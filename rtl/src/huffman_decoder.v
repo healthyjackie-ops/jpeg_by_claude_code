@@ -198,7 +198,8 @@ module huffman_decoder (
                 end
 
                 S_DC_SIZE: begin
-                    if (sym > 8'd11) begin
+                    // Phase 13: DC cat 上限 15 (P=12 范围)；P=8 的合法流不会超过 11
+                    if (sym > 8'd15) begin
                         blk_err <= 1'b1; st <= S_ERR;
                     end else if (sym == 8'd0) begin
                         // diff = 0，直接写 DC

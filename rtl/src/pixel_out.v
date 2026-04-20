@@ -27,17 +27,17 @@ module pixel_out (
     input  wire        is_cmyk,        // Phase 12: 1=CMYK {C,M,Y,K}
     output reg         row_done,
 
-    // line_buffer 读口
+    // line_buffer 读口 — Phase 13: 数据 16b (低 12b 有效)
     output reg  [3:0]  rd_y_row,
     output reg  [11:0] rd_y_col,
     output reg  [2:0]  rd_c_row,
     output reg  [11:0] rd_c_col,       // Phase 9: 扩宽至 12 位
     output reg  [2:0]  rd_k_row,       // Phase 12: CMYK K plane
     output reg  [11:0] rd_k_col,
-    input  wire [7:0]  rd_y_data,
-    input  wire [7:0]  rd_cb_data,
-    input  wire [7:0]  rd_cr_data,
-    input  wire [7:0]  rd_k_data,
+    input  wire [15:0] rd_y_data,
+    input  wire [15:0] rd_cb_data,
+    input  wire [15:0] rd_cr_data,
+    input  wire [15:0] rd_k_data,
 
     // AXI-Stream 输出 (Phase 12: 32b)
     output reg         tvalid,
@@ -100,16 +100,14 @@ module pixel_out (
             if (active && (!tvalid || tready)) begin
                 // 驱动当前 (y_row, x_col) 像素
                 tvalid    <= 1'b1;
-                // Phase 12 packing:
-                //   CMYK : {C=rd_y, M=rd_cb, Y=rd_cr, K=rd_k}
-                //   GRAY : {Y, 0x80, 0x80, 0x00}
-                //   YCbCr: {Y, Cb, Cr, 0x00}
+                // Phase 12 packing (32b, P=8 only) — Phase 13 注：下游 16b bus 的
+                // 低 8b 即 P=8 样本；P=12 的高 4b 在此处被截断（13b.5 扩 48b 修复）
                 if (is_cmyk)
-                    tdata <= {rd_y_data, rd_cb_data, rd_cr_data, rd_k_data};
+                    tdata <= {rd_y_data[7:0], rd_cb_data[7:0], rd_cr_data[7:0], rd_k_data[7:0]};
                 else if (is_grayscale)
-                    tdata <= {rd_y_data, 8'h80, 8'h80, 8'h00};
+                    tdata <= {rd_y_data[7:0], 8'h80, 8'h80, 8'h00};
                 else
-                    tdata <= {rd_y_data, rd_cb_data, rd_cr_data, 8'h00};
+                    tdata <= {rd_y_data[7:0], rd_cb_data[7:0], rd_cr_data[7:0], 8'h00};
                 tuser_sof <= is_first_row && (y_row == 4'd0) && (x_col == 12'd0);
                 tlast     <= (x_col == (img_width - 12'd1));
 

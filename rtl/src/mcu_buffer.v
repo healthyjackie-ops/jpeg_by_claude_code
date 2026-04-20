@@ -18,10 +18,10 @@ module mcu_buffer (
     input  wire        rst_n,
     input  wire        soft_reset,
 
-    // 来自 idct_2d
+    // 来自 idct_2d — Phase 13: 像素宽度升至 16b (低 12b 有效)
     input  wire        pix_valid,
     input  wire [2:0]  pix_row,
-    input  wire [7:0]  pix0, pix1, pix2, pix3, pix4, pix5, pix6, pix7,
+    input  wire [15:0] pix0, pix1, pix2, pix3, pix4, pix5, pix6, pix7,
     input  wire        blk_done_in,
 
     // 控制：当前 block 类型 (由 block_sequencer 驱动)
@@ -35,22 +35,24 @@ module mcu_buffer (
     input  wire        mcu_consume,    // 高电平时允许输出
 
     // 读取 MCU 内容 (Y 最大 32×16, Cb 8×8, Cr 8×8, K 8×8) —— 按 (row, col) 地址读
+    // Phase 13: 数据宽度 16b (低 12b 有效)
     input  wire [3:0]  rd_y_row,       // 0..15
     input  wire [4:0]  rd_y_col,       // 0..31 (Phase 11b: 32 列支持)
-    output wire [7:0]  rd_y_data,
+    output wire [15:0] rd_y_data,
     input  wire [2:0]  rd_c_row,       // 0..7
     input  wire [2:0]  rd_c_col,
-    output wire [7:0]  rd_cb_data,
-    output wire [7:0]  rd_cr_data,
-    output wire [7:0]  rd_k_data       // Phase 12: CMYK K 读口
+    output wire [15:0] rd_cb_data,
+    output wire [15:0] rd_cr_data,
+    output wire [15:0] rd_k_data       // Phase 12: CMYK K 读口
 );
 
-    // Y: 32×16 = 512 bytes (支持 4:1:1 32-wide 和 4:2:0 16×16)
-    reg [7:0] ybuf [0:511];
-    // Cb, Cr, K: 8×8 = 64 bytes each
-    reg [7:0] cbbuf [0:63];
-    reg [7:0] crbuf [0:63];
-    reg [7:0] kbuf  [0:63];
+    // Phase 13: 像素宽度 16b 存储 (低 12b 有效)
+    // Y: 32×16 = 512 entries × 16b
+    reg [15:0] ybuf [0:511];
+    // Cb, Cr, K: 8×8 = 64 entries × 16b each
+    reg [15:0] cbbuf [0:63];
+    reg [15:0] crbuf [0:63];
+    reg [15:0] kbuf  [0:63];
 
     assign rd_y_data  = ybuf[{rd_y_row, rd_y_col}];
     assign rd_cb_data = cbbuf[{rd_c_row, rd_c_col}];
