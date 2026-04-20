@@ -43,6 +43,7 @@ static int libjpeg_decode_ycc(const uint8_t *data, size_t size, libjpeg_ycc_t *o
     int is_gray = (cinfo.num_components == 1);
     int is_444  = 0;
     int is_422  = 0;
+    int is_440  = 0;
     if (!is_gray && cinfo.num_components == 3) {
         int h0 = cinfo.comp_info[0].h_samp_factor;
         int v0 = cinfo.comp_info[0].v_samp_factor;
@@ -52,6 +53,7 @@ static int libjpeg_decode_ycc(const uint8_t *data, size_t size, libjpeg_ycc_t *o
         int v2 = cinfo.comp_info[2].v_samp_factor;
         is_444 = (h0 == 1 && v0 == 1 && h1 == 1 && v1 == 1 && h2 == 1 && v2 == 1);
         is_422 = (h0 == 2 && v0 == 1 && h1 == 1 && v1 == 1 && h2 == 1 && v2 == 1);
+        is_440 = (h0 == 1 && v0 == 2 && h1 == 1 && v1 == 1 && h2 == 1 && v2 == 1);
     }
     cinfo.raw_data_out = TRUE;
     cinfo.do_fancy_upsampling = FALSE;
@@ -65,7 +67,10 @@ static int libjpeg_decode_ycc(const uint8_t *data, size_t size, libjpeg_ycc_t *o
     out->width = W;
     out->height = H;
     out->num_components = is_gray ? 1 : 3;
-    out->chroma_mode = is_gray ? 0 : (is_444 ? 2 : (is_422 ? 3 : 1));
+    out->chroma_mode = is_gray ? 0 :
+                       is_444  ? 2 :
+                       is_422  ? 3 :
+                       is_440  ? 4 : 1;
 
     if (is_gray) {
         /* Phase 8: grayscale — raw_data_out fills 8 rows of Y per call.
@@ -158,6 +163,48 @@ static int libjpeg_decode_ycc(const uint8_t *data, size_t size, libjpeg_ycc_t *o
             memcpy(out->y  + (size_t)r * W,     y_pad  + (size_t)r * Wp,  W);
             memcpy(out->cb + (size_t)r * (W/2), cb_pad + (size_t)r * CWp, W/2);
             memcpy(out->cr + (size_t)r * (W/2), cr_pad + (size_t)r * CWp, W/2);
+        }
+        free(y_pad); free(cb_pad); free(cr_pad);
+    } else if (is_440) {
+        /* Phase 11a: 4:4:0 — MCU 8x16. jpeg_read_raw_data returns 16 rows
+           Y at Wp, 8 rows Cb/Cr at Wp per call (chroma full-width, half-height). */
+        uint32_t Wp  = ((W + 7) / 8) * 8;
+        uint32_t Hp  = ((H + 15) / 16) * 16;
+        uint32_t CHp = Hp / 2;
+        uint8_t *y_pad  = (uint8_t*)calloc((size_t)Wp * Hp,  1);
+        uint8_t *cb_pad = (uint8_t*)calloc((size_t)Wp * CHp, 1);
+        uint8_t *cr_pad = (uint8_t*)calloc((size_t)Wp * CHp, 1);
+
+        JSAMPROW y_rowptrs[16];
+        JSAMPROW cb_rowptrs[8];
+        JSAMPROW cr_rowptrs[8];
+        JSAMPARRAY arrays[3] = { y_rowptrs, cb_rowptrs, cr_rowptrs };
+
+        while (cinfo.output_scanline < H) {
+            uint32_t base_y = cinfo.output_scanline;
+            for (uint32_t i = 0; i < 16; i++) {
+                y_rowptrs[i] = y_pad + (size_t)(base_y + i) * Wp;
+            }
+            uint32_t base_c = base_y >> 1;
+            for (uint32_t i = 0; i < 8; i++) {
+                cb_rowptrs[i] = cb_pad + (size_t)(base_c + i) * Wp;
+                cr_rowptrs[i] = cr_pad + (size_t)(base_c + i) * Wp;
+            }
+            (void)jpeg_read_raw_data(&cinfo, arrays, 16);
+        }
+
+        /* Crop to W×H Y and W×(H/2) chroma */
+        out->y  = (uint8_t*)calloc((size_t)W * H, 1);
+        out->cb = (uint8_t*)calloc((size_t)W * (H/2), 1);
+        out->cr = (uint8_t*)calloc((size_t)W * (H/2), 1);
+        out->cb_width  = W;
+        out->cb_height = H/2;
+        for (uint32_t r = 0; r < H; r++) {
+            memcpy(out->y + (size_t)r * W, y_pad + (size_t)r * Wp, W);
+        }
+        for (uint32_t r = 0; r < H/2; r++) {
+            memcpy(out->cb + (size_t)r * W, cb_pad + (size_t)r * Wp, W);
+            memcpy(out->cr + (size_t)r * W, cr_pad + (size_t)r * Wp, W);
         }
         free(y_pad); free(cb_pad); free(cr_pad);
     } else {
@@ -300,11 +347,23 @@ int main(int argc, char **argv) {
                 if (d1 > dc_max) dc_max = d1;
                 if (d2 > dc_max) dc_max = d2;
             }
+        } else if (gold.chroma_mode == 4) {
+            /* Phase 11a: 4:4:0 — compare pre-upsample W×(H/2) planes */
+            size_t ncpix = (size_t)gold.cb_width * gold.cb_height;
+            for (size_t i = 0; i < ncpix; i++) {
+                int d1 = (int)ours.cb_plane_440[i] - (int)gold.cb[i];
+                int d2 = (int)ours.cr_plane_440[i] - (int)gold.cr[i];
+                if (d1 < 0) d1 = -d1;
+                if (d2 < 0) d2 = -d2;
+                if (d1 > dc_max) dc_max = d1;
+                if (d2 > dc_max) dc_max = d2;
+            }
         }
 
         const char *tag = (gold.chroma_mode == 0) ? " [GRAY]" :
                           (gold.chroma_mode == 2) ? " [444]"  :
-                          (gold.chroma_mode == 3) ? " [422]"  : "";
+                          (gold.chroma_mode == 3) ? " [422]"  :
+                          (gold.chroma_mode == 4) ? " [440]"  : "";
         if (dy_max == 0 && dc_max == 0) {
             printf("[PASS] %s %ux%u exact%s\n", argv[a], gold.width, gold.height, tag);
             pass++;

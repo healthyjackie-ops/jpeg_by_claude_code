@@ -55,7 +55,7 @@ module header_parser (
     output reg         frame_done,     // 遇 EOI
     output reg  [15:0] dri_interval,   // Phase 7: DRI 间隔 MCU 数（0=禁用）
     output reg  [1:0]  num_components_o,// Phase 8: 1=grayscale, 3=YCbCr
-    output reg  [1:0]  chroma_mode_o,  // Phase 9: 0=GRAY,1=420,2=444,3=422(rsv)
+    output reg  [2:0]  chroma_mode_o,  // Phase 9/10/11a: 0=GRAY,1=420,2=444,3=422,4=440
     output reg  [8:0]  err             // sticky
 );
 
@@ -183,7 +183,7 @@ module header_parser (
             header_done <= 1'b0; data_mode <= 1'b0; frame_done <= 1'b0;
             dri_interval <= 16'd0;
             num_components_o <= 2'd3;
-            chroma_mode_o <= 2'd1;
+            chroma_mode_o <= 3'd1;
             err <= 9'd0;
             qt_wr <= 1'b0; qt_sel <= 2'd0; qt_idx <= 6'd0; qt_val <= 8'd0;
             ht_bits_wr <= 1'b0; ht_val_wr <= 1'b0;
@@ -196,7 +196,7 @@ module header_parser (
             header_done <= 1'b0; data_mode <= 1'b0; frame_done <= 1'b0;
             dri_interval <= 16'd0;
             num_components_o <= 2'd3;
-            chroma_mode_o <= 2'd1;
+            chroma_mode_o <= 3'd1;
             err <= 9'd0;
             qt_wr <= 1'b0; ht_bits_wr <= 1'b0; ht_val_wr <= 1'b0;
             ht_build_start <= 1'b0;
@@ -218,7 +218,7 @@ module header_parser (
                         frame_done  <= 1'b0;
                         dri_interval <= 16'd0;
                         num_components_o <= 2'd3;
-                        chroma_mode_o <= 2'd1;
+                        chroma_mode_o <= 3'd1;
                         err         <= 9'd0;
                     end
                 end
@@ -429,7 +429,7 @@ module header_parser (
                         num_components_o <= byte_in[1:0];
                         // Phase 9: Nf=1 -> GRAY; Nf=3 待 comp0 HV 再判定 420 vs 444
                         if (byte_in == 8'd1)
-                            chroma_mode_o <= 2'd0;   // GRAY
+                            chroma_mode_o <= 3'd0;   // GRAY
                         remain <= remain - 16'd1;
                         sof_comp_idx <= 2'd0;
                         state <= S_SOF_COMP_ID;
@@ -450,11 +450,13 @@ module header_parser (
                         case (sof_comp_idx)
                             2'd0: begin
                                 if (byte_in == 8'h22) begin
-                                    chroma_mode_o <= 2'd1;   // 4:2:0
+                                    chroma_mode_o <= 3'd1;   // 4:2:0
                                 end else if (byte_in == 8'h11) begin
-                                    chroma_mode_o <= 2'd2;   // 4:4:4
+                                    chroma_mode_o <= 3'd2;   // 4:4:4
                                 end else if (byte_in == 8'h21) begin
-                                    chroma_mode_o <= 2'd3;   // Phase 10: 4:2:2
+                                    chroma_mode_o <= 3'd3;   // Phase 10: 4:2:2
+                                end else if (byte_in == 8'h12) begin
+                                    chroma_mode_o <= 3'd4;   // Phase 11a: 4:4:0
                                 end else begin
                                     err[`ERR_UNSUP_CHROMA] <= 1'b1; state <= S_ERROR;
                                 end

@@ -18,6 +18,7 @@ module pixel_out (
     input  wire        is_grayscale,   // Phase 8: 1=MCU-row 8 行, Cb/Cr 输出 0x80
     input  wire        is_444,         // Phase 9: 1=chroma 全分辨率，c_col=x_col, c_row=y_row[2:0]
     input  wire        is_422,         // Phase 10: 1=chroma 横半分辨率，c_col=x_col[11:1], c_row=y_row[2:0]
+    input  wire        is_440,         // Phase 11a: 1=chroma 纵半分辨率，c_col=x_col, c_row=y_row[3:1]
     output reg         row_done,
 
     // line_buffer 读口
@@ -118,6 +119,7 @@ module pixel_out (
                     if (is_444 || is_422)
                         rd_c_row <= (y_row == y_row_max) ? 3'd0 : next_y_row[2:0];
                     else
+                        // 4:2:0 / 4:4:0 → chroma 纵向半分: c_row=y_row[3:1]
                         rd_c_row <= (y_row == y_row_max) ? 3'd0 : next_y_row[3:1];
                     rd_c_col <= 12'd0;
                 end else begin
@@ -129,7 +131,12 @@ module pixel_out (
                     end else if (is_422) begin
                         rd_c_row <= y_row[2:0];
                         rd_c_col <= {1'b0, next_x_col[11:1]};
+                    end else if (is_440) begin
+                        // chroma 纵向半分 (c_row=y_row[3:1]) + 横向全分 (c_col=x_col)
+                        rd_c_row <= y_row[3:1];
+                        rd_c_col <= next_x_col;
                     end else begin
+                        // 4:2:0: chroma 两向半分
                         rd_c_row <= y_row[3:1];
                         rd_c_col <= {1'b0, next_x_col[11:1]};
                     end

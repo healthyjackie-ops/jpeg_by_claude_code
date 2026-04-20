@@ -17,7 +17,7 @@ module block_sequencer (
     input  wire [15:0] img_width,
     input  wire [15:0] img_height,
     input  wire [1:0]  num_components,// Phase 8: 1=grayscale, 3=YCbCr
-    input  wire [1:0]  chroma_mode,   // Phase 9: 0=GRAY, 1=420, 2=444, 3=422(rsv)
+    input  wire [2:0]  chroma_mode,   // Phase 9/10/11a: 0=GRAY,1=420,2=444,3=422,4=440
     input  wire [1:0]  y_qt_sel,
     input  wire [1:0]  cb_qt_sel,
     input  wire [1:0]  cr_qt_sel,
@@ -81,22 +81,23 @@ module block_sequencer (
     // Phase 6: 非 16 对齐尺寸向上取整
     // Phase 8: grayscale → MCU = 8x8；4:2:0 → MCU = 16x16
     // Phase 9: 4:4:4 → MCU = 8x8, 3 blocks (Y, Cb, Cr)
-    wire is_gray = (chroma_mode == 2'd0);
-    wire is_444  = (chroma_mode == 2'd2);
-    wire is_420  = (chroma_mode == 2'd1);
-    wire is_422  = (chroma_mode == 2'd3);
-    // MCU 宽度: GRAY/444→8, 420/422→16
-    // MCU 高度: GRAY/444/422→8, 420→16
-    wire mcu_w8 = is_gray | is_444;
+    wire is_gray = (chroma_mode == 3'd0);
+    wire is_420  = (chroma_mode == 3'd1);
+    wire is_444  = (chroma_mode == 3'd2);
+    wire is_422  = (chroma_mode == 3'd3);
+    wire is_440  = (chroma_mode == 3'd4);
+    // MCU 宽度 8: GRAY/444/440; MCU 宽度 16: 420/422
+    // MCU 高度 8: GRAY/444/422; MCU 高度 16: 420/440
+    wire mcu_w8 = is_gray | is_444 | is_440;
     wire mcu_h8 = is_gray | is_444 | is_422;
     wire [15:0] mcu_cols = mcu_w8 ? ((img_width  + 16'd7)  >> 3) :
                                     ((img_width  + 16'd15) >> 4);
     wire [15:0] mcu_rows = mcu_h8 ? ((img_height + 16'd7)  >> 3) :
                                     ((img_height + 16'd15) >> 4);
-    // block 数: GRAY→1, 444→3, 422→4, 420→6
-    wire [2:0] last_blk = is_gray ? 3'd0 :
-                          is_444  ? 3'd2 :
-                          is_422  ? 3'd3 : 3'd5;
+    // block 数: GRAY→1, 444→3, 422/440→4, 420→6
+    wire [2:0] last_blk = is_gray         ? 3'd0 :
+                          is_444          ? 3'd2 :
+                          (is_422|is_440) ? 3'd3 : 3'd5;
     wire _unused_ncomp = |num_components;  // 保留端口以备 sanity check
     wire _unused_mode  = is_420;            // 保留 is_420 wire 以便未来加 sanity check
 
@@ -162,6 +163,35 @@ module block_sequencer (
                     qt_sel_out = y_qt_sel;   dcp_sel    = 2'd0;
                     h_dc_pred_in = dcp_y;
                     cur_blk_type = 3'd1;     // Y_right
+                end
+                3'd2: begin
+                    h_dc_sel   = cb_dc_sel;  h_ac_sel   = cb_ac_sel;
+                    qt_sel_out = cb_qt_sel;  dcp_sel    = 2'd1;
+                    h_dc_pred_in = dcp_cb;
+                    cur_blk_type = 3'd4;
+                end
+                default: begin // blk_idx == 3
+                    h_dc_sel   = cr_dc_sel;  h_ac_sel   = cr_ac_sel;
+                    qt_sel_out = cr_qt_sel;  dcp_sel    = 2'd2;
+                    h_dc_pred_in = dcp_cr;
+                    cur_blk_type = 3'd5;
+                end
+            endcase
+        end else if (is_440) begin
+            // Phase 11a: 4:4:0 — blk_idx 0/1=Y_top/Y_bot, 2=Cb, 3=Cr.
+            // mcu_buffer Y 块 0 (rows 0-7) 和 2 (rows 8-15) 对应 Y_top/Y_bot
+            case (blk_idx)
+                3'd0: begin
+                    h_dc_sel   = y_dc_sel;   h_ac_sel   = y_ac_sel;
+                    qt_sel_out = y_qt_sel;   dcp_sel    = 2'd0;
+                    h_dc_pred_in = dcp_y;
+                    cur_blk_type = 3'd0;     // Y_top (rows 0-7, cols 0-7)
+                end
+                3'd1: begin
+                    h_dc_sel   = y_dc_sel;   h_ac_sel   = y_ac_sel;
+                    qt_sel_out = y_qt_sel;   dcp_sel    = 2'd0;
+                    h_dc_pred_in = dcp_y;
+                    cur_blk_type = 3'd2;     // Y_bot (rows 8-15, cols 0-7)
                 end
                 3'd2: begin
                     h_dc_sel   = cb_dc_sel;  h_ac_sel   = cb_ac_sel;

@@ -120,10 +120,11 @@ module jpeg_axi_top (
     wire        dc_restart_w;       // Phase 7: block_seq → dc_predictor
     wire        align_req_w;        // Phase 7: block_seq → bitstream_unpack (drain shreg)
     wire [1:0]  num_components_w;   // Phase 8: Nf (1=gray, 3=YCbCr)
-    wire [1:0]  chroma_mode_w;      // Phase 9/10: 0=GRAY,1=420,2=444,3=422
-    wire        is_grayscale_w = (chroma_mode_w == 2'd0);
-    wire        is_444_w       = (chroma_mode_w == 2'd2);
-    wire        is_422_w       = (chroma_mode_w == 2'd3);
+    wire [2:0]  chroma_mode_w;      // Phase 9/10/11a: 0=GRAY,1=420,2=444,3=422,4=440
+    wire        is_grayscale_w = (chroma_mode_w == 3'd0);
+    wire        is_444_w       = (chroma_mode_w == 3'd2);
+    wire        is_422_w       = (chroma_mode_w == 3'd3);
+    wire        is_440_w       = (chroma_mode_w == 3'd4);
 
     header_parser u_hp (
         .clk(aclk), .rst_n(aresetn), .start(start_pulse),
@@ -328,6 +329,7 @@ module jpeg_axi_top (
         .is_grayscale(is_grayscale_w),    // Phase 8
         .is_444(is_444_w),                // Phase 9
         .is_422(is_422_w),                // Phase 10
+        .is_440(is_440_w),                // Phase 11a
         .mb_y_row(mb_y_row_w), .mb_y_col(mb_y_col_w),
         .mb_c_row(mb_c_row_w), .mb_c_col(mb_c_col_w),
         .mb_y_data(mb_y_data_w),
@@ -376,6 +378,7 @@ module jpeg_axi_top (
         .is_grayscale(is_grayscale_w), // Phase 8
         .is_444(is_444_w),             // Phase 9
         .is_422(is_422_w),             // Phase 10
+        .is_440(is_440_w),             // Phase 11a
         .row_done(row_done_w),
         .rd_y_row(po_rd_y_row_w), .rd_y_col(po_rd_y_col_w),
         .rd_c_row(po_rd_c_row_w), .rd_c_col(po_rd_c_col_w),
