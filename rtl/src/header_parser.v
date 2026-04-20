@@ -453,6 +453,8 @@ module header_parser (
                                     chroma_mode_o <= 2'd1;   // 4:2:0
                                 end else if (byte_in == 8'h11) begin
                                     chroma_mode_o <= 2'd2;   // 4:4:4
+                                end else if (byte_in == 8'h21) begin
+                                    chroma_mode_o <= 2'd3;   // Phase 10: 4:2:2
                                 end else begin
                                     err[`ERR_UNSUP_CHROMA] <= 1'b1; state <= S_ERROR;
                                 end

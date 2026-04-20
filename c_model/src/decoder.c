@@ -42,18 +42,22 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
     int is_gray = (info.chroma_mode == CHROMA_GRAY);
     int is_444  = (info.chroma_mode == CHROMA_444);
     int is_420  = (info.chroma_mode == CHROMA_420);
+    int is_422  = (info.chroma_mode == CHROMA_422);
     /* Phase 6: 内部用 MCU 对齐的 padded 尺寸解码，结束再 crop 到 W×H
        Phase 8: 灰度 MCU=8x8, 彩色 4:2:0 MCU=16x16
-       Phase 9: 4:4:4 MCU=8x8 */
-    uint16_t mcu_dim = is_420 ? 16 : 8;
-    uint16_t Wp = info.mcu_cols * mcu_dim;
-    uint16_t Hp = info.mcu_rows * mcu_dim;
-    uint16_t CWp = is_420 ? (Wp >> 1) : Wp;
-    uint16_t CHp = is_420 ? (Hp >> 1) : Hp;
+       Phase 9: 4:4:4 MCU=8x8
+       Phase 10: 4:2:2 MCU=16x8 (Y 2x1, chroma horizontal-subsampled) */
+    uint16_t mcu_w = (is_420 || is_422) ? 16 : 8;
+    uint16_t mcu_h = is_420 ? 16 : 8;
+    uint16_t Wp = info.mcu_cols * mcu_w;
+    uint16_t Hp = info.mcu_rows * mcu_h;
+    /* Sub-sampled chroma pad dimensions */
+    uint16_t CWp_sub = (is_420 || is_422) ? (Wp >> 1) : Wp;
+    uint16_t CHp_sub = is_420 ? (Hp >> 1) : Hp;
 
     uint8_t *y_pad       = (uint8_t*)calloc((size_t)Wp  * Hp,  1);
-    uint8_t *cb_pad_420  = is_420 ? (uint8_t*)calloc((size_t)CWp * CHp, 1) : NULL;
-    uint8_t *cr_pad_420  = is_420 ? (uint8_t*)calloc((size_t)CWp * CHp, 1) : NULL;
+    uint8_t *cb_pad_sub  = (is_420 || is_422) ? (uint8_t*)calloc((size_t)CWp_sub * CHp_sub, 1) : NULL;
+    uint8_t *cr_pad_sub  = (is_420 || is_422) ? (uint8_t*)calloc((size_t)CWp_sub * CHp_sub, 1) : NULL;
     uint8_t *cb_pad      = is_gray ? NULL : (uint8_t*)calloc((size_t)Wp  * Hp,  1);
     uint8_t *cr_pad      = is_gray ? NULL : (uint8_t*)calloc((size_t)Wp  * Hp,  1);
     out->y_plane       = (uint8_t*)calloc((size_t)W  * H,  1);
@@ -64,16 +68,23 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
             out->cb_plane_420 = (uint8_t*)calloc((size_t)(W >> 1) * (H >> 1), 1);
             out->cr_plane_420 = (uint8_t*)calloc((size_t)(W >> 1) * (H >> 1), 1);
         }
+        if (is_422) {
+            out->cb_plane_422 = (uint8_t*)calloc((size_t)(W >> 1) * H, 1);
+            out->cr_plane_422 = (uint8_t*)calloc((size_t)(W >> 1) * H, 1);
+        }
     }
     int alloc_ok = y_pad && out->y_plane &&
                    (is_gray ||
                     (cb_pad && cr_pad &&
                      out->cb_plane && out->cr_plane &&
                      (!is_420 ||
-                      (cb_pad_420 && cr_pad_420 &&
-                       out->cb_plane_420 && out->cr_plane_420))));
+                      (cb_pad_sub && cr_pad_sub &&
+                       out->cb_plane_420 && out->cr_plane_420)) &&
+                     (!is_422 ||
+                      (cb_pad_sub && cr_pad_sub &&
+                       out->cb_plane_422 && out->cr_plane_422))));
     if (!alloc_ok) {
-        free(y_pad); free(cb_pad_420); free(cr_pad_420); free(cb_pad); free(cr_pad);
+        free(y_pad); free(cb_pad_sub); free(cr_pad_sub); free(cb_pad); free(cr_pad);
         out->err = (uint32_t)JPEG_ERR_INTERNAL;
         return -1;
     }
@@ -145,10 +156,46 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
                 uint8_t *y_dst = y_pad + (size_t)(my * 16) * Wp + (mx * 16);
                 copy_block_16x16_y(y_blk, y_dst, Wp);
 
-                uint8_t *cb_dst = cb_pad_420 + (size_t)(my * 8) * CWp + (mx * 8);
-                uint8_t *cr_dst = cr_pad_420 + (size_t)(my * 8) * CWp + (mx * 8);
-                copy_block_8x8(cb_blk, cb_dst, CWp);
-                copy_block_8x8(cr_blk, cr_dst, CWp);
+                uint8_t *cb_dst = cb_pad_sub + (size_t)(my * 8) * CWp_sub + (mx * 8);
+                uint8_t *cr_dst = cr_pad_sub + (size_t)(my * 8) * CWp_sub + (mx * 8);
+                copy_block_8x8(cb_blk, cb_dst, CWp_sub);
+                copy_block_8x8(cr_blk, cr_dst, CWp_sub);
+            } else if (is_422) {
+                /* Phase 10: 4:2:2 — 4 blocks/MCU: Y_left, Y_right, Cb, Cr.
+                   Y is 2x1 subsampled, chroma is 1x1 at half horizontal res. */
+                for (int i = 0; i < 2; i++) {
+                    if (huff_decode_block(&bs, y_dc, y_ac,
+                                          &info.components[0].dc_pred, coef)) {
+                        out->err = JPEG_ERR_BAD_HUFFMAN;
+                        return -1;
+                    }
+                    dequant_block(coef, y_qt);
+                    idct_islow(coef, y_blk[i]);
+                }
+                if (huff_decode_block(&bs, cb_dc, cb_ac,
+                                      &info.components[1].dc_pred, coef)) {
+                    out->err = JPEG_ERR_BAD_HUFFMAN;
+                    return -1;
+                }
+                dequant_block(coef, cb_qt);
+                idct_islow(coef, cb_blk);
+
+                if (huff_decode_block(&bs, cr_dc, cr_ac,
+                                      &info.components[2].dc_pred, coef)) {
+                    out->err = JPEG_ERR_BAD_HUFFMAN;
+                    return -1;
+                }
+                dequant_block(coef, cr_qt);
+                idct_islow(coef, cr_blk);
+
+                uint8_t *y_dst = y_pad + (size_t)(my * 8) * Wp + (mx * 16);
+                copy_block_8x8(y_blk[0], y_dst + 0, Wp);
+                copy_block_8x8(y_blk[1], y_dst + 8, Wp);
+
+                uint8_t *cb_dst = cb_pad_sub + (size_t)(my * 8) * CWp_sub + (mx * 8);
+                uint8_t *cr_dst = cr_pad_sub + (size_t)(my * 8) * CWp_sub + (mx * 8);
+                copy_block_8x8(cb_blk, cb_dst, CWp_sub);
+                copy_block_8x8(cr_blk, cr_dst, CWp_sub);
             } else {
                 /* Phase 9: 4:4:4 — 3 blocks/MCU, 8x8 each, chroma full-res */
                 if (huff_decode_block(&bs, y_dc, y_ac,
@@ -225,8 +272,23 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
     }
 
     if (is_420) {
-        chroma_upsample_nn(cb_pad_420, cb_pad, Wp, Hp);
-        chroma_upsample_nn(cr_pad_420, cr_pad, Wp, Hp);
+        chroma_upsample_nn(cb_pad_sub, cb_pad, Wp, Hp);
+        chroma_upsample_nn(cr_pad_sub, cr_pad, Wp, Hp);
+    } else if (is_422) {
+        /* Phase 10: 4:2:2 — horizontal-only nearest-neighbor upsample.
+           src: CWp_sub × Hp  →  dst: Wp × Hp   (each src col maps to 2 dst cols) */
+        for (uint16_t r = 0; r < Hp; r++) {
+            const uint8_t *cb_src = cb_pad_sub + (size_t)r * CWp_sub;
+            const uint8_t *cr_src = cr_pad_sub + (size_t)r * CWp_sub;
+            uint8_t *cb_dst = cb_pad + (size_t)r * Wp;
+            uint8_t *cr_dst = cr_pad + (size_t)r * Wp;
+            for (uint16_t c = 0; c < CWp_sub; c++) {
+                cb_dst[2*c    ] = cb_src[c];
+                cb_dst[2*c + 1] = cb_src[c];
+                cr_dst[2*c    ] = cr_src[c];
+                cr_dst[2*c + 1] = cr_src[c];
+            }
+        }
     }
     /* Phase 9: 4:4:4 → cb_pad/cr_pad 已写为全分辨率，无需 upsample */
 
@@ -244,12 +306,21 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
            so we pack conservatively for non-aligned: copy (W>>1) cols from padded. */
         for (uint16_t r = 0; r < (H >> 1); r++) {
             memcpy(out->cb_plane_420 + (size_t)r * (W >> 1),
-                   cb_pad_420 + (size_t)r * CWp, (W >> 1));
+                   cb_pad_sub + (size_t)r * CWp_sub, (W >> 1));
             memcpy(out->cr_plane_420 + (size_t)r * (W >> 1),
-                   cr_pad_420 + (size_t)r * CWp, (W >> 1));
+                   cr_pad_sub + (size_t)r * CWp_sub, (W >> 1));
         }
     }
-    free(y_pad); free(cb_pad_420); free(cr_pad_420); free(cb_pad); free(cr_pad);
+    if (is_422) {
+        /* 4:2:2 sub-res chroma planes: (W/2) × H for libjpeg raw comparison. */
+        for (uint16_t r = 0; r < H; r++) {
+            memcpy(out->cb_plane_422 + (size_t)r * (W >> 1),
+                   cb_pad_sub + (size_t)r * CWp_sub, (W >> 1));
+            memcpy(out->cr_plane_422 + (size_t)r * (W >> 1),
+                   cr_pad_sub + (size_t)r * CWp_sub, (W >> 1));
+        }
+    }
+    free(y_pad); free(cb_pad_sub); free(cr_pad_sub); free(cb_pad); free(cr_pad);
 
     bs_align_to_byte(&bs);
     uint8_t b;
@@ -278,5 +349,7 @@ void jpeg_free(jpeg_decoded_t *out) {
     free(out->cr_plane);
     free(out->cb_plane_420);
     free(out->cr_plane_420);
+    free(out->cb_plane_422);
+    free(out->cr_plane_422);
     memset(out, 0, sizeof(*out));
 }

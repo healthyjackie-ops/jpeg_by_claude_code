@@ -48,7 +48,7 @@ typedef enum {
     CHROMA_GRAY = 0,   /* Nf=1, H=V=1 -> MCU 8x8, 1 block */
     CHROMA_420  = 1,   /* Nf=3, H0=V0=2, chroma H=V=1 -> MCU 16x16, 6 blocks */
     CHROMA_444  = 2,   /* Nf=3, H=V=1 all comps      -> MCU 8x8,  3 blocks */
-    CHROMA_422  = 3    /* reserved for Phase 10 */
+    CHROMA_422  = 3    /* Phase 10: Nf=3, H0=2,V0=1 -> MCU 16x8, 4 blocks */
 } chroma_mode_t;
 
 typedef struct {

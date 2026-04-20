@@ -84,15 +84,21 @@ module block_sequencer (
     wire is_gray = (chroma_mode == 2'd0);
     wire is_444  = (chroma_mode == 2'd2);
     wire is_420  = (chroma_mode == 2'd1);
-    wire mcu_8x8 = is_gray | is_444;       // MCU 尺寸 8x8
-    wire [15:0] mcu_cols = mcu_8x8 ? ((img_width  + 16'd7)  >> 3) :
-                                     ((img_width  + 16'd15) >> 4);
-    wire [15:0] mcu_rows = mcu_8x8 ? ((img_height + 16'd7)  >> 3) :
-                                     ((img_height + 16'd15) >> 4);
-    // block 数: GRAY→1, 444→3, 420→6
+    wire is_422  = (chroma_mode == 2'd3);
+    // MCU 宽度: GRAY/444→8, 420/422→16
+    // MCU 高度: GRAY/444/422→8, 420→16
+    wire mcu_w8 = is_gray | is_444;
+    wire mcu_h8 = is_gray | is_444 | is_422;
+    wire [15:0] mcu_cols = mcu_w8 ? ((img_width  + 16'd7)  >> 3) :
+                                    ((img_width  + 16'd15) >> 4);
+    wire [15:0] mcu_rows = mcu_h8 ? ((img_height + 16'd7)  >> 3) :
+                                    ((img_height + 16'd15) >> 4);
+    // block 数: GRAY→1, 444→3, 422→4, 420→6
     wire [2:0] last_blk = is_gray ? 3'd0 :
-                          is_444  ? 3'd2 : 3'd5;
+                          is_444  ? 3'd2 :
+                          is_422  ? 3'd3 : 3'd5;
     wire _unused_ncomp = |num_components;  // 保留端口以备 sanity check
+    wire _unused_mode  = is_420;            // 保留 is_420 wire 以便未来加 sanity check
 
     localparam [3:0]
         S_IDLE     = 4'd0,
@@ -135,6 +141,35 @@ module block_sequencer (
                     cur_blk_type = 3'd4;
                 end
                 default: begin // blk_idx == 2
+                    h_dc_sel   = cr_dc_sel;  h_ac_sel   = cr_ac_sel;
+                    qt_sel_out = cr_qt_sel;  dcp_sel    = 2'd2;
+                    h_dc_pred_in = dcp_cr;
+                    cur_blk_type = 3'd5;
+                end
+            endcase
+        end else if (is_422) begin
+            // Phase 10: 4:2:2 — blk_idx 0/1=Y_left/Y_right, 2=Cb, 3=Cr.
+            // cur_blk_type 映射到 mcu_buffer 的 Y 块位 0/1 和 Cb/Cr 4/5
+            case (blk_idx)
+                3'd0: begin
+                    h_dc_sel   = y_dc_sel;   h_ac_sel   = y_ac_sel;
+                    qt_sel_out = y_qt_sel;   dcp_sel    = 2'd0;
+                    h_dc_pred_in = dcp_y;
+                    cur_blk_type = 3'd0;     // Y_left
+                end
+                3'd1: begin
+                    h_dc_sel   = y_dc_sel;   h_ac_sel   = y_ac_sel;
+                    qt_sel_out = y_qt_sel;   dcp_sel    = 2'd0;
+                    h_dc_pred_in = dcp_y;
+                    cur_blk_type = 3'd1;     // Y_right
+                end
+                3'd2: begin
+                    h_dc_sel   = cb_dc_sel;  h_ac_sel   = cb_ac_sel;
+                    qt_sel_out = cb_qt_sel;  dcp_sel    = 2'd1;
+                    h_dc_pred_in = dcp_cb;
+                    cur_blk_type = 3'd4;
+                end
+                default: begin // blk_idx == 3
                     h_dc_sel   = cr_dc_sel;  h_ac_sel   = cr_ac_sel;
                     qt_sel_out = cr_qt_sel;  dcp_sel    = 2'd2;
                     h_dc_pred_in = dcp_cr;

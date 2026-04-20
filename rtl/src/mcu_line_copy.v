@@ -13,6 +13,7 @@ module mcu_line_copy (
     input  wire [15:0] mcu_col_idx,      // 0..mcu_cols-1
     input  wire        is_grayscale,    // Phase 8: 1=only Y 8x8, skip chroma
     input  wire        is_444,          // Phase 9: 1=4:4:4 (Y 8x8 + Cb/Cr 8x8 full-res)
+    input  wire        is_422,          // Phase 10: 1=4:2:2 (Y 16x8 + Cb/Cr 8x8)
     output reg         done,
 
     // 读 mcu_buffer
@@ -44,17 +45,20 @@ module mcu_line_copy (
 
     // Phase 8: 灰度 → MCU 为 8×8, 基地址 mx*8; 彩色 4:2:0 → 16×16, 基地址 mx*16
     // Phase 9: 4:4:4 → MCU 为 8×8 (Y + Cb + Cr 全分辨率), 基地址 mx*8
-    wire mcu_8x8_y = is_grayscale | is_444;
-    wire [11:0] y_col_base = mcu_8x8_y ? {mcu_col_idx[8:0], 3'd0} :
-                                          {mcu_col_idx[7:0], 4'd0};
-    // chroma 列基地址: 4:2:0 → mx*8（半分辨率）;
-    //                  4:4:4 → mx*8（全分辨率，与 Y 同步）
+    // Phase 10: 4:2:2 → Y 为 16×8, 基地址 mx*16; chroma 8×8, 基地址 mx*8
+    wire mcu_y8_wide = is_grayscale | is_444;              // Y 列 ≤ 7
+    wire mcu_y8_tall = is_grayscale | is_444 | is_422;     // Y 行 ≤ 7
+    wire [11:0] y_col_base = mcu_y8_wide ? {mcu_col_idx[8:0], 3'd0} :
+                                            {mcu_col_idx[7:0], 4'd0};
+    // chroma 列基地址: 4:2:0/4:2:2 → mx*8（横半分辨率）;
+    //                  4:4:4 → mx*8（全分辨率，与 Y 同步, 但 Y 本身为 mx*8）
     wire [11:0] c_col_base = {mcu_col_idx[8:0], 3'd0};   // mx*8 (12b)
     wire _unused_mcu_hi = |mcu_col_idx[15:9];
     // Phase 8: Y 扫描范围 — grayscale 8 行 8 列, 彩色 16×16
     // Phase 9: 4:4:4 同 grayscale 的 8×8
-    wire [4:0] y_cnt_max_Y = mcu_8x8_y ? 5'd7  : 5'd15;
-    wire [3:0] col_cnt_max_Y = mcu_8x8_y ? 4'd7 : 4'd15;
+    // Phase 10: 4:2:2 → 8 行 × 16 列
+    wire [4:0] y_cnt_max_Y   = mcu_y8_tall ? 5'd7  : 5'd15;
+    wire [3:0] col_cnt_max_Y = mcu_y8_wide ? 4'd7  : 4'd15;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
