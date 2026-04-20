@@ -35,9 +35,9 @@
 
 | Phase | Spec | 时长 | 验收 |
 |---|---|---|---|
-| **14** | [SOF2 header 解析](spec_phase14.md) | 2d | 识别但仍 error-out |
-| **15** | [Coef frame buffer](spec_phase15.md) | 3–4d | 读/写/累加端口 loop-back |
-| **16** | [DC-only scan (Ss=Se=0)](spec_phase16.md) | 4–5d | DC-only SOF2 |
+| **14** ✅ | [SOF2 header 解析](spec_phase14.md) | 2d | 识别但仍 error-out（8/8 bit-exact） |
+| **15** ✅ | [Coef frame buffer](spec_phase15.md) | 3–4d | 读/写/累加端口 loop-back（5/5 tests） |
+| **16** | [DC-only scan (Ss=Se=0)](spec_phase16.md) | 4–5d | DC-only SOF2（sub: 16a scan-params, 16b C model, 16c RTL bit-exact） |
 | **17** | [AC spectral selection](spec_phase17.md) | 5–6d | 完整扫描序列 |
 | **18** | [Successive approximation](spec_phase18.md) | 5–7d | refinement scans |
 | **19** | [Drain → IDCT → 输出](spec_phase19.md) | 3–4d | 1080p progressive 端到端 |
