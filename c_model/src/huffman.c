@@ -103,3 +103,28 @@ int huff_decode_block(bitstream_t *bs,
         bidx, bs->byte_pos, bs->bit_cnt, pre_byte, pre_bc);
     return 0;
 }
+
+int huff_decode_block_dc_only(bitstream_t *bs,
+                              const htable_t *dc_tab,
+                              int16_t *dc_pred,
+                              int16_t coef[64],
+                              uint8_t al_shift) {
+    memset(coef, 0, 64 * sizeof(int16_t));
+
+    uint8_t size;
+    if (huff_decode_symbol(bs, dc_tab, &size)) return -1;
+    if (size > 15) return -1;
+
+    int32_t diff = 0;
+    if (size > 0) {
+        if (bs_get_bits(bs, size, &diff)) return -1;
+    }
+    *dc_pred += (int16_t)diff;
+
+    /* Point transform: store predictor left-shifted by Al. For Al=0 this is a
+     * plain int16 assignment. ISO 10918-1 F.1.4.4.1.2 keeps the predictor in
+     * its unshifted form and applies the shift only to the stored coefficient.
+     */
+    coef[0] = (int16_t)((int32_t)(*dc_pred) << al_shift);
+    return 0;
+}

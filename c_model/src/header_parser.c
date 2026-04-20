@@ -230,6 +230,14 @@ static int parse_sof1(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
     return parse_sof_common(bs, info, err, 1);
 }
 
+/* Phase 16b: SOF2 progressive. P=8 only for now (progressive + P=12 is rare
+ * and out of Phase 16 scope). Component layout / chroma rules identical to
+ * SOF0; scan-level progressive parameters are validated in parse_sos. */
+static int parse_sof2(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
+    info->sof_type = 2;
+    return parse_sof_common(bs, info, err, 0);
+}
+
 static int parse_sos(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
     uint16_t len;
     if (bs_read_u16(bs, &len)) { *err |= JPEG_ERR_STREAM_TRUNC; return -1; }
@@ -318,6 +326,10 @@ int jpeg_parse_headers(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
                 if (parse_sof1(bs, info, err)) return -1;
                 got_sof = 1;
                 break;
+            case MARKER_SOF2:
+                if (parse_sof2(bs, info, err)) return -1;
+                got_sof = 1;
+                break;
             case MARKER_DQT:
                 if (parse_dqt(bs, info, err)) return -1;
                 break;
@@ -340,8 +352,10 @@ int jpeg_parse_headers(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
             default:
                 if (marker >= MARKER_APP0 && marker <= MARKER_APP15) {
                     if (skip_segment(bs, err)) return -1;
-                } else if ((marker >= MARKER_SOF2 && marker <= MARKER_SOF3) ||
+                } else if (marker == MARKER_SOF3 ||
                            (marker >= MARKER_SOF5 && marker <= MARKER_SOF15)) {
+                    /* Phase 16b: SOF2 (progressive) now handled above.
+                     * SOF3 (lossless) / SOF5..SOF15 remain unsupported. */
                     *err |= JPEG_ERR_UNSUP_SOF;
                     return -1;
                 } else {

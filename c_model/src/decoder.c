@@ -47,6 +47,22 @@ static void copy_block_16x16_y_u16(const uint16_t y_blk[4][64],
 
 static int decode_p12(bitstream_t *bs, jpeg_info_t *info, jpeg_decoded_t *out);
 
+/* Phase 16b: progressive SOF2 first-scan dispatch state. Set from info before
+ * entering the MCU loop; consulted by dec_blk(). Not thread-safe — jpeg_decode
+ * is a single call path. */
+static int     g_dc_only = 0;
+static uint8_t g_al      = 0;
+
+/* Phase 16b: wrapper around huff_decode_block. For SOF2 single DC-only scans
+ * (Ss=Se=0, Ah=0) we decode only the DC coefficient and store it shifted by
+ * Al; all AC coefficients remain zero. Baseline SOF0/SOF1 paths are untouched.
+ */
+static int dec_blk(bitstream_t *bs, const htable_t *dc, const htable_t *ac,
+                   int16_t *dc_pred, int16_t coef[64]) {
+    if (g_dc_only) return huff_decode_block_dc_only(bs, dc, dc_pred, coef, g_al);
+    return huff_decode_block(bs, dc, ac, dc_pred, coef);
+}
+
 int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
     memset(out, 0, sizeof(*out));
 
@@ -67,6 +83,26 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
        4:4:0, 4:1:1) are out of scope for Phase 13. */
     if (info.precision == 12) {
         return decode_p12(&bs, &info, out);
+    }
+
+    /* Phase 16b: progressive SOF2 support is limited to a single DC-only scan
+     * (Ss=Se=0, Ah=0). Al is permitted but our current generator only exercises
+     * Al=0. Multi-scan progressive (AC or refinement) is deferred to Phase 17+.
+     * DRI + progressive is also deferred — most DC-only vectors never carry DRI.
+     */
+    g_dc_only = 0;
+    g_al      = 0;
+    if (info.sof_type == 2) {
+        if (info.scan_ss != 0 || info.scan_se != 0 || info.scan_ah != 0) {
+            out->err = JPEG_ERR_UNSUP_SOF;
+            return -1;
+        }
+        if (info.dri != 0) {
+            out->err = JPEG_ERR_UNSUP_SOF;
+            return -1;
+        }
+        g_dc_only = 1;
+        g_al      = info.scan_al;
     }
 
     out->width  = info.width;
@@ -199,7 +235,7 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
         for (uint16_t mx = 0; mx < info.mcu_cols; mx++) {
             if (is_gray) {
                 /* Phase 8: 单 Y block, 8x8 MCU */
-                if (huff_decode_block(&bs, y_dc, y_ac,
+                if (dec_blk(&bs, y_dc, y_ac,
                                       &info.components[0].dc_pred, coef)) {
                     out->err = JPEG_ERR_BAD_HUFFMAN;
                     return -1;
@@ -210,7 +246,7 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
                 copy_block_8x8(y_blk[0], y_dst, Wp);
             } else if (is_420) {
                 for (int i = 0; i < 4; i++) {
-                    if (huff_decode_block(&bs, y_dc, y_ac,
+                    if (dec_blk(&bs, y_dc, y_ac,
                                           &info.components[0].dc_pred, coef)) {
                         out->err = JPEG_ERR_BAD_HUFFMAN;
                         return -1;
@@ -218,7 +254,7 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
                     dequant_block(coef, y_qt);
                     idct_islow(coef, y_blk[i]);
                 }
-                if (huff_decode_block(&bs, cb_dc, cb_ac,
+                if (dec_blk(&bs, cb_dc, cb_ac,
                                       &info.components[1].dc_pred, coef)) {
                     out->err = JPEG_ERR_BAD_HUFFMAN;
                     return -1;
@@ -226,7 +262,7 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
                 dequant_block(coef, cb_qt);
                 idct_islow(coef, cb_blk);
 
-                if (huff_decode_block(&bs, cr_dc, cr_ac,
+                if (dec_blk(&bs, cr_dc, cr_ac,
                                       &info.components[2].dc_pred, coef)) {
                     out->err = JPEG_ERR_BAD_HUFFMAN;
                     return -1;
@@ -245,7 +281,7 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
                 /* Phase 10: 4:2:2 — 4 blocks/MCU: Y_left, Y_right, Cb, Cr.
                    Y is 2x1 subsampled, chroma is 1x1 at half horizontal res. */
                 for (int i = 0; i < 2; i++) {
-                    if (huff_decode_block(&bs, y_dc, y_ac,
+                    if (dec_blk(&bs, y_dc, y_ac,
                                           &info.components[0].dc_pred, coef)) {
                         out->err = JPEG_ERR_BAD_HUFFMAN;
                         return -1;
@@ -253,7 +289,7 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
                     dequant_block(coef, y_qt);
                     idct_islow(coef, y_blk[i]);
                 }
-                if (huff_decode_block(&bs, cb_dc, cb_ac,
+                if (dec_blk(&bs, cb_dc, cb_ac,
                                       &info.components[1].dc_pred, coef)) {
                     out->err = JPEG_ERR_BAD_HUFFMAN;
                     return -1;
@@ -261,7 +297,7 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
                 dequant_block(coef, cb_qt);
                 idct_islow(coef, cb_blk);
 
-                if (huff_decode_block(&bs, cr_dc, cr_ac,
+                if (dec_blk(&bs, cr_dc, cr_ac,
                                       &info.components[2].dc_pred, coef)) {
                     out->err = JPEG_ERR_BAD_HUFFMAN;
                     return -1;
@@ -281,7 +317,7 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
                 /* Phase 11b: 4:1:1 — 6 blocks/MCU: Y0,Y1,Y2,Y3, Cb, Cr.
                    Y is 4x1 subsampled (horizontal), chroma is 1x1 at quarter horizontal res. */
                 for (int i = 0; i < 4; i++) {
-                    if (huff_decode_block(&bs, y_dc, y_ac,
+                    if (dec_blk(&bs, y_dc, y_ac,
                                           &info.components[0].dc_pred, coef)) {
                         out->err = JPEG_ERR_BAD_HUFFMAN;
                         return -1;
@@ -289,7 +325,7 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
                     dequant_block(coef, y_qt);
                     idct_islow(coef, y_blk[i]);
                 }
-                if (huff_decode_block(&bs, cb_dc, cb_ac,
+                if (dec_blk(&bs, cb_dc, cb_ac,
                                       &info.components[1].dc_pred, coef)) {
                     out->err = JPEG_ERR_BAD_HUFFMAN;
                     return -1;
@@ -297,7 +333,7 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
                 dequant_block(coef, cb_qt);
                 idct_islow(coef, cb_blk);
 
-                if (huff_decode_block(&bs, cr_dc, cr_ac,
+                if (dec_blk(&bs, cr_dc, cr_ac,
                                       &info.components[2].dc_pred, coef)) {
                     out->err = JPEG_ERR_BAD_HUFFMAN;
                     return -1;
@@ -319,7 +355,7 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
                 /* Phase 11a: 4:4:0 — 4 blocks/MCU: Y_top, Y_bot, Cb, Cr.
                    Y is 1x2 subsampled (vertical), chroma is 1x1 at half vertical res. */
                 for (int i = 0; i < 2; i++) {
-                    if (huff_decode_block(&bs, y_dc, y_ac,
+                    if (dec_blk(&bs, y_dc, y_ac,
                                           &info.components[0].dc_pred, coef)) {
                         out->err = JPEG_ERR_BAD_HUFFMAN;
                         return -1;
@@ -327,7 +363,7 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
                     dequant_block(coef, y_qt);
                     idct_islow(coef, y_blk[i]);
                 }
-                if (huff_decode_block(&bs, cb_dc, cb_ac,
+                if (dec_blk(&bs, cb_dc, cb_ac,
                                       &info.components[1].dc_pred, coef)) {
                     out->err = JPEG_ERR_BAD_HUFFMAN;
                     return -1;
@@ -335,7 +371,7 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
                 dequant_block(coef, cb_qt);
                 idct_islow(coef, cb_blk);
 
-                if (huff_decode_block(&bs, cr_dc, cr_ac,
+                if (dec_blk(&bs, cr_dc, cr_ac,
                                       &info.components[2].dc_pred, coef)) {
                     out->err = JPEG_ERR_BAD_HUFFMAN;
                     return -1;
@@ -356,7 +392,7 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
                    Component order in stream matches SOF/SOS ordering: C, M, Y, K.
                    Store into y_pad (C), m_pad (M), yc_pad (Y-comp), k_pad (K). */
                 /* Block 0: C */
-                if (huff_decode_block(&bs, y_dc, y_ac,
+                if (dec_blk(&bs, y_dc, y_ac,
                                       &info.components[0].dc_pred, coef)) {
                     out->err = JPEG_ERR_BAD_HUFFMAN;
                     return -1;
@@ -365,7 +401,7 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
                 idct_islow(coef, y_blk[0]);
 
                 /* Block 1: M */
-                if (huff_decode_block(&bs, cb_dc, cb_ac,
+                if (dec_blk(&bs, cb_dc, cb_ac,
                                       &info.components[1].dc_pred, coef)) {
                     out->err = JPEG_ERR_BAD_HUFFMAN;
                     return -1;
@@ -374,7 +410,7 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
                 idct_islow(coef, cb_blk);
 
                 /* Block 2: Y (yellow) */
-                if (huff_decode_block(&bs, cr_dc, cr_ac,
+                if (dec_blk(&bs, cr_dc, cr_ac,
                                       &info.components[2].dc_pred, coef)) {
                     out->err = JPEG_ERR_BAD_HUFFMAN;
                     return -1;
@@ -383,7 +419,7 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
                 idct_islow(coef, cr_blk);
 
                 /* Block 3: K */
-                if (huff_decode_block(&bs, k_dc, k_ac,
+                if (dec_blk(&bs, k_dc, k_ac,
                                       &info.components[3].dc_pred, coef)) {
                     out->err = JPEG_ERR_BAD_HUFFMAN;
                     return -1;
@@ -401,7 +437,7 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
                 copy_block_8x8(k_blk,    k_dst,  Wp);
             } else {
                 /* Phase 9: 4:4:4 — 3 blocks/MCU, 8x8 each, chroma full-res */
-                if (huff_decode_block(&bs, y_dc, y_ac,
+                if (dec_blk(&bs, y_dc, y_ac,
                                       &info.components[0].dc_pred, coef)) {
                     out->err = JPEG_ERR_BAD_HUFFMAN;
                     return -1;
@@ -409,7 +445,7 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
                 dequant_block(coef, y_qt);
                 idct_islow(coef, y_blk[0]);
 
-                if (huff_decode_block(&bs, cb_dc, cb_ac,
+                if (dec_blk(&bs, cb_dc, cb_ac,
                                       &info.components[1].dc_pred, coef)) {
                     out->err = JPEG_ERR_BAD_HUFFMAN;
                     return -1;
@@ -417,7 +453,7 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
                 dequant_block(coef, cb_qt);
                 idct_islow(coef, cb_blk);
 
-                if (huff_decode_block(&bs, cr_dc, cr_ac,
+                if (dec_blk(&bs, cr_dc, cr_ac,
                                       &info.components[2].dc_pred, coef)) {
                     out->err = JPEG_ERR_BAD_HUFFMAN;
                     return -1;
@@ -591,6 +627,17 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
     free(y_pad); free(cb_pad_sub); free(cr_pad_sub); free(cb_pad); free(cr_pad);
     free(m_pad); free(yc_pad); free(k_pad);
 
+    /* Phase 16b: SOF2 single DC-only scan must be followed directly by EOI
+     * (possibly after padding/byte-stuffing). A different marker in-between
+     * (SOS, DHT, ...) means the file is multi-scan progressive which we do
+     * not yet support. Catch the pending-marker case first so it's not
+     * silently swallowed by the EOI scanner below. */
+    if (info.sof_type == 2 && bs.marker_pending &&
+        bs.last_marker != MARKER_EOI) {
+        out->err = JPEG_ERR_UNSUP_SOF;
+        return -1;
+    }
+
     bs_align_to_byte(&bs);
     uint8_t b;
     int saw_eoi = 0;
@@ -598,6 +645,11 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
         if (b == 0xFF) {
             while (bs_read_byte(&bs, &b) == 0 && b == 0xFF) {}
             if (b == MARKER_EOI) { saw_eoi = 1; break; }
+            /* Phase 16b: anything else past the DC-only scan is unsupported. */
+            if (info.sof_type == 2 && b != 0x00) {
+                out->err = JPEG_ERR_UNSUP_SOF;
+                return -1;
+            }
         }
     }
     if (!saw_eoi && bs.marker_pending && bs.last_marker == MARKER_EOI) {

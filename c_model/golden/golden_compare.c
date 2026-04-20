@@ -71,6 +71,14 @@ static int libjpeg_decode_ycc(const uint8_t *data, size_t size, libjpeg_ycc_t *o
     cinfo.raw_data_out = TRUE;
     cinfo.do_fancy_upsampling = FALSE;
     cinfo.dct_method = JDCT_ISLOW;
+    /* Phase 16b: progressive DC-only files would otherwise be "smoothed" by
+     * libjpeg's inter-block interpolation (do_block_smoothing=TRUE by default
+     * in progressive mode). That smoothing is an implementation-specific post-
+     * process, not part of the JPEG standard. Disable it so the golden is a
+     * literal DC-only IDCT that our decoder can match bit-exactly. Baseline
+     * SOF0/SOF1 files are unaffected since smoothing only applies to partial
+     * progressive state. */
+    cinfo.do_block_smoothing = FALSE;
     cinfo.out_color_space = is_gray ? JCS_GRAYSCALE :
                             is_cmyk ? JCS_CMYK : JCS_YCbCr;
 

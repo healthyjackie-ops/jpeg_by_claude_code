@@ -37,7 +37,9 @@
 |---|---|---|---|
 | **14** ✅ | [SOF2 header 解析](spec_phase14.md) | 2d | 识别但仍 error-out（8/8 bit-exact） |
 | **15** ✅ | [Coef frame buffer](spec_phase15.md) | 3–4d | 读/写/累加端口 loop-back（5/5 tests） |
-| **16** | [DC-only scan (Ss=Se=0)](spec_phase16.md) | 4–5d | DC-only SOF2（sub: 16a scan-params, 16b C model, 16c RTL bit-exact） |
+| **16a** ✅ | [SOS scan-param plumbing](spec_phase16.md) | 1d | Ss/Se/Ah/Al 通过 CSR 可读；baseline 零退步 |
+| **16b** ✅ | [C model DC-only decode](spec_phase16.md) | 1–2d | 14/14 DC-only 向量 bit-exact vs libjpeg-turbo（block-smoothing off） |
+| **16c** | [RTL DC-only integration](spec_phase16.md) | 2–3d | coef_buffer 接入 + huffman DC-only + drain FSM + diff bit-exact |
 | **17** | [AC spectral selection](spec_phase17.md) | 5–6d | 完整扫描序列 |
 | **18** | [Successive approximation](spec_phase18.md) | 5–7d | refinement scans |
 | **19** | [Drain → IDCT → 输出](spec_phase19.md) | 3–4d | 1080p progressive 端到端 |
