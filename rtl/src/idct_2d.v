@@ -16,11 +16,11 @@ module idct_2d (
     input  wire        rst_n,
     input  wire        soft_reset,
 
-    // 来自 dequant_izz
+    // 来自 dequant_izz (Phase 13: 32b signed 以承载 16×16 乘积)
     input  wire        dq_start,
     input  wire        dq_wr,
     input  wire [5:0]  dq_idx,
-    input  wire signed [15:0] dq_val,
+    input  wire signed [31:0] dq_val,
     input  wire        dq_done,
 
     // 输出 8 像素/cyc (pass2 过程中)
@@ -30,8 +30,8 @@ module idct_2d (
     output reg         blk_done_out
 );
 
-    // 输入缓冲 64 × int16 (natural order)
-    reg signed [15:0] inbuf [0:63];
+    // 输入缓冲 64 × int32 (Phase 13: 从 int16 升到 int32 以承载 dequant 16×16 乘积)
+    reg signed [31:0] inbuf [0:63];
     // 转置缓冲 64 × int32
     reg signed [31:0] ws    [0:63];
 
@@ -45,16 +45,16 @@ module idct_2d (
     // 在 0..7 期间才是有效 feed，cycle 8,9 是 drain (让 idct_1d 3 级流水的残留 2 拍输出被写)
     wire       fed_valid = (pass_cnt <= 4'd7);
 
-    // Pass1 组合输入（按当前 col）
+    // Pass1 组合输入（按当前 col）— inbuf 已是 32b signed，直接取
     wire [2:0] col = pass_cnt[2:0];
-    wire signed [31:0] p1_in0 = {{16{inbuf[{3'd0, col}][15]}}, inbuf[{3'd0, col}]};
-    wire signed [31:0] p1_in1 = {{16{inbuf[{3'd1, col}][15]}}, inbuf[{3'd1, col}]};
-    wire signed [31:0] p1_in2 = {{16{inbuf[{3'd2, col}][15]}}, inbuf[{3'd2, col}]};
-    wire signed [31:0] p1_in3 = {{16{inbuf[{3'd3, col}][15]}}, inbuf[{3'd3, col}]};
-    wire signed [31:0] p1_in4 = {{16{inbuf[{3'd4, col}][15]}}, inbuf[{3'd4, col}]};
-    wire signed [31:0] p1_in5 = {{16{inbuf[{3'd5, col}][15]}}, inbuf[{3'd5, col}]};
-    wire signed [31:0] p1_in6 = {{16{inbuf[{3'd6, col}][15]}}, inbuf[{3'd6, col}]};
-    wire signed [31:0] p1_in7 = {{16{inbuf[{3'd7, col}][15]}}, inbuf[{3'd7, col}]};
+    wire signed [31:0] p1_in0 = inbuf[{3'd0, col}];
+    wire signed [31:0] p1_in1 = inbuf[{3'd1, col}];
+    wire signed [31:0] p1_in2 = inbuf[{3'd2, col}];
+    wire signed [31:0] p1_in3 = inbuf[{3'd3, col}];
+    wire signed [31:0] p1_in4 = inbuf[{3'd4, col}];
+    wire signed [31:0] p1_in5 = inbuf[{3'd5, col}];
+    wire signed [31:0] p1_in6 = inbuf[{3'd6, col}];
+    wire signed [31:0] p1_in7 = inbuf[{3'd7, col}];
 
     wire signed [31:0] p1_o0, p1_o1, p1_o2, p1_o3, p1_o4, p1_o5, p1_o6, p1_o7;
     idct_1d u_p1 (

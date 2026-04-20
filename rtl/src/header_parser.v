@@ -19,11 +19,11 @@ module header_parser (
     input  wire        byte_valid,
     output reg         byte_ready,
 
-    // 写 QTable (8-bit value, 存 natural-order 索引)
+    // 写 QTable (16-bit value, 存 natural-order 索引; Pq=0 时高 8b=0)
     output reg         qt_wr,
     output reg  [1:0]  qt_sel,         // Tq
     output reg  [5:0]  qt_idx,         // natural order index
-    output reg  [7:0]  qt_val,
+    output reg  [15:0] qt_val,
 
     // 写 HTable BITS / HUFFVAL
     output reg         ht_bits_wr,
@@ -59,6 +59,7 @@ module header_parser (
     output reg  [15:0] dri_interval,   // Phase 7: DRI 间隔 MCU 数（0=禁用）
     output reg  [2:0]  num_components_o,// Phase 12: 1=gray, 3=YCbCr, 4=CMYK (3b for Nf=4)
     output reg  [2:0]  chroma_mode_o,  // Phase 12: 0=GRAY,1=420,2=444,3=422,4=440,5=411,6=CMYK
+    output reg         precision_o,    // Phase 13: 0=P=8, 1=P=12
     output reg  [8:0]  err             // sticky
 );
 
@@ -77,6 +78,7 @@ module header_parser (
         S_SKIP         = 6'd8,
         S_DQT_PQTQ     = 6'd9,
         S_DQT_VAL      = 6'd10,
+        S_DQT_VAL_LO   = 6'd36,     // Phase 13: Pq=1 第二字节 (LSB)
         S_DHT_TCTH     = 6'd11,
         S_DHT_BITS     = 6'd12,
         S_DHT_VAL      = 6'd13,
@@ -136,6 +138,8 @@ module header_parser (
 
     // DQT sub-state
     reg [5:0]  dqt_k;         // 0..63
+    reg        dqt_pq;        // Phase 13: 0=8b entries (64B), 1=16b entries (128B)
+    reg [7:0]  dqt_hi_byte;   // Phase 13: Pq=1 first (MSB) byte, combined with LSB in S_DQT_VAL_LO
 
     // DHT sub-state
     reg [4:0]  dht_l;         // 1..16
@@ -162,7 +166,7 @@ module header_parser (
             S_FIND_FF, S_FIND_MK,
             S_LEN_HI, S_LEN_LO,
             S_SKIP,
-            S_DQT_PQTQ, S_DQT_VAL,
+            S_DQT_PQTQ, S_DQT_VAL, S_DQT_VAL_LO,
             S_DHT_TCTH, S_DHT_BITS, S_DHT_VAL,
             S_SOF_P, S_SOF_H_HI, S_SOF_H_LO, S_SOF_W_HI, S_SOF_W_LO, S_SOF_NF,
             S_SOF_COMP_ID, S_SOF_COMP_HV, S_SOF_COMP_TQ,
@@ -178,6 +182,7 @@ module header_parser (
             state <= S_IDLE;
             seg_len <= 16'd0; remain <= 16'd0; last_marker <= 8'd0;
             dqt_k <= 6'd0; dht_l <= 5'd0; dht_total <= 9'd0; dht_idx <= 9'd0;
+            dqt_pq <= 1'b0; dqt_hi_byte <= 8'd0;
             sof_comp_idx <= 2'd0; sos_comp_idx <= 2'd0;
             img_width <= 16'd0; img_height <= 16'd0;
             comp0_qt <= 2'd0; comp1_qt <= 2'd0; comp2_qt <= 2'd0; comp3_qt <= 2'd0;
@@ -187,8 +192,9 @@ module header_parser (
             dri_interval <= 16'd0;
             num_components_o <= 3'd3;
             chroma_mode_o <= 3'd1;
+            precision_o <= 1'b0;
             err <= 9'd0;
-            qt_wr <= 1'b0; qt_sel <= 2'd0; qt_idx <= 6'd0; qt_val <= 8'd0;
+            qt_wr <= 1'b0; qt_sel <= 2'd0; qt_idx <= 6'd0; qt_val <= 16'd0;
             ht_bits_wr <= 1'b0; ht_val_wr <= 1'b0;
             ht_ac <= 1'b0; ht_sel <= 2'd0;
             ht_bits_idx <= 5'd0; ht_bits_val <= 8'd0;
@@ -200,6 +206,7 @@ module header_parser (
             dri_interval <= 16'd0;
             num_components_o <= 3'd3;
             chroma_mode_o <= 3'd1;
+            precision_o <= 1'b0;
             err <= 9'd0;
             qt_wr <= 1'b0; ht_bits_wr <= 1'b0; ht_val_wr <= 1'b0;
             ht_build_start <= 1'b0;
@@ -222,6 +229,7 @@ module header_parser (
                         dri_interval <= 16'd0;
                         num_components_o <= 3'd3;
                         chroma_mode_o <= 3'd1;
+                        precision_o <= 1'b0;
                         err         <= 9'd0;
                     end
                 end
@@ -254,6 +262,7 @@ module header_parser (
                     // 不消耗字节，纯分发
                     case (last_marker)
                         `MARKER_SOF0:  state <= S_LEN_HI;
+                        `MARKER_SOF1:  state <= S_LEN_HI;   // Phase 13: extended sequential
                         `MARKER_DQT:   state <= S_LEN_HI;
                         `MARKER_DHT:   state <= S_LEN_HI;
                         `MARKER_DRI:   state <= S_LEN_HI;
@@ -269,7 +278,7 @@ module header_parser (
                             end else if ((last_marker & 8'hF0) == 8'hC0 &&
                                          last_marker != `MARKER_DHT &&
                                          last_marker != 8'hC8 /* JPG ext */) begin
-                                // 非 SOF0 的 SOF
+                                // 非 SOF0/SOF1 的 SOF (progressive/lossless/hierarchical etc.)
                                 err[`ERR_UNSUP_SOF] <= 1'b1; state <= S_ERROR;
                             end else if (last_marker >= 8'hD0 && last_marker <= 8'hD7) begin
                                 // RSTn in header 不合法
@@ -293,6 +302,7 @@ module header_parser (
                         `MARKER_DQT:  begin dqt_k <= 6'd0;  state <= S_DQT_PQTQ; end
                         `MARKER_DHT:  begin                state <= S_DHT_TCTH; end
                         `MARKER_SOF0: begin sof_comp_idx <= 2'd0; state <= S_SOF_P;  end
+                        `MARKER_SOF1: begin sof_comp_idx <= 2'd0; state <= S_SOF_P;  end  // Phase 13
                         `MARKER_SOS:  begin sos_comp_idx <= 2'd0; state <= S_SOS_NS; end
                         `MARKER_DRI:  begin state <= S_DRI_HI; end
                         default:      begin state <= S_SKIP; end
@@ -309,28 +319,54 @@ module header_parser (
 
                 // ------------------------------------------------------ DQT
                 S_DQT_PQTQ: if (beat) begin
-                    if (byte_in[7:4] != 4'd0) begin
+                    // Phase 13: accept Pq=0 (8b/entry) or Pq=1 (16b/entry, MSB first)
+                    if (byte_in[7:4] > 4'd1) begin
                         err[`ERR_UNSUP_PREC] <= 1'b1; state <= S_ERROR;
                     end else begin
-                        qt_sel <= byte_in[1:0];  // Tq (0..3)
+                        dqt_pq <= byte_in[4];
+                        qt_sel <= byte_in[1:0];
                         dqt_k  <= 6'd0;
                         remain <= remain - 16'd1;
                         state  <= S_DQT_VAL;
                     end
                 end
                 S_DQT_VAL: if (beat) begin
+                    if (dqt_pq == 1'b0) begin
+                        // Pq=0: 8b 直接写 {8'd0, byte_in}
+                        qt_wr  <= 1'b1;
+                        qt_idx <= zz_natural[dqt_k];
+                        qt_val <= {8'd0, byte_in};
+                        remain <= remain - 16'd1;
+                        if (dqt_k == 6'd63) begin
+                            if (remain - 16'd1 > 0) begin
+                                state <= S_DQT_PQTQ;   // 下一 quant table
+                            end else begin
+                                state <= S_FIND_FF;
+                            end
+                        end else begin
+                            dqt_k <= dqt_k + 6'd1;
+                        end
+                    end else begin
+                        // Pq=1: 本 byte 是 MSB，保存后去读 LSB
+                        dqt_hi_byte <= byte_in;
+                        remain      <= remain - 16'd1;
+                        state       <= S_DQT_VAL_LO;
+                    end
+                end
+                S_DQT_VAL_LO: if (beat) begin
                     qt_wr  <= 1'b1;
                     qt_idx <= zz_natural[dqt_k];
-                    qt_val <= byte_in;
+                    qt_val <= {dqt_hi_byte, byte_in};
                     remain <= remain - 16'd1;
                     if (dqt_k == 6'd63) begin
                         if (remain - 16'd1 > 0) begin
-                            state <= S_DQT_PQTQ;   // 下一 quant table
+                            state <= S_DQT_PQTQ;
                         end else begin
                             state <= S_FIND_FF;
                         end
                     end else begin
                         dqt_k <= dqt_k + 6'd1;
+                        state <= S_DQT_VAL;
                     end
                 end
 
@@ -390,13 +426,19 @@ module header_parser (
                     end
                 end
 
-                // ------------------------------------------------------ SOF0
+                // ------------------------------------------------------ SOF0/SOF1
                 S_SOF_P: if (beat) begin
-                    if (byte_in != 8'd8) begin
-                        err[`ERR_UNSUP_PREC] <= 1'b1; state <= S_ERROR;
-                    end else begin
+                    // Phase 13: accept P=8 (SOF0/SOF1) or P=12 (SOF1 only)
+                    if (byte_in == 8'd8) begin
+                        precision_o <= 1'b0;
                         remain <= remain - 16'd1;
                         state  <= S_SOF_H_HI;
+                    end else if (byte_in == 8'd12 && last_marker == `MARKER_SOF1) begin
+                        precision_o <= 1'b1;
+                        remain <= remain - 16'd1;
+                        state  <= S_SOF_H_HI;
+                    end else begin
+                        err[`ERR_UNSUP_PREC] <= 1'b1; state <= S_ERROR;
                     end
                 end
                 S_SOF_H_HI: if (beat) begin

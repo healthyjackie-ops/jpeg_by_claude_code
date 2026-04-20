@@ -27,13 +27,13 @@ module dequant_izz (
     // 写 QTable 端口 (读)
     output reg  [1:0]  qt_rd_sel,
     output reg  [5:0]  qt_rd_idx,
-    input  wire [7:0]  qt_rd_data,
+    input  wire [15:0] qt_rd_data,
 
-    // 输出到 IDCT
+    // 输出到 IDCT (Phase 13: 32b 以承载 coef 16b signed × qt 16b unsigned)
     output reg         dq_start,          // 脉冲：新 block 开始
     output reg         dq_wr,
     output reg  [5:0]  dq_idx,            // natural order 0..63
-    output reg signed [15:0] dq_val,
+    output reg signed [31:0] dq_val,
     output reg         dq_done
 );
 
@@ -63,7 +63,7 @@ module dequant_izz (
             st <= S_IDLE;
             qt_rd_sel <= 2'd0; qt_rd_idx <= 6'd0;
             dq_start <= 1'b0; dq_wr <= 1'b0;
-            dq_idx <= 6'd0; dq_val <= 16'sd0; dq_done <= 1'b0;
+            dq_idx <= 6'd0; dq_val <= 32'sd0; dq_done <= 1'b0;
         end else if (soft_reset) begin
             st <= S_IDLE;
             dq_start <= 1'b0; dq_wr <= 1'b0; dq_done <= 1'b0;
@@ -92,6 +92,7 @@ module dequant_izz (
                         stream_cnt <= stream_cnt + 7'd1;
                     end else if (stream_cnt <= 7'd63) begin
                         // 相乘并写出 (natural_idx = stream_cnt - 1)
+                        // coef 16b signed × qt 16b unsigned → 需要 17b signed 扩位
                         dq_wr  <= 1'b1;
                         dq_idx <= stream_cnt[5:0] - 6'd1;
                         dq_val <= coef_buf[stream_cnt[5:0] - 6'd1] *

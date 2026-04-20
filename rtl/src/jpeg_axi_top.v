@@ -102,7 +102,7 @@ module jpeg_axi_top (
     wire        qt_wr;
     wire [1:0]  qt_sel;
     wire [5:0]  qt_idx;
-    wire [7:0]  qt_val;
+    wire [15:0] qt_val;                     // Phase 13: 16b (Pq=1 支持)
     wire        ht_bits_wr, ht_val_wr, ht_ac_w;
     wire [1:0]  ht_sel_w;
     wire [4:0]  ht_bits_idx_w;
@@ -121,6 +121,7 @@ module jpeg_axi_top (
     wire        align_req_w;        // Phase 7: block_seq → bitstream_unpack (drain shreg)
     wire [2:0]  num_components_w;   // Phase 12: Nf (1=gray, 3=YCbCr, 4=CMYK)
     wire [2:0]  chroma_mode_w;      // Phase 12: 0=GRAY,1=420,2=444,3=422,4=440,5=411,6=CMYK
+    wire        precision_w;        // Phase 13: 0=P=8, 1=P=12
     wire        is_grayscale_w = (chroma_mode_w == 3'd0);
     wire        is_444_w       = (chroma_mode_w == 3'd2);
     wire        is_422_w       = (chroma_mode_w == 3'd3);
@@ -149,13 +150,14 @@ module jpeg_axi_top (
         .dri_interval(dri_interval_w),   // Phase 7
         .num_components_o(num_components_w), // Phase 8
         .chroma_mode_o(chroma_mode_w),   // Phase 9
+        .precision_o(precision_w),       // Phase 13
         .err(err_w)
     );
 
     // ---------------- QTable RAM ------------------------------------
     wire [1:0]  qt_rd_sel_w;
     wire [5:0]  qt_rd_idx_w;
-    wire [7:0]  qt_rd_data_w;
+    wire [15:0] qt_rd_data_w;              // Phase 13: 16b (Pq=1 支持)
 
     qtable_ram u_qt (
         .clk(aclk),
@@ -259,7 +261,7 @@ module jpeg_axi_top (
     wire [1:0]  qt_sel_cur_w;          // block_sequencer 驱动
     wire        dq_start_w, dq_wr_w, dq_done_w;
     wire [5:0]  dq_idx_w;
-    wire signed [15:0] dq_val_w;
+    wire signed [31:0] dq_val_w;        // Phase 13: 32b (16×16 dequant 乘积)
 
     dequant_izz u_dq (
         .clk(aclk), .rst_n(aresetn), .soft_reset(softrst),
@@ -542,6 +544,7 @@ module jpeg_axi_top (
                      cfg_reg_w, scratch_reg_w, int_en_w,
                      fifo_byte_tlast, in_fifo_full, out_fifo_empty,
                      in_fifo_tuser_nc, peek_valid_nc, mb_ready_nc,
+                     precision_w,  // Phase 13: driven by header_parser, 下一阶段 RTL 消费
                      1'b0};
 
 endmodule

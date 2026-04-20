@@ -8,6 +8,7 @@
 `define MARKER_SOI    8'hD8
 `define MARKER_EOI    8'hD9
 `define MARKER_SOF0   8'hC0
+`define MARKER_SOF1   8'hC1    // Phase 13: extended sequential, P=8 or 12
 `define MARKER_DHT    8'hC4
 `define MARKER_DQT    8'hDB
 `define MARKER_DRI    8'hDD
@@ -39,7 +40,8 @@
 `define FIX_2_562915447   15'd20995
 `define FIX_3_072711026   15'd25172
 
-`define CONST_BITS  5'd13
-`define PASS1_BITS  5'd2
+`define CONST_BITS      5'd13
+`define PASS1_BITS      5'd2    // P=8 slow-int pass-1 descale bit count
+`define PASS1_BITS_P12  5'd1    // P=12: libjpeg-turbo uses 1 (loses 1b of pass-1 precision to avoid overflow)
 
 `endif
