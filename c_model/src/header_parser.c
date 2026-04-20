@@ -67,14 +67,25 @@ static int parse_dqt(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
         int tq = pq_tq & 0xF;
         remain -= 1;
         if (tq >= 4) { *err |= JPEG_ERR_BAD_MARKER; return -1; }
-        if (pq != 0) { *err |= JPEG_ERR_UNSUP_PREC; return -1; }
-        for (int i = 0; i < 64; i++) {
-            uint8_t v;
-            if (bs_read_byte(bs, &v)) { *err |= JPEG_ERR_STREAM_TRUNC; return -1; }
-            info->qtables[tq].q[ZZ_NATURAL[i]] = v;
+        /* Phase 13: Pq=0 -> 8b entries, Pq=1 -> 16b entries (MSB first).
+           Cross-check Pq <= (P==8?0:1) is deferred to decode (DQT may precede SOF). */
+        if (pq > 1) { *err |= JPEG_ERR_UNSUP_PREC; return -1; }
+        if (pq == 0) {
+            for (int i = 0; i < 64; i++) {
+                uint8_t v;
+                if (bs_read_byte(bs, &v)) { *err |= JPEG_ERR_STREAM_TRUNC; return -1; }
+                info->qtables[tq].q[ZZ_NATURAL[i]] = v;
+            }
+            remain -= 64;
+        } else {
+            for (int i = 0; i < 64; i++) {
+                uint16_t v;
+                if (bs_read_u16(bs, &v)) { *err |= JPEG_ERR_STREAM_TRUNC; return -1; }
+                info->qtables[tq].q[ZZ_NATURAL[i]] = v;
+            }
+            remain -= 128;
         }
         info->qtables[tq].loaded = 1;
-        remain -= 64;
     }
     return 0;
 }
@@ -112,12 +123,16 @@ static int parse_dht(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
     return 0;
 }
 
-static int parse_sof0(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
+/* Shared SOF parser. allow_p12:
+ *   0 → SOF0: only P=8 accepted (baseline)
+ *   1 → SOF1: P ∈ {8,12} accepted (extended sequential) */
+static int parse_sof_common(bitstream_t *bs, jpeg_info_t *info, uint32_t *err,
+                            int allow_p12) {
     uint16_t len;
     if (bs_read_u16(bs, &len)) { *err |= JPEG_ERR_STREAM_TRUNC; return -1; }
     uint8_t p;
     if (bs_read_byte(bs, &p)) { *err |= JPEG_ERR_STREAM_TRUNC; return -1; }
-    if (p != 8) { *err |= JPEG_ERR_UNSUP_PREC; return -1; }
+    if (p != 8 && !(allow_p12 && p == 12)) { *err |= JPEG_ERR_UNSUP_PREC; return -1; }
     info->precision = p;
     if (bs_read_u16(bs, &info->height)) { *err |= JPEG_ERR_STREAM_TRUNC; return -1; }
     if (bs_read_u16(bs, &info->width))  { *err |= JPEG_ERR_STREAM_TRUNC; return -1; }
@@ -205,6 +220,14 @@ static int parse_sof0(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
     return 0;
 }
 
+static int parse_sof0(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
+    return parse_sof_common(bs, info, err, 0);
+}
+
+static int parse_sof1(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
+    return parse_sof_common(bs, info, err, 1);
+}
+
 static int parse_sos(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
     uint16_t len;
     if (bs_read_u16(bs, &len)) { *err |= JPEG_ERR_STREAM_TRUNC; return -1; }
@@ -276,6 +299,10 @@ int jpeg_parse_headers(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
                 if (parse_sof0(bs, info, err)) return -1;
                 got_sof = 1;
                 break;
+            case MARKER_SOF1:
+                if (parse_sof1(bs, info, err)) return -1;
+                got_sof = 1;
+                break;
             case MARKER_DQT:
                 if (parse_dqt(bs, info, err)) return -1;
                 break;
@@ -298,7 +325,7 @@ int jpeg_parse_headers(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
             default:
                 if (marker >= MARKER_APP0 && marker <= MARKER_APP15) {
                     if (skip_segment(bs, err)) return -1;
-                } else if (marker == MARKER_SOF1 || (marker >= MARKER_SOF2 && marker <= MARKER_SOF3) ||
+                } else if ((marker >= MARKER_SOF2 && marker <= MARKER_SOF3) ||
                            (marker >= MARKER_SOF5 && marker <= MARKER_SOF15)) {
                     *err |= JPEG_ERR_UNSUP_SOF;
                     return -1;

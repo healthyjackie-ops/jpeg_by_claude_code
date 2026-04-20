@@ -35,6 +35,13 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
         return -1;
     }
 
+    /* Phase 13a.2: parser accepts P=12 / SOF1 / Pq=1. The uint8_t decode path
+       below assumes P=8; P=12 full decode lands in Phase 13a.3. */
+    if (info.precision != 8) {
+        out->err = JPEG_ERR_UNSUP_PREC;
+        return -1;
+    }
+
     out->width  = info.width;
     out->height = info.height;
     uint16_t W  = info.width;
