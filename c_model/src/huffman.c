@@ -212,3 +212,138 @@ int huff_decode_ac_progressive(bitstream_t *bs,
     }
     return 0;
 }
+
+/* Phase 18a: DC refinement scan (ISO 10918-1 G.1.2.1.1).
+ * Each block contributes one bit at position Al appended to coef[0].
+ */
+int huff_decode_dc_refine(bitstream_t *bs, int16_t coef[64], uint8_t al) {
+    uint32_t bit;
+    if (bs_get_bits_u(bs, 1, &bit)) return -1;
+    if (bit) {
+        int16_t mask = (int16_t)((int32_t)1 << al);
+        coef[0] = (int16_t)(coef[0] | mask);
+    }
+    return 0;
+}
+
+/* Apply one correction bit to a non-zero refinement-scan coefficient.
+ * Matches libjpeg-turbo: the `& p1 == 0` guard is a safety net; for valid
+ * progressive streams coef values at scan entry are aligned multiples of
+ * (1<<Ah) and thus always pass it.
+ */
+static inline int rfn_apply_bit(bitstream_t *bs, int16_t *cp,
+                                int16_t p1, int16_t m1) {
+    uint32_t cb;
+    if (bs_get_bits_u(bs, 1, &cb)) return -1;
+    if (cb && ((*cp & p1) == 0)) {
+        if (*cp >= 0) *cp = (int16_t)(*cp + p1);
+        else          *cp = (int16_t)(*cp + m1);
+    }
+    return 0;
+}
+
+/* Phase 18a: AC refinement scan (ISO/IEC 10918-1 G.1.2.3).
+ *
+ * Mirrors libjpeg-turbo's decode_mcu_AC_refine (jdphuff.c). Rules:
+ *   - SSSS must be 0 or 1; refinement amplitude is ±1 only.
+ *   - RRRR counts skipped *zero* positions. Non-zero coefs traversed along
+ *     the way each receive one correction bit.
+ *   - EOBn sets eob_run to 2^RRRR + extra, then the current block still
+ *     finishes with correction bits on any remaining non-zeros in [k..se].
+ *   - Subsequent in-EOB blocks (eob_run>0 at entry) just apply correction
+ *     bits to non-zeros in [ss..se] and decrement eob_run.
+ */
+int huff_decode_ac_refine(bitstream_t *bs,
+                          const htable_t *ac_tab,
+                          int16_t coef[64],
+                          uint8_t ss, uint8_t se, uint8_t al,
+                          uint32_t *eob_run) {
+    if (ss == 0 || ss > se || se > 63) return -1;
+
+    int16_t p1 = (int16_t)((int32_t)1 << al);       /* +1 at bit position Al */
+    int16_t m1 = (int16_t)(-((int32_t)1 << al));    /* -1 at bit position Al */
+
+    int k = (int)ss;
+
+    /* If entering inside an EOB run, skip straight to correction-bit loop. */
+    if (*eob_run > 0) {
+        while (k <= (int)se) {
+            int16_t *cp = &coef[ZIGZAG[k]];
+            if (*cp != 0) {
+                if (rfn_apply_bit(bs, cp, p1, m1)) return -1;
+            }
+            k++;
+        }
+        (*eob_run)--;
+        return 0;
+    }
+
+    while (k <= (int)se) {
+        uint8_t rs;
+        if (huff_decode_symbol(bs, ac_tab, &rs)) return -1;
+        int r = rs >> 4;
+        int s = rs & 0xF;
+        int sval = 0;      /* placed value (0 = ZRL / no new placement) */
+
+        if (s == 0) {
+            if (r != 15) {
+                uint32_t extra = 0;
+                if (r > 0) {
+                    if (bs_get_bits_u(bs, (uint8_t)r, &extra)) return -1;
+                }
+                *eob_run = ((uint32_t)1u << r) + extra;
+                /* Finish this block's non-zero refines, then eat one eob_run. */
+                while (k <= (int)se) {
+                    int16_t *cp = &coef[ZIGZAG[k]];
+                    if (*cp != 0) {
+                        if (rfn_apply_bit(bs, cp, p1, m1)) return -1;
+                    }
+                    k++;
+                }
+                (*eob_run)--;
+                return 0;
+            }
+            /* ZRL: r stays at 15, sval stays 0. Walk loop below will
+             * pre-decrement until r<0 at the 16th zero and break there. */
+        } else {
+            if (s != 1) return -1;           /* refinement: only ±1 allowed */
+            uint32_t bit;
+            if (bs_get_bits_u(bs, 1, &bit)) return -1;
+            sval = bit ? (int)p1 : (int)m1;
+            /* r remains the number of zero positions to skip before placement. */
+        }
+
+        /* Walk: refine non-zeros, count-down r on zeros. Break when r<0 so k
+         * lands at the target position for placement (or 16th zero for ZRL).
+         * For sval!=0 with r=0, the first zero encountered becomes the target.
+         */
+        int placed = 0;
+        while (k <= (int)se) {
+            int16_t *cp = &coef[ZIGZAG[k]];
+            if (*cp != 0) {
+                if (rfn_apply_bit(bs, cp, p1, m1)) return -1;
+                k++;
+            } else {
+                if (r == 0) {
+                    /* Target zero — place sval if any, then advance. */
+                    if (sval != 0) {
+                        coef[ZIGZAG[k]] = (int16_t)sval;
+                        placed = 1;
+                    }
+                    k++;
+                    break;
+                }
+                r--;
+                k++;
+            }
+        }
+
+        if (sval != 0 && !placed) {
+            /* Ran off band without a target zero — malformed stream. */
+            return -1;
+        }
+        /* ZRL (sval==0, r should now be 0 if exactly 16 zeros consumed; if k>se
+         * with r>0 the stream is malformed but we accept and continue.) */
+    }
+    return 0;
+}

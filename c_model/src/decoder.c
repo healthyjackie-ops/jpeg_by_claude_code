@@ -1013,12 +1013,6 @@ static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
     int saw_eoi = 0;
     int scan_no = 0;
     for (;;) {
-        if (info->scan_ah != 0) {
-            /* Refinement scans: Phase 18. */
-            out->err = JPEG_ERR_UNSUP_SOF;
-            goto fail;
-        }
-
         int is_dc = (info->scan_ss == 0 && info->scan_se == 0);
         int is_ac = (info->scan_ss >= 1 && info->scan_se >= info->scan_ss &&
                      info->scan_se <= 63);
@@ -1027,6 +1021,7 @@ static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
             goto fail;
         }
         uint8_t al = info->scan_al;
+        int is_refine = (info->scan_ah != 0);
         if (dbg) fprintf(stderr,
             "[prog] scan=%d Ss=%u Se=%u Ah=%u Al=%u Ns=%u bytepos=%zu bitcnt=%d\n",
             scan_no, info->scan_ss, info->scan_se, info->scan_ah,
@@ -1034,31 +1029,47 @@ static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
         scan_no++;
 
         if (is_dc) {
-            /* Interleaved DC scan (Ns = num_comps). Walk MCU-major. DC preds
-             * reset at scan start. */
-            for (int c = 0; c < num_comps; c++) info->components[c].dc_pred = 0;
+            /* Interleaved DC scan (Ns = num_comps). Walk MCU-major.
+             * First scan: DC preds reset, coef[0] = dc<<Al.
+             * Refinement (Ah>0): per block, 1 bit OR'd into coef[0] at pos Al.
+             */
+            if (!is_refine) {
+                for (int c = 0; c < num_comps; c++) info->components[c].dc_pred = 0;
+            }
             for (uint32_t my = 0; my < info->mcu_rows; my++) {
                 for (uint32_t mx = 0; mx < info->mcu_cols; mx++) {
                     if (is_gray) {
                         uint32_t blk = cg[0].base + my * cg[0].blk_cols + mx;
-                        const htable_t *dc_tab =
-                            &info->htables_dc[info->components[0].td];
-                        if (huff_decode_dc_progressive(
-                                bs, dc_tab,
-                                &info->components[0].dc_pred,
-                                coef_buf[blk], al)) {
-                            out->err = JPEG_ERR_BAD_HUFFMAN; goto fail;
+                        if (is_refine) {
+                            if (huff_decode_dc_refine(bs, coef_buf[blk], al)) {
+                                out->err = JPEG_ERR_BAD_HUFFMAN; goto fail;
+                            }
+                        } else {
+                            const htable_t *dc_tab =
+                                &info->htables_dc[info->components[0].td];
+                            if (huff_decode_dc_progressive(
+                                    bs, dc_tab,
+                                    &info->components[0].dc_pred,
+                                    coef_buf[blk], al)) {
+                                out->err = JPEG_ERR_BAD_HUFFMAN; goto fail;
+                            }
                         }
                     } else if (is_444) {
                         for (int c = 0; c < 3; c++) {
                             uint32_t blk = cg[c].base + my * cg[c].blk_cols + mx;
-                            const htable_t *dc_tab =
-                                &info->htables_dc[info->components[c].td];
-                            if (huff_decode_dc_progressive(
-                                    bs, dc_tab,
-                                    &info->components[c].dc_pred,
-                                    coef_buf[blk], al)) {
-                                out->err = JPEG_ERR_BAD_HUFFMAN; goto fail;
+                            if (is_refine) {
+                                if (huff_decode_dc_refine(bs, coef_buf[blk], al)) {
+                                    out->err = JPEG_ERR_BAD_HUFFMAN; goto fail;
+                                }
+                            } else {
+                                const htable_t *dc_tab =
+                                    &info->htables_dc[info->components[c].td];
+                                if (huff_decode_dc_progressive(
+                                        bs, dc_tab,
+                                        &info->components[c].dc_pred,
+                                        coef_buf[blk], al)) {
+                                    out->err = JPEG_ERR_BAD_HUFFMAN; goto fail;
+                                }
                             }
                         }
                     } else { /* 4:2:0 */
@@ -1068,25 +1079,37 @@ static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
                                 uint32_t blk = cg[0].base +
                                     (y_by0 + (uint32_t)iy) * cg[0].blk_cols +
                                     (y_bx0 + (uint32_t)ix);
-                                const htable_t *dc_tab =
-                                    &info->htables_dc[info->components[0].td];
-                                if (huff_decode_dc_progressive(
-                                        bs, dc_tab,
-                                        &info->components[0].dc_pred,
-                                        coef_buf[blk], al)) {
-                                    out->err = JPEG_ERR_BAD_HUFFMAN; goto fail;
+                                if (is_refine) {
+                                    if (huff_decode_dc_refine(bs, coef_buf[blk], al)) {
+                                        out->err = JPEG_ERR_BAD_HUFFMAN; goto fail;
+                                    }
+                                } else {
+                                    const htable_t *dc_tab =
+                                        &info->htables_dc[info->components[0].td];
+                                    if (huff_decode_dc_progressive(
+                                            bs, dc_tab,
+                                            &info->components[0].dc_pred,
+                                            coef_buf[blk], al)) {
+                                        out->err = JPEG_ERR_BAD_HUFFMAN; goto fail;
+                                    }
                                 }
                             }
                         }
                         for (int c = 1; c < 3; c++) {
                             uint32_t blk = cg[c].base + my * cg[c].blk_cols + mx;
-                            const htable_t *dc_tab =
-                                &info->htables_dc[info->components[c].td];
-                            if (huff_decode_dc_progressive(
-                                    bs, dc_tab,
-                                    &info->components[c].dc_pred,
-                                    coef_buf[blk], al)) {
-                                out->err = JPEG_ERR_BAD_HUFFMAN; goto fail;
+                            if (is_refine) {
+                                if (huff_decode_dc_refine(bs, coef_buf[blk], al)) {
+                                    out->err = JPEG_ERR_BAD_HUFFMAN; goto fail;
+                                }
+                            } else {
+                                const htable_t *dc_tab =
+                                    &info->htables_dc[info->components[c].td];
+                                if (huff_decode_dc_progressive(
+                                        bs, dc_tab,
+                                        &info->components[c].dc_pred,
+                                        coef_buf[blk], al)) {
+                                    out->err = JPEG_ERR_BAD_HUFFMAN; goto fail;
+                                }
                             }
                         }
                     }
@@ -1124,12 +1147,22 @@ static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
             for (uint32_t by = 0; by < nat_rows; by++) {
                 for (uint32_t bx = 0; bx < nat_cols; bx++) {
                     uint32_t blk = cg[scan_comp].base + by * stride + bx;
-                    if (huff_decode_ac_progressive(
-                            bs, ac_tab, coef_buf[blk],
-                            info->scan_ss, info->scan_se,
-                            al, &eob_run)) {
+                    int rc;
+                    if (is_refine) {
+                        rc = huff_decode_ac_refine(
+                                bs, ac_tab, coef_buf[blk],
+                                info->scan_ss, info->scan_se,
+                                al, &eob_run);
+                    } else {
+                        rc = huff_decode_ac_progressive(
+                                bs, ac_tab, coef_buf[blk],
+                                info->scan_ss, info->scan_se,
+                                al, &eob_run);
+                    }
+                    if (rc) {
                         if (dbg) fprintf(stderr,
-                            "[prog] AC FAIL comp=%d b=%u/%u (by=%u bx=%u) eob_run=%u bytepos=%zu bitcnt=%d\n",
+                            "[prog] AC%s FAIL comp=%d b=%u/%u (by=%u bx=%u) eob_run=%u bytepos=%zu bitcnt=%d\n",
+                            is_refine ? "_refine" : "",
                             scan_comp, b, n_blk, by, bx,
                             eob_run, bs->byte_pos, bs->bit_cnt);
                         out->err = JPEG_ERR_BAD_HUFFMAN; goto fail;
@@ -1138,7 +1171,8 @@ static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
                 }
             }
             if (dbg) fprintf(stderr,
-                "[prog] AC OK comp=%d n_blk=%u final_eob_run=%u bytepos=%zu bitcnt=%d\n",
+                "[prog] AC%s OK comp=%d n_blk=%u final_eob_run=%u bytepos=%zu bitcnt=%d\n",
+                is_refine ? "_refine" : "",
                 scan_comp, n_blk, eob_run, bs->byte_pos, bs->bit_cnt);
         }
 

@@ -23,12 +23,13 @@ TEST_BINS := $(patsubst $(TEST_DIR)/test_%.c,$(BUILD_DIR)/test_%,$(TEST_SRCS))
 GOLDEN_SRC := $(GOLDEN_DIR)/golden_compare.c
 GOLDEN_BIN := $(BUILD_DIR)/golden_compare
 
-.PHONY: all test golden phase16 phase17 clean
+.PHONY: all test golden phase16 phase17 phase18 clean
 all: $(BUILD_DIR)/jpeg_decode $(GOLDEN_BIN)
 
 VECTORS_ROOT ?= ../verification/vectors
 PHASE16_DIR  := $(VECTORS_ROOT)/phase16
 PHASE17_DIR  := $(VECTORS_ROOT)/phase17
+PHASE18_DIR  := $(VECTORS_ROOT)/phase18
 
 phase16: $(GOLDEN_BIN)
 	@if ls $(PHASE16_DIR)/*.jpg >/dev/null 2>&1; then \
@@ -43,6 +44,14 @@ phase17: $(GOLDEN_BIN)
 	  $(GOLDEN_BIN) $(PHASE17_DIR)/*.jpg; \
 	else \
 	  echo "[phase17] no vectors in $(PHASE17_DIR) — run tools/gen_phase17.py" >&2; \
+	  exit 2; \
+	fi
+
+phase18: $(GOLDEN_BIN)
+	@if ls $(PHASE18_DIR)/*.jpg >/dev/null 2>&1; then \
+	  $(GOLDEN_BIN) $(PHASE18_DIR)/*.jpg; \
+	else \
+	  echo "[phase18] no vectors in $(PHASE18_DIR) — run tools/gen_phase18.py" >&2; \
 	  exit 2; \
 	fi
 

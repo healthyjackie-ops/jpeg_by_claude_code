@@ -50,4 +50,29 @@ int huff_decode_ac_progressive(bitstream_t *bs,
                                uint8_t al_shift,
                                uint32_t *eob_run);
 
+/* Phase 18a: progressive SOF2 DC refinement scan (Ah>0, Ss=Se=0).
+ *   - Reads 1 bit; if set, ORs (1 << al) into coef[0].
+ *   - No DC predictor involved; refinement just appends a lower-order bit.
+ * Returns 0 on success, -1 on bitstream error.
+ */
+int huff_decode_dc_refine(bitstream_t *bs,
+                          int16_t coef[64],
+                          uint8_t al);
+
+/* Phase 18a: progressive SOF2 AC refinement scan (Ah>0, Ss>=1).
+ *   - ISO/IEC 10918-1 G.1.2.3 "Decode_AC_refine".
+ *   - Only new nonzero amplitudes of magnitude 1 (SSSS=1) are allowed.
+ *   - Non-zero coefficients existing in coef[ZZ[k]] from earlier scans get
+ *     a correction bit (increment |value| by (1<<al) when bit==1).
+ *   - EOB run must still apply correction bits to non-zero coefs in the
+ *     remainder of [ss..se] for each block it covers.
+ * Returns 0 on success, -1 on bitstream error or invalid symbol.
+ */
+int huff_decode_ac_refine(bitstream_t *bs,
+                          const htable_t *ac_tab,
+                          int16_t coef[64],
+                          uint8_t ss, uint8_t se,
+                          uint8_t al,
+                          uint32_t *eob_run);
+
 #endif

@@ -42,7 +42,8 @@
 | **16c** ✅ | [RTL DC-only integration](spec_phase16.md) | 2–3d | huffman DC-only + SOF2 accept + Al shift；14/14 bit-exact，phase06-13 零退步 |
 | **17a** ✅ | [AC spectral selection — C model](spec_phase17.md) | 2d | 16/16 phase17 向量 pixel-exact vs libjpeg-turbo（gray/444/420，Ah=0） |
 | **17b** | [AC spectral selection — RTL](spec_phase17.md) | 3–4d | huffman AC-only + coef_buffer writeback；16/16 RTL bit-exact |
-| **18** | [Successive approximation](spec_phase18.md) | 5–7d | refinement scans |
+| **18a** ✅ | [Successive approximation — C model](spec_phase18.md) | 1d | 17/17 phase18 向量 pixel-exact（DC+AC refine，Ah>0），phase16/17 零退步 |
+| **18b** | [Successive approximation — RTL](spec_phase18.md) | 3–5d | RTL refine path + coef_buffer read-modify-write；17/17 RTL bit-exact |
 | **19** | [Drain → IDCT → 输出](spec_phase19.md) | 3–4d | 1080p progressive 端到端 |
 | **20** | [AXI4-master + DDR for 4K](spec_phase20.md) | 5–7d | 4K SOF2 |
 
