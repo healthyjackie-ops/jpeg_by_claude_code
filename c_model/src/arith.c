@@ -113,6 +113,18 @@ void arith_dec_init(arith_decoder_t *d, const uint8_t *data, size_t len)
     d->ct = -16;
 }
 
+void arith_dec_reset(arith_decoder_t *d)
+{
+    /* Phase 22c: RSTn re-prime. Preserve src/len/pos so decoding
+     * resumes at the byte right after the marker — the caller has
+     * already consumed the RSTn bytes (either via unread_marker clear
+     * or via a manual scan in the framing layer). */
+    d->a = 0;
+    d->c = 0;
+    d->ct = -16;
+    d->unread_marker = 0;
+}
+
 int arith_dec_decode(arith_decoder_t *d, uint8_t *stat)
 {
     uint8_t  nl, nm;

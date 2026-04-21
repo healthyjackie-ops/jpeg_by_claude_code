@@ -782,7 +782,7 @@ static int test_ac_block_varied(void)
     uint8_t enc_buf[65536];
     uint8_t stats_e[256] = {0};
     uint8_t stats_d[256] = {0};
-    uint8_t fb_e = 0, fb_d = 0;
+    uint8_t fb_e = 113, fb_d = 113;  /* ISO T.851 fixed-0.5 bin */
     int16_t blocks[20][64];
     uint64_t rs = 0x5a5a5a5a12345678ULL;
 
@@ -835,7 +835,7 @@ static int test_ac_block_edge_cases(void)
     uint8_t enc_buf[32768];
     uint8_t stats_e[256] = {0};
     uint8_t stats_d[256] = {0};
-    uint8_t fb_e = 0, fb_d = 0;
+    uint8_t fb_e = 113, fb_d = 113;  /* ISO T.851 fixed-0.5 bin */
     int16_t blocks[8][64] = {0};
 
     /* 0: all-zero AC (pure EOB at k=1). */
@@ -897,7 +897,7 @@ static int test_ac_block_conditioning(void)
     for (int Kx = 1; Kx <= 32; Kx += 8) {
         uint8_t stats_e[256] = {0};
         uint8_t stats_d[256] = {0};
-        uint8_t fb_e = 0, fb_d = 0;
+        uint8_t fb_e = 113, fb_d = 113;  /* ISO T.851 fixed-0.5 bin */
         int16_t blocks[10][64];
         for (int i = 0; i < 10; i++)
             fill_random_block(blocks[i], &rs, 512, 10);

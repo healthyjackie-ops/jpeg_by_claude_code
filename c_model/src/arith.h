@@ -38,6 +38,13 @@ typedef struct {
  * byte-priming per INITDEC. */
 void arith_dec_init(arith_decoder_t *d, const uint8_t *data, size_t len);
 
+/* Reset the decoder's entropy state (a/c/ct/unread_marker) without
+ * rewinding src/pos — used at RSTn boundaries where the current source
+ * cursor must persist but the arithmetic coder must re-prime. The
+ * caller is responsible for re-initialising its own statistics area.
+ * Matches libjpeg-turbo's process_restart reset for arith streams. */
+void arith_dec_reset(arith_decoder_t *d);
+
 /* Decode one binary symbol using the probability bin at *stat.
  * Updates *stat (state-index migration / MPS flip) per D.2.4-D.2.5.
  * Returns 0 or 1. Never returns a failure value — on byte exhaustion it

@@ -5,6 +5,7 @@
 #include "dequant.h"
 #include "idct.h"
 #include "chroma.h"
+#include "arith.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,6 +52,8 @@ static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
                               jpeg_decoded_t *out);
 static int decode_lossless(bitstream_t *bs, jpeg_info_t *info,
                            jpeg_decoded_t *out);
+static int decode_sof9(bitstream_t *bs, jpeg_info_t *info,
+                       jpeg_decoded_t *out);
 
 /* Phase 16b: progressive SOF2 first-scan dispatch state. Set from info before
  * entering the MCU loop; consulted by dec_blk(). Not thread-safe — jpeg_decode
@@ -90,11 +93,15 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
         return decode_lossless(&bs, &info, out);
     }
 
-    /* Phase 22a: SOF9/10/11 (arithmetic-coded) parse through the header
-     * (including DAC conditioning) but the entropy decoder is still under
-     * construction. Fail fast with UNSUP_SOF so the error surface stays
-     * consistent with pre-Phase-22 behaviour on arith inputs. */
-    if (info.sof_type == 9 || info.sof_type == 10 || info.sof_type == 11) {
+    /* Phase 22c/23b: SOF9 sequential arithmetic-coded decode path —
+     * supports gray / 4:4:4 / 4:2:0 at 8-bit in this initial landing.
+     * SOF10 (progressive arith) / SOF11 (lossless arith) still error-
+     * out here — they reuse the same Q-coder core but need the scan
+     * state machines from phases 17/25 respectively. */
+    if (info.sof_type == 9) {
+        return decode_sof9(&bs, &info, out);
+    }
+    if (info.sof_type == 10 || info.sof_type == 11) {
         out->err = JPEG_ERR_UNSUP_SOF;
         return -1;
     }
@@ -1645,6 +1652,376 @@ static int decode_lossless(bitstream_t *bs, jpeg_info_t *info,
     out->err = 0;
     return 0;
 #undef LOSSLESS_FAIL
+}
+
+/* =====================================================================
+ * Phase 22c/23b: SOF9 sequential arithmetic decode
+ *
+ * Drives the Q-coder DC-diff helper (phase 22b) + AC block helper
+ * (phase 23a) across one MCU-interleaved scan. Supports 8-bit gray /
+ * 4:4:4 / 4:2:0 in this landing — the remaining chroma modes (4:2:2,
+ * 4:4:0, 4:1:1, CMYK) are identical-shape MCU loops and will fold in
+ * once the bit-exact harness passes on the three common modes.
+ *
+ * Structure mirrors the SOF0/SOF1 baseline in jpeg_decode (same MCU
+ * layout, same padded plane strategy, same chroma upsample) so the
+ * only real substitution is block decoding and restart handling.
+ * ===================================================================== */
+
+/* Decode one 8x8 block via (DC diff + AC run/level) arithmetic coding.
+ * Returns 0 on success, -1 on corrupt stream. Writes dequantized,
+ * natural-order coefficients into `coef_out` (the caller performs IDCT).
+ */
+static int sof9_decode_block(arith_decoder_t *ad,
+                             uint8_t *dc_stats,
+                             uint8_t *ac_stats,
+                             uint8_t *fixed_bin,
+                             int dc_L, int dc_U, int ac_Kx,
+                             int *dc_context,
+                             int16_t *last_dc,
+                             const uint16_t *qtable,
+                             int16_t coef_out[64])
+{
+    int diff = 0;
+    if (arith_dec_dc_diff(ad, dc_stats, dc_context, dc_L, dc_U, &diff)) {
+        return -1;
+    }
+    /* ISO F.1.4.4.1.1: DC value accumulates mod 2^16 (signed 16-bit). */
+    int32_t dc_val = (int32_t)(*last_dc) + diff;
+    dc_val = (int16_t)(dc_val & 0xFFFF);
+    *last_dc = (int16_t)dc_val;
+
+    /* 64 coefs in natural order: DC at index 0, AC at 1..63. */
+    memset(coef_out, 0, 64 * sizeof(int16_t));
+    coef_out[0] = (int16_t)dc_val;
+
+    if (arith_dec_ac_block(ad, ac_stats, fixed_bin, ac_Kx, 1, 63, coef_out)) {
+        return -1;
+    }
+
+    /* Dequantize — same strategy as baseline: coef *= q[k]. */
+    for (int k = 0; k < 64; k++) {
+        coef_out[k] = (int16_t)((int32_t)coef_out[k] * (int32_t)qtable[k]);
+    }
+    return 0;
+}
+
+/* Scan forward in the source to consume one RSTn marker. Returns 0 on
+ * success, -1 on mismatch or truncation. Handles both the already-
+ * latched (unread_marker != 0) case and the "marker not yet seen"
+ * case — the arith renorm loop can read either just-before or just-
+ * after a marker depending on symbol-to-byte alignment. */
+static int sof9_consume_rst(arith_decoder_t *ad, uint8_t expected_rst)
+{
+    if (ad->unread_marker != 0) {
+        if (ad->unread_marker == expected_rst) {
+            ad->unread_marker = 0;
+            return 0;
+        }
+        return -1;
+    }
+    while (ad->pos < ad->len) {
+        uint8_t c = ad->src[ad->pos++];
+        if (c != 0xFF) continue;
+        while (ad->pos < ad->len && ad->src[ad->pos] == 0xFF) ad->pos++;
+        if (ad->pos >= ad->len) return -1;
+        uint8_t m = ad->src[ad->pos++];
+        if (m == 0x00) continue;             /* stuffed literal 0xFF */
+        return (m == expected_rst) ? 0 : -1;
+    }
+    return -1;
+}
+
+/* After the MCU loop, scan forward for EOI. The arith decoder may or
+ * may not have latched it in unread_marker; accept either path. */
+static int sof9_find_eoi(arith_decoder_t *ad)
+{
+    if (ad->unread_marker == MARKER_EOI) return 0;
+    if (ad->unread_marker != 0) return -1;  /* some other marker mid-stream */
+    while (ad->pos < ad->len) {
+        uint8_t c = ad->src[ad->pos++];
+        if (c != 0xFF) continue;
+        while (ad->pos < ad->len && ad->src[ad->pos] == 0xFF) ad->pos++;
+        if (ad->pos >= ad->len) return -1;
+        uint8_t m = ad->src[ad->pos++];
+        if (m == 0x00) continue;             /* stuffing — keep scanning */
+        return (m == MARKER_EOI) ? 0 : -1;
+    }
+    return -1;
+}
+
+static int decode_sof9(bitstream_t *bs, jpeg_info_t *info, jpeg_decoded_t *out)
+{
+    /* Accept only the three chroma modes wired up below — other modes
+     * error-out cleanly so the caller can surface UNSUP_SOF. */
+    int is_gray = (info->chroma_mode == CHROMA_GRAY);
+    int is_444  = (info->chroma_mode == CHROMA_444);
+    int is_420  = (info->chroma_mode == CHROMA_420);
+    if (!is_gray && !is_444 && !is_420) {
+        out->err = JPEG_ERR_UNSUP_SOF;
+        return -1;
+    }
+    if (info->precision != 8) {
+        /* SOF9 allows P=8 or 12 — 12-bit is a Wave-2 follow-up, out of
+         * scope for this phase. */
+        out->err = JPEG_ERR_UNSUP_SOF;
+        return -1;
+    }
+
+    out->precision = 8;
+    out->width  = info->width;
+    out->height = info->height;
+    uint16_t W  = info->width;
+    uint16_t H  = info->height;
+
+    uint16_t mcu_w = is_420 ? 16 : 8;
+    uint16_t mcu_h = is_420 ? 16 : 8;
+    uint16_t Wp = info->mcu_cols * mcu_w;
+    uint16_t Hp = info->mcu_rows * mcu_h;
+    uint16_t CWp_sub = is_420 ? (uint16_t)(Wp >> 1) : Wp;
+    uint16_t CHp_sub = is_420 ? (uint16_t)(Hp >> 1) : Hp;
+
+    int is_chroma_sub = is_420;
+    uint8_t *y_pad      = (uint8_t*)calloc((size_t)Wp * Hp, 1);
+    uint8_t *cb_pad_sub = is_chroma_sub ? (uint8_t*)calloc((size_t)CWp_sub * CHp_sub, 1) : NULL;
+    uint8_t *cr_pad_sub = is_chroma_sub ? (uint8_t*)calloc((size_t)CWp_sub * CHp_sub, 1) : NULL;
+    uint8_t *cb_pad     = is_gray ? NULL : (uint8_t*)calloc((size_t)Wp * Hp, 1);
+    uint8_t *cr_pad     = is_gray ? NULL : (uint8_t*)calloc((size_t)Wp * Hp, 1);
+
+    out->y_plane = (uint8_t*)calloc((size_t)W * H, 1);
+    if (!is_gray) {
+        out->cb_plane = (uint8_t*)calloc((size_t)W * H, 1);
+        out->cr_plane = (uint8_t*)calloc((size_t)W * H, 1);
+        if (is_420) {
+            out->cb_plane_420 = (uint8_t*)calloc((size_t)(W >> 1) * (H >> 1), 1);
+            out->cr_plane_420 = (uint8_t*)calloc((size_t)(W >> 1) * (H >> 1), 1);
+        }
+    }
+    int alloc_ok = y_pad && out->y_plane &&
+                   (is_gray ||
+                    (cb_pad && cr_pad && out->cb_plane && out->cr_plane &&
+                     (!is_420 ||
+                      (cb_pad_sub && cr_pad_sub &&
+                       out->cb_plane_420 && out->cr_plane_420))));
+    if (!alloc_ok) {
+        free(y_pad); free(cb_pad); free(cr_pad);
+        free(cb_pad_sub); free(cr_pad_sub);
+        out->err = (uint32_t)JPEG_ERR_INTERNAL;
+        return -1;
+    }
+
+    /* Phase 22 defaults if no DAC was seen. libjpeg: L=0, U=1, K=5. */
+    int dc_L[4], dc_U[4], ac_Kx[4];
+    for (int t = 0; t < 4; t++) {
+        dc_L[t]  = info->arith_dc_L[t];
+        int u    = info->arith_dc_U[t];
+        /* (L=0, U=0) — the only way for U < L — means "never set by DAC"
+         * because DAC validation requires U >= L. Apply the default. */
+        dc_U[t]  = (u == 0 && dc_L[t] == 0) ? 1 : u;
+        int k    = info->arith_ac_K[t];
+        ac_Kx[t] = (k == 0) ? 5 : k;           /* K=0 is invalid → unset */
+    }
+
+    /* Per-scan arith state. libjpeg allocates one DC stats area per DC
+     * table and one AC stats area per AC table; our info has 4 slots
+     * for each. Only the tables referenced by the current scan's Td/Ta
+     * entries are live, but allocating all 4 keeps the code simple.
+     *
+     * fixed_bin init = 113: ISO/T.851 "fixed 0.5" probability state. All
+     * AC sign bits route through this single bin; index 113 is the
+     * non-adapting entry in Table D.2, giving Qe=0x5a1d (~= 0.5) and
+     * self-transitions for both MPS and LPS. libjpeg-turbo:
+     *   entropy->fixed_bin[0] = 113;                         (start_pass)
+     * Initializing to 0 would pick up the adaptive state-0 probability
+     * on the first sign, producing a different (and wrong) bit stream. */
+    uint8_t dc_stats[4][JPEG_DC_STAT_BINS];
+    uint8_t ac_stats[4][256];
+    uint8_t fixed_bin = 113;
+    memset(dc_stats, 0, sizeof(dc_stats));
+    memset(ac_stats, 0, sizeof(ac_stats));
+
+    /* Per-component state — ISO F.1.4.4.1: last_dc_val wraps mod 2^16,
+     * dc_context tracks the previous-block classification. */
+    int     dc_context[JPEG_MAX_COMPONENTS] = {0};
+    int16_t last_dc[JPEG_MAX_COMPONENTS]    = {0};
+
+    /* Component-level table/qtable pointers (matches baseline shape). */
+    int Nf = is_gray ? 1 : 3;
+    int td[3] = {0}, ta[3] = {0};
+    const uint16_t *qt[3] = {0};
+    for (int c = 0; c < Nf; c++) {
+        td[c] = info->components[c].td;
+        ta[c] = info->components[c].ta;
+        qt[c] = info->qtables[info->components[c].qt_id].q;
+    }
+
+    /* Hand the remaining buffer to the arith decoder. bs->byte_pos
+     * points to the first byte of the entropy-coded segment; the
+     * decoder owns all byte-source logic from here to the next
+     * non-stuffed marker. */
+    arith_decoder_t ad;
+    arith_dec_init(&ad, bs->data + bs->byte_pos, bs->size - bs->byte_pos);
+
+    int16_t coef[64];
+    uint8_t y_blk[4][64];
+    uint8_t cb_blk[64], cr_blk[64];
+
+    uint16_t restart_cnt = 0;
+    uint8_t  next_rst    = MARKER_RST0;
+
+    for (uint16_t my = 0; my < info->mcu_rows; my++) {
+        for (uint16_t mx = 0; mx < info->mcu_cols; mx++) {
+            if (is_gray) {
+                if (sof9_decode_block(&ad, dc_stats[td[0]], ac_stats[ta[0]],
+                                      &fixed_bin, dc_L[td[0]], dc_U[td[0]],
+                                      ac_Kx[ta[0]],
+                                      &dc_context[0], &last_dc[0],
+                                      qt[0], coef)) {
+                    goto entropy_fail;
+                }
+                idct_islow(coef, y_blk[0]);
+                uint8_t *y_dst = y_pad + (size_t)(my * 8) * Wp + (mx * 8);
+                copy_block_8x8(y_blk[0], y_dst, Wp);
+            } else if (is_420) {
+                /* Y: 4 blocks per MCU, scanned 2x2 in raster order. */
+                for (int i = 0; i < 4; i++) {
+                    if (sof9_decode_block(&ad, dc_stats[td[0]], ac_stats[ta[0]],
+                                          &fixed_bin, dc_L[td[0]], dc_U[td[0]],
+                                          ac_Kx[ta[0]],
+                                          &dc_context[0], &last_dc[0],
+                                          qt[0], coef)) {
+                        goto entropy_fail;
+                    }
+                    idct_islow(coef, y_blk[i]);
+                }
+                if (sof9_decode_block(&ad, dc_stats[td[1]], ac_stats[ta[1]],
+                                      &fixed_bin, dc_L[td[1]], dc_U[td[1]],
+                                      ac_Kx[ta[1]],
+                                      &dc_context[1], &last_dc[1],
+                                      qt[1], coef)) {
+                    goto entropy_fail;
+                }
+                idct_islow(coef, cb_blk);
+
+                if (sof9_decode_block(&ad, dc_stats[td[2]], ac_stats[ta[2]],
+                                      &fixed_bin, dc_L[td[2]], dc_U[td[2]],
+                                      ac_Kx[ta[2]],
+                                      &dc_context[2], &last_dc[2],
+                                      qt[2], coef)) {
+                    goto entropy_fail;
+                }
+                idct_islow(coef, cr_blk);
+
+                uint8_t *y_dst = y_pad + (size_t)(my * 16) * Wp + (mx * 16);
+                copy_block_16x16_y(y_blk, y_dst, Wp);
+                uint8_t *cb_dst = cb_pad_sub + (size_t)(my * 8) * CWp_sub + (mx * 8);
+                uint8_t *cr_dst = cr_pad_sub + (size_t)(my * 8) * CWp_sub + (mx * 8);
+                copy_block_8x8(cb_blk, cb_dst, CWp_sub);
+                copy_block_8x8(cr_blk, cr_dst, CWp_sub);
+            } else {
+                /* 4:4:4 — Y, Cb, Cr: one 8x8 each per MCU. */
+                if (sof9_decode_block(&ad, dc_stats[td[0]], ac_stats[ta[0]],
+                                      &fixed_bin, dc_L[td[0]], dc_U[td[0]],
+                                      ac_Kx[ta[0]],
+                                      &dc_context[0], &last_dc[0],
+                                      qt[0], coef)) {
+                    goto entropy_fail;
+                }
+                idct_islow(coef, y_blk[0]);
+                if (sof9_decode_block(&ad, dc_stats[td[1]], ac_stats[ta[1]],
+                                      &fixed_bin, dc_L[td[1]], dc_U[td[1]],
+                                      ac_Kx[ta[1]],
+                                      &dc_context[1], &last_dc[1],
+                                      qt[1], coef)) {
+                    goto entropy_fail;
+                }
+                idct_islow(coef, cb_blk);
+                if (sof9_decode_block(&ad, dc_stats[td[2]], ac_stats[ta[2]],
+                                      &fixed_bin, dc_L[td[2]], dc_U[td[2]],
+                                      ac_Kx[ta[2]],
+                                      &dc_context[2], &last_dc[2],
+                                      qt[2], coef)) {
+                    goto entropy_fail;
+                }
+                idct_islow(coef, cr_blk);
+
+                uint8_t *y_dst  = y_pad  + (size_t)(my * 8) * Wp + (mx * 8);
+                uint8_t *cb_dst = cb_pad + (size_t)(my * 8) * Wp + (mx * 8);
+                uint8_t *cr_dst = cr_pad + (size_t)(my * 8) * Wp + (mx * 8);
+                copy_block_8x8(y_blk[0], y_dst,  Wp);
+                copy_block_8x8(cb_blk,   cb_dst, Wp);
+                copy_block_8x8(cr_blk,   cr_dst, Wp);
+            }
+
+            /* Phase 7: DRI restart marker handling — identical to
+             * baseline except we reset arith state in addition to
+             * DC predictors. */
+            if (info->dri != 0) {
+                restart_cnt++;
+                int is_last = (my == info->mcu_rows - 1) &&
+                              (mx == info->mcu_cols - 1);
+                if (restart_cnt == info->dri && !is_last) {
+                    if (sof9_consume_rst(&ad, next_rst)) {
+                        out->err = JPEG_ERR_BAD_MARKER;
+                        goto cleanup_fail;
+                    }
+                    arith_dec_reset(&ad);
+                    memset(dc_stats, 0, sizeof(dc_stats));
+                    memset(ac_stats, 0, sizeof(ac_stats));
+                    fixed_bin = 113;           /* T.851 fixed-0.5 bin */
+                    for (int c = 0; c < Nf; c++) {
+                        dc_context[c] = 0;
+                        last_dc[c]    = 0;
+                    }
+                    next_rst = (uint8_t)(MARKER_RST0 +
+                                         (((next_rst - MARKER_RST0) + 1) & 7));
+                    restart_cnt = 0;
+                }
+            }
+        }
+    }
+
+    /* Chroma upsample + crop — same strategy as baseline. */
+    if (is_420) {
+        chroma_upsample_nn(cb_pad_sub, cb_pad, Wp, Hp);
+        chroma_upsample_nn(cr_pad_sub, cr_pad, Wp, Hp);
+    }
+
+    for (uint16_t r = 0; r < H; r++) {
+        memcpy(out->y_plane + (size_t)r * W, y_pad + (size_t)r * Wp, W);
+        if (!is_gray) {
+            memcpy(out->cb_plane + (size_t)r * W, cb_pad + (size_t)r * Wp, W);
+            memcpy(out->cr_plane + (size_t)r * W, cr_pad + (size_t)r * Wp, W);
+        }
+    }
+    if (is_420) {
+        for (uint16_t r = 0; r < (H >> 1); r++) {
+            memcpy(out->cb_plane_420 + (size_t)r * (W >> 1),
+                   cb_pad_sub + (size_t)r * CWp_sub, (W >> 1));
+            memcpy(out->cr_plane_420 + (size_t)r * (W >> 1),
+                   cr_pad_sub + (size_t)r * CWp_sub, (W >> 1));
+        }
+    }
+
+    free(y_pad); free(cb_pad); free(cr_pad);
+    free(cb_pad_sub); free(cr_pad_sub);
+
+    /* Final framing: arith decoder owns bytes up to the first non-
+     * stuffed 0xFF marker; after the last MCU that's EOI. */
+    if (sof9_find_eoi(&ad)) {
+        out->err = JPEG_ERR_STREAM_TRUNC;
+        return -1;
+    }
+
+    out->err = 0;
+    return 0;
+
+entropy_fail:
+    out->err = JPEG_ERR_BAD_HUFFMAN;   /* generic "bad entropy stream" */
+cleanup_fail:
+    free(y_pad); free(cb_pad); free(cr_pad);
+    free(cb_pad_sub); free(cr_pad_sub);
+    return -1;
 }
 
 void jpeg_free(jpeg_decoded_t *out) {
