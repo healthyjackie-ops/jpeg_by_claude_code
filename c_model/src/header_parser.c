@@ -247,12 +247,13 @@ static int parse_sof1(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
     return parse_sof_common(bs, info, err, 8, 12);
 }
 
-/* Phase 16b: SOF2 progressive. P=8 only for now (progressive + P=12 is rare
- * and out of Phase 16 scope). Component layout / chroma rules identical to
- * SOF0; scan-level progressive parameters are validated in parse_sos. */
+/* Phase 16b: SOF2 progressive. P=8 originally; Phase 13b-prog widens the
+ * header parser to accept P=12 so decode_progressive can exercise the
+ * 12-bit drain path. Component layout / chroma rules identical to SOF0;
+ * scan-level progressive parameters are validated in parse_sos. */
 static int parse_sof2(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
     info->sof_type = 2;
-    return parse_sof_common(bs, info, err, 8, 8);
+    return parse_sof_common(bs, info, err, 8, 12);
 }
 
 /* Phase 25a/27: SOF3 lossless. Component layout identical to SOF0/1/2. Precision

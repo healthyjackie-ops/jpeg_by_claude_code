@@ -112,24 +112,25 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
         return -1;
     }
 
-    /* Phase 13a.3: P=12 branches to a dedicated 16-bit decode path supporting
-       grayscale / 4:4:4 / 4:2:0. Other chroma modes with P=12 (CMYK, 4:2:2,
-       4:4:0, 4:1:1) are out of scope for Phase 13. SOF3 was already handled
-       above, so this is strictly SOF0/1 P=12 (and SOF2 P=12 is currently
-       unreachable — decode_progressive asserts P=8 internally). */
-    if (info.precision == 12) {
-        return decode_p12(&bs, &info, out);
-    }
-
     /* Phase 17a/17c: SOF2 handled via a dedicated multi-scan decoder that
      * supports DC + spectral-selection AC scans (Ah=0) and refinement scans
      * (Ah>0, Phase 18a). DRI>0 is accepted (Phase 17c/18c) and enforced inside
      * each scan's MCU/block loop. The legacy single-scan DC-only path (Phase
-     * 16b) is a degenerate sub-case and remains covered by the same routine. */
+     * 16b) is a degenerate sub-case and remains covered by the same routine.
+     * Phase 13b-prog: decode_progressive itself handles P=12 for gray/444/420,
+     * so the SOF2 dispatch comes before the generic P=12 fallthrough below. */
     g_dc_only = 0;
     g_al      = 0;
     if (info.sof_type == 2) {
         return decode_progressive(&bs, &info, out);
+    }
+
+    /* Phase 13a.3: P=12 branches to a dedicated 16-bit decode path supporting
+       grayscale / 4:4:4 / 4:2:0 for SOF0/SOF1. SOF2 P=12 routed above via
+       decode_progressive. SOF3 lossless already handled further up. Other
+       chroma modes with P=12 (CMYK, 4:2:2, 4:4:0, 4:1:1) remain out of scope. */
+    if (info.precision == 12) {
+        return decode_p12(&bs, &info, out);
     }
 
     out->width  = info.width;
@@ -997,8 +998,14 @@ static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
         out->err = JPEG_ERR_UNSUP_CHROMA;
         return -1;
     }
-    if (info->precision != 8) {
-        /* SOF2 + P=12 out of scope */
+    /* Phase 13b-prog: extend P=12 to SOF2 progressive Huffman. First cut is
+     * gray / 4:4:4 / 4:2:0 only (matching Phase 13a baseline scope). Extended
+     * chroma 4:2:2 / 4:4:0 / 4:1:1 and CMYK at P=12 remain future work. */
+    if (info->precision != 8 && info->precision != 12) {
+        out->err = JPEG_ERR_UNSUP_PREC;
+        return -1;
+    }
+    if (info->precision == 12 && !(is_gray || is_444 || is_420)) {
         out->err = JPEG_ERR_UNSUP_PREC;
         return -1;
     }
@@ -1470,6 +1477,116 @@ static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
     /* -------------------------------------------------------------------- */
     /* Drain: dequant + IDCT per block, place into pad planes              */
     /* -------------------------------------------------------------------- */
+
+    /* Phase 13b-prog: P=12 drain. Scan-time coef_buf (int16) already works
+     * for P=12 (libjpeg-turbo uses int16 JCOEF throughout, including
+     * 12-bit mode). At drain we need wider IDCT (int32 dq + uint16 block
+     * output) and uint16 pads/planes. Gray/4:4:4/4:2:0 only — guarded
+     * at the top of the function. */
+    if (info->precision == 12) {
+        out->precision = 12;
+        size_t y_samples  = (size_t)Wp * Hp;
+        size_t cb_samples_sub = is_420 ? (size_t)CWp_sub * CHp_sub : 0;
+        uint16_t *y_pad16      = (uint16_t*)calloc(y_samples, sizeof(uint16_t));
+        uint16_t *cb_pad16_sub = is_420 ? (uint16_t*)calloc(cb_samples_sub, sizeof(uint16_t)) : NULL;
+        uint16_t *cr_pad16_sub = is_420 ? (uint16_t*)calloc(cb_samples_sub, sizeof(uint16_t)) : NULL;
+        uint16_t *cb_pad16     = is_gray ? NULL : (uint16_t*)calloc(y_samples, sizeof(uint16_t));
+        uint16_t *cr_pad16     = is_gray ? NULL : (uint16_t*)calloc(y_samples, sizeof(uint16_t));
+
+        out->y_plane16 = (uint16_t*)calloc((size_t)W * H, sizeof(uint16_t));
+        if (!is_gray) {
+            out->cb_plane16 = (uint16_t*)calloc((size_t)W * H, sizeof(uint16_t));
+            out->cr_plane16 = (uint16_t*)calloc((size_t)W * H, sizeof(uint16_t));
+            if (is_420) {
+                out->cb_plane16_420 = (uint16_t*)calloc((size_t)(W >> 1) * (H >> 1), sizeof(uint16_t));
+                out->cr_plane16_420 = (uint16_t*)calloc((size_t)(W >> 1) * (H >> 1), sizeof(uint16_t));
+            }
+        }
+        int alloc_ok16 = y_pad16 && out->y_plane16 &&
+                         (is_gray ||
+                          (cb_pad16 && cr_pad16 && out->cb_plane16 && out->cr_plane16 &&
+                           (!is_420 || (cb_pad16_sub && cr_pad16_sub &&
+                                        out->cb_plane16_420 && out->cr_plane16_420))));
+        if (!alloc_ok16) {
+            free(y_pad16); free(cb_pad16_sub); free(cr_pad16_sub);
+            free(cb_pad16); free(cr_pad16);
+            out->err = (uint32_t)JPEG_ERR_INTERNAL; goto fail;
+        }
+
+        int32_t dq[64];
+        uint16_t blk_u16[64];
+        for (int c = 0; c < num_comps; c++) {
+            const uint16_t *qt = info->qtables[info->components[c].qt_id].q;
+            uint32_t blk_rows = cg[c].blk_rows;
+            uint32_t blk_cols = cg[c].blk_cols;
+            uint32_t base = cg[c].base;
+            uint16_t *pad;
+            uint16_t pad_stride;
+            if (c == 0) {
+                pad = y_pad16;
+                pad_stride = Wp;
+            } else if (is_420) {
+                pad = (c == 1) ? cb_pad16_sub : cr_pad16_sub;
+                pad_stride = CWp_sub;
+            } else { /* 4:4:4 */
+                pad = (c == 1) ? cb_pad16 : cr_pad16;
+                pad_stride = Wp;
+            }
+            for (uint32_t by = 0; by < blk_rows; by++) {
+                for (uint32_t bx = 0; bx < blk_cols; bx++) {
+                    uint32_t blk = base + by * blk_cols + bx;
+                    dequant_block_i32(coef_buf[blk], qt, dq);
+                    idct_islow_p12(dq, blk_u16);
+                    uint16_t *dst = pad + ((size_t)by * 8u) * pad_stride + (bx * 8u);
+                    copy_block_8x8_u16(blk_u16, dst, pad_stride);
+                }
+            }
+        }
+        free(coef_buf);
+
+        /* 4:2:0 chroma upsample — uint16 nearest-neighbor 2x 2x. */
+        if (is_420) {
+            for (uint16_t r = 0; r < Hp; r++) {
+                const uint16_t *cb_src = cb_pad16_sub + (size_t)(r >> 1) * CWp_sub;
+                const uint16_t *cr_src = cr_pad16_sub + (size_t)(r >> 1) * CWp_sub;
+                uint16_t *cb_dst = cb_pad16 + (size_t)r * Wp;
+                uint16_t *cr_dst = cr_pad16 + (size_t)r * Wp;
+                for (uint16_t c = 0; c < CWp_sub; c++) {
+                    cb_dst[2*c    ] = cb_src[c];
+                    cb_dst[2*c + 1] = cb_src[c];
+                    cr_dst[2*c    ] = cr_src[c];
+                    cr_dst[2*c + 1] = cr_src[c];
+                }
+            }
+        }
+
+        /* Crop padded → output planes (16-bit). */
+        for (uint16_t r = 0; r < H; r++) {
+            memcpy(out->y_plane16 + (size_t)r * W,
+                   y_pad16 + (size_t)r * Wp, W * sizeof(uint16_t));
+            if (!is_gray) {
+                memcpy(out->cb_plane16 + (size_t)r * W,
+                       cb_pad16 + (size_t)r * Wp, W * sizeof(uint16_t));
+                memcpy(out->cr_plane16 + (size_t)r * W,
+                       cr_pad16 + (size_t)r * Wp, W * sizeof(uint16_t));
+            }
+        }
+        if (is_420) {
+            for (uint16_t r = 0; r < (H >> 1); r++) {
+                memcpy(out->cb_plane16_420 + (size_t)r * (W >> 1),
+                       cb_pad16_sub + (size_t)r * CWp_sub,
+                       (size_t)(W >> 1) * sizeof(uint16_t));
+                memcpy(out->cr_plane16_420 + (size_t)r * (W >> 1),
+                       cr_pad16_sub + (size_t)r * CWp_sub,
+                       (size_t)(W >> 1) * sizeof(uint16_t));
+            }
+        }
+
+        free(y_pad16); free(cb_pad16_sub); free(cr_pad16_sub);
+        free(cb_pad16); free(cr_pad16);
+        out->err = 0;
+        return 0;
+    }
 
     int is_chroma_sub = (is_420 || is_422 || is_440 || is_411);
     uint8_t *y_pad      = (uint8_t*)calloc((size_t)Wp * Hp, 1);

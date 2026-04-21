@@ -412,9 +412,12 @@ chroma layouts — matching arith parity reached in Phase 24c. Still
 deferred:
 
 - **CMYK (Nf=4)** in any SOF2/SOF9/SOF10 path → **closed in Phase 12c** ✅
-- **P=12** in any SOF2/SOF9/SOF10 path (decode_progressive asserts P=8)
+- **P=12** in SOF2 gray/444/420 → **closed in Phase 13b-prog** ✅
+- **P=12** in SOF2 extended chroma (4:2:2 / 4:4:0 / 4:1:1) — future
+- **P=12** in SOF9 sequential arith / SOF10 progressive arith — future
+- **P=12** + CMYK in any entropy-coded DCT path — future
 
-Both are unblockable future extensions; libjpeg-turbo supports them so
+All are unblockable future extensions; libjpeg-turbo supports them so
 bit-exact reference decodes are available whenever the scope pickup lands.
 
 ## 10. Phase 12c — CMYK (Nf=4) across SOF2 / SOF9 / SOF10
@@ -438,3 +441,35 @@ Vectors: `tools/gen_phase12c_prog.py` (PIL `progressive=True` → SOF2)
 and `tools/gen_phase12c_arith.py` (PIL baseline → `jpegtran -arithmetic
 [-progressive]` for SOF9/SOF10); Pillow's `arithmetic=True` kwarg is a
 no-op in its libjpeg binding, which forced the jpegtran transcode path.
+
+## 11. Phase 13b-prog — P=12 in SOF2 progressive Huffman
+
+**Status**: ✅ **COMPLETE** — 20/20 phase13b_prog bit-exact, 1515/1515 aggregate (2026-04-21).
+**Detail spec**: [`spec_phase13b_prog.md`](spec_phase13b_prog.md).
+
+Closes the first of the P=12 gaps identified in §9.4: Phase 13a covered
+SOF0/SOF1 + P=12 via `decode_p12`; Phase 13b-prog extends the same
+gray/444/420 subset to SOF2 via a uint16 early-return drain branch
+inside `decode_progressive`.
+
+Because libjpeg-turbo's `JCOEF` is `int16` at both P=8 and P=12, the
+scan-time pipeline (Huffman decode + RLE + zigzag + coef accumulation +
+MCU interleave + restart reset + SOS parsing) is precision-agnostic and
+required zero changes. The entire P=12 delta is confined to:
+
+1. `parse_sof2` accept gate widened to P∈{8,12}
+2. `decode_progressive` precision gate + ~95-line uint16 drain branch
+   (dequant → `idct_islow_p12` → uint16 pads → NN 2×2 upsample → crop)
+3. `jpeg_decode` dispatch reordered so `sof_type == 2` routes to
+   `decode_progressive` *before* the generic P=12 fallthrough to
+   `decode_p12` (previously SOF2 + P=12 was misrouted to `decode_p12`,
+   producing `BAD_HUFFMAN`).
+
+The uint16 drain is an early-return — the P=8 drain path is byte-for-byte
+untouched, eliminating P=8 regression risk. First-batch 20/20 bit-exact.
+
+Vectors: `tools/gen_phase13b_prog.py` uses `cjpeg -precision 12
+-progressive -quality N -optimize` on 16-bit Netpbm inputs (PGM/PPM
+maxval=65535). cjpeg's default progressive script (no `-scans`) emits
+DC-first + AC-first + AC-refine + DC-refine in a single encode — one
+vector exercises every scan type, same recipe as Phase 17d.
