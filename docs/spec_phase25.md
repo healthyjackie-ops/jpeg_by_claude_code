@@ -1,6 +1,6 @@
 # Phase 25 — SOF3 Lossless（ISO/IEC 10918-1 Annex H）
 
-**Status**: 25a ✅ C model 完成；25b/25c 规划中；Phase 26（RTL）后续。
+**Status**: 25a ✅ / 25b ✅ / 25c ✅ C model 完成；Phase 26（RTL）、Phase 27（P ∈ {2..16}）后续。
 **Upstream**: Phase 18c ✅（progressive + DRI），Phase 13 ✅（12-bit precision piping）
 **Downstream**: Phase 26（lossless RTL），Phase 27（P=2..16），Phase 28（SOF11 lossless-arith）
 
@@ -202,7 +202,95 @@ static int libjpeg_decode_lossless(...);                   // gray-only, JCS_GRA
 
 ---
 
-## 5. 25b 完工记录（Nf=3 RGB + Pt>0）
+## 5. 25c 完工记录（DRI restart markers）
+
+**提交**：<hash-to-fill-in>
+**日期**：2026-04-21
+
+### 5.1 范围与扩展
+
+Phase 25c 在 25a/25b 基础上补齐 **DRI 重启标记**：
+- 任意 `DRI > 0`，限定为 **MCU 行的整数倍**（对齐 libjpeg-turbo 解码约束）
+- 所有组合仍保持 Phase 25b 覆盖：Nf ∈ {1,3}，Ps ∈ {1..7}，Pt ∈ {0..2} 实测
+- 越界 DRI（非行整倍数）→ 返回 `JPEG_ERR_UNSUP_SOF`
+
+### 5.2 ISO vs libjpeg-turbo 语义（踩坑核心）
+
+**教科书错觉**：ISO H.1.2.2 只说“每个 restart interval 的第一个 sample 用 `2^(P-Pt-1)`”。
+最初的实现按字面理解写成 per-sample `after_restart[c]` 标志——**这是错的**，仅 Ps=1 碰巧通过。
+
+**libjpeg-turbo 真实语义**（`src/jdlossls.c` + `src/jddiffct.c`）：
+1. 有两套 predictor 回调：
+   - `jpeg_undifference_first_row`：第一列 = `2^(P-Pt-1)`，其他列 = **Ra**（忽略 Ps）
+   - `jpeg_undifference<Ps>`：第一列 = **Rb**（忽略 Ps），其他列按 Ps 查表
+2. `start_pass_lossless` 将 `predict_undifference[ci]` 设为 `first_row`；跑完一行后 `first_row` 自身把回调替换成 `undifference<Ps>`。
+3. `process_restart` 调用 `start_pass_lossless`，等价于把 `predict_undifference[ci]` 重新指回 `first_row`——**整个 RST 之后的下一整行都用 1-D Ra 预测**。
+4. `start_input_pass` 强制 `restart_interval % MCUs_per_row == 0`，保证 RST 必然落在行边界。
+
+### 5.3 修复实现（`src/decoder.c`）
+
+- 放弃 per-sample `after_restart[c]`，改用 per-row `first_row_mode[c]`：
+  - 初始全 1
+  - 每行末：若本行结尾处命中 RST，`first_row_mode[c] = 1`；否则置 0
+- predictor 分支：
+  ```c
+  if (first_row_mode[c]) {
+      Px = (x == 0) ? initial_pred : cur[x-1];   // Ra
+  } else if (x == 0) {
+      Px = prev[0];                              // Rb（无论 Ps）
+  } else {
+      /* Ps 查表：Ra / Rb / Rc / Ra+Rb-Rc / ... / (Ra+Rb)>>1 */
+  }
+  ```
+- MCU 末尾：若 `dri != 0 && mcu_count == dri && mcu_idx < total_mcus`，调用 `prog_handle_restart` + 复位 `mcu_count` + 标记 `rst_at_row_end`
+- 入口 guard：`info->dri % W != 0` → `JPEG_ERR_UNSUP_SOF`（W 即 MCUs_per_row，在 Hi=Vi=1 前提下）
+
+### 5.4 调试踪迹
+
+1. 初版 DRI 修复只过 Ps=1，其余全挂 → 怀疑 Huffman。
+2. 实测 gray Ps=2+DRI=2 过，gray Ps=4+DRI=2 挂，RGB 三种均挂。
+3. 发现 gray 测试挂的唯一是 Ps=4（Ra+Rb-Rc），而 RGB 挂 Ps=2/4/7——“梯度图像上 Ra≈Rb”的巧合导致 gray Ps=2 误过。
+4. 克隆 libjpeg-turbo 源码扫读 `jdlossls.c`，发现 `jpeg_undifference_first_row` 在整行上持续使用 Ra，立刻锁定语义偏差。
+5. 换成 `first_row_mode[c]` 后 16/16 scratch 全过，143/143 phase25c 正式向量全过。
+
+### 5.5 测试矩阵（`verification/vectors/phase25c/`）
+
+143 张向量（`tools/gen_phase25c.py`）：
+
+| Grid | 规模 | 覆盖 |
+|------|------|------|
+| A: 7 predictors × 4 DRI × 2 pattern × 2 mode | 32×32 | gray + RGB × (grad/check) × Ps 1..7 × RR ∈ {1,2,4,8} |
+| B: noise ptr × 7 predictors | 64×48 | gray+RGB × noise × Ps 1..7，RR=4 |
+| C: Pt ∈ {1,2} × 代表 Ps × gray/RGB | 48×48 | Ps ∈ {1,4,7}，RR=4 |
+| D: 每行都有 RST 的 stress | 97×73 | RGB noise × Ps {1,2,4,5,7}，RR=1 |
+
+### 5.6 回归汇总（Phase 25c 验收）
+
+| 套件 | 通过/总 |
+|------|---------|
+| phase25c (new) | 143 / 143 |
+| phase25b | 44 / 44 |
+| phase25 | 28 / 28 |
+| phase_prog_dri | 20 / 20 |
+| phase18 | 17 / 17 |
+| phase17 | 16 / 16 |
+| phase16 | 14 / 14 |
+| phase14 | 8 / 8 |
+| phase13 | 20 / 20 |
+| phase12 | 15 / 15 |
+| phase11a/b | 30 / 30 |
+| phase10 | 15 / 15 |
+| phase09 | 15 / 15 |
+| phase08 | 15 / 15 |
+| phase07 | 20 / 20 |
+| phase06 | 20 / 20 |
+| **合计** | **440 / 440** |
+
+单元测试全通，跨所有 Wave-1/2/3 管线无退步。
+
+---
+
+## 6. 25b 完工记录（Nf=3 RGB + Pt>0）
 
 **提交**：<hash-to-fill-in>
 **日期**：2026-04-21
@@ -270,7 +358,7 @@ Phase 25b 在 25a 基础上扩展：
 
 ---
 
-## 6. 25a 完工记录
+## 7. 25a 完工记录
 
 **提交**：<hash-to-fill-in>
 **日期**：2026-04-21

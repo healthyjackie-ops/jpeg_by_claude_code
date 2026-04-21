@@ -1392,11 +1392,7 @@ static int decode_lossless(bitstream_t *bs, jpeg_info_t *info,
         out->err = JPEG_ERR_UNSUP_PREC;
         return -1;
     }
-    if (info->dri != 0) {
-        /* Phase 25c will add RSTn handling. */
-        out->err = JPEG_ERR_UNSUP_SOF;
-        return -1;
-    }
+    /* DRI is handled inline (Phase 25c). */
 
     /* Nf=3 RGB must use the 4:4:4-shaped component layout. */
     int is_gray = (info->num_components == 1);
@@ -1495,6 +1491,51 @@ static int decode_lossless(bitstream_t *bs, jpeg_info_t *info,
     int32_t mask = (int32_t)(((uint32_t)1u << (P - Pt)) - 1u);   /* 0xFF for P=8/Pt=0 */
     int32_t initial_pred = (int32_t)1 << (P - Pt - 1);
 
+    /* Phase 25c: DRI state.
+     *
+     * libjpeg-turbo's lossless implementation (src/jdlossls.c) splits the
+     * per-component predictor into two phases driven by a function pointer:
+     *
+     *   (a) jpeg_undifference_first_row — applied to the FIRST row of the
+     *       scan, and again to the first row immediately after each RSTn.
+     *       First column uses x = 2^(P-Pt-1); all other columns use Ra
+     *       (horizontal predictor 1), REGARDLESS of the scan header Ps.
+     *
+     *   (b) jpeg_undifference<Ps> — applied to every subsequent row. First
+     *       column uses Rb (vertical predictor 2), REGARDLESS of Ps; other
+     *       columns use the Ps formula.
+     *
+     * After each RST the function pointer is reset back to (a) via
+     * start_pass_lossless (see jddiffct.c:process_restart), so the NEXT
+     * ENTIRE ROW after a restart is treated as a "first row" — NOT just
+     * the first sample. libjpeg-turbo additionally enforces
+     *   (restart_interval % MCUs_per_row) == 0
+     * (see jddiffct.c:start_input_pass), which makes every RST land on a
+     * row boundary. We match that constraint here.
+     *
+     * State:
+     *   - mcu_count counts MCUs within the current restart interval. For
+     *     Nf=1 gray / Nf=3 RGB interleaved (Hi=Vi=1) MCU == 1 pixel, so
+     *     MCUs_per_row == W.
+     *   - first_row_mode[c] = 1 means "this row (or the start of it) is the
+     *     first row of a new restart interval; use 1-D horizontal predictor".
+     *   - Set to 1 at scan start and again at the end of every RST-terminated
+     *     row. Cleared at row end otherwise.
+     */
+    uint32_t mcus_per_row = (uint32_t)W;   /* Hi=Vi=1 for all comps */
+    if (info->dri != 0 && (info->dri % mcus_per_row) != 0) {
+        /* ISO allows mid-row restarts but libjpeg-turbo does not; matching
+         * that is required for bit-exact parity on cjpeg-generated files. */
+        out->err = JPEG_ERR_UNSUP_SOF;
+        for (int k = 0; k < Nf; k++) free(int_scratch[k]);
+        return -1;
+    }
+
+    uint32_t mcu_count = 0;
+    uint8_t first_row_mode[3] = { 1, 1, 1 };
+    uint32_t total_mcus = (uint32_t)W * (uint32_t)H;  /* Ns==Nf in scope */
+
+    uint32_t mcu_idx = 0;
     for (uint16_t y = 0; y < H; y++) {
         uint8_t *row_c[3];
         const uint8_t *prev_c[3];
@@ -1502,6 +1543,7 @@ static int decode_lossless(bitstream_t *bs, jpeg_info_t *info,
             row_c[c]  = int_planes[c] + (size_t)y * W;
             prev_c[c] = (y > 0) ? (int_planes[c] + (size_t)(y - 1) * W) : NULL;
         }
+        uint8_t rst_at_row_end = 0;
         for (uint16_t x = 0; x < W; x++) {
             /* For each (y, x) decode one sample per component, in scan-comp
              * order. For Nf=3 interleaved scan, that's R, G, B sequentially. */
@@ -1511,12 +1553,14 @@ static int decode_lossless(bitstream_t *bs, jpeg_info_t *info,
                 const uint8_t *prev = prev_c[c];
 
                 int32_t Px;
-                if (y == 0 && x == 0) {
-                    Px = initial_pred;
-                } else if (y == 0) {
-                    Px = (int32_t)cur[x - 1];              /* Ra */
+                if (first_row_mode[c]) {
+                    /* 1-D horizontal predictor for this entire row. */
+                    if (x == 0) Px = initial_pred;
+                    else        Px = (int32_t)cur[x - 1];   /* Ra */
                 } else if (x == 0) {
-                    Px = (int32_t)prev[0];                 /* Rb */
+                    /* First column of a non-first row: always Rb, regardless
+                     * of Ps (matches libjpeg INITIAL_PREDICTOR2 = prev_row[0]). */
+                    Px = (int32_t)prev[0];
                 } else {
                     int32_t Ra = (int32_t)cur[x - 1];
                     int32_t Rb = (int32_t)prev[x];
@@ -1544,7 +1588,26 @@ static int decode_lossless(bitstream_t *bs, jpeg_info_t *info,
                 int32_t sample = (Px + diff) & mask;
                 cur[x] = (uint8_t)sample;
             }
+
+            /* End of one MCU (all scan components at (y,x)). Apply DRI.
+             * Because DRI is a multiple of mcus_per_row, RST only fires at
+             * end-of-row (x == W-1) if at all. */
+            mcu_idx++;
+            mcu_count++;
+            if (info->dri != 0 && mcu_count == info->dri && mcu_idx < total_mcus) {
+                if (prog_handle_restart(bs, info, Nf, NULL)) {
+                    out->err = JPEG_ERR_BAD_MARKER;
+                    for (int k = 0; k < Nf; k++) free(int_scratch[k]);
+                    return -1;
+                }
+                mcu_count = 0;
+                rst_at_row_end = 1;   /* → next row is "first row" again */
+            }
         }
+        /* Row transition: next row is "first row" iff a RST just ended this
+         * row; otherwise it's a normal row using Ps. */
+        uint8_t next_mode = rst_at_row_end ? 1 : 0;
+        for (int c = 0; c < Nf; c++) first_row_mode[c] = next_mode;
     }
 
     /* Post-process: shift-left by Pt to produce output samples. For Pt=0
