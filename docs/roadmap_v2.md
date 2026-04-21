@@ -57,7 +57,7 @@
 | **23a** ✅ | [AC arith block helper — C model](spec_phase22.md) | 1d | `arith_dec_ac_block` 3/3 round-trip tests bit-exact（20 varied blocks + 8 edge blocks + Kx∈{1,9,17,25} sweep） |
 | **22c / 23b** ✅ | [SOF9 sequential arith end-to-end — C model](spec_phase22.md) | 1d | 18/18 phase22 向量 bit-exact vs libjpeg-turbo（gray + 4:4:4 + 4:2:0，8x8..128x96，q 50-80，DRI 0/4，含非 16 对齐 17x13），phase06-27 + phase_prog_dri 零退步（726/726） |
 | **23c** | [SOF9 RTL integration](spec_phase23.md) | 5d | RTL arith DC+AC 通路，bit-exact 回归 |
-| **24a** ✅ | [SOF10 progressive arith — C model](spec_phase24.md) | 1d | 18/18 phase24 向量 bit-exact vs libjpeg-turbo（gray + 4:4:4 + 4:2:0，8x8..128x96，q 50-80，DRI 0/4，含非 16 对齐 17x13，4 scan types：DC-first / AC-first / AC-refine / DC-refine），phase06-27 + phase_prog_dri + phase22 零退步（1186/1186） |
+| **24a** ✅ | [SOF10 progressive arith — C model](spec_phase24.md) | 1d | 33/33 phase24 向量 bit-exact vs libjpeg-turbo（gray + 4:4:4 + 4:2:0，8x8..320x200，q 30-90，DRI ∈ {0,1,4,8,16}，含非 16 对齐 17x13，4 scan types：DC-first / AC-first / AC-refine / DC-refine），phase06-27 + phase_prog_dri + phase22 零退步（1201/1201） |
 | **24b** | [SOF10 RTL](spec_phase24.md) | 5d | progressive coef buffer × arith |
 
 ### Wave 5 — Lossless
@@ -69,7 +69,7 @@
 | **25c** ✅ | [SOF3 + DRI — C model](spec_phase25.md) | 1d | 143/143 phase25c 向量 bit-exact（gray/RGB × Ps 1-7 × Pt 0-2 × DRI 1/2/4/8 rows），phase06-25b 零退步 |
 | **26** | [Lossless Huffman (1–16 sizes) — RTL](spec_phase26.md) | 2d | RTL lossless path |
 | **27** ✅ | [Lossless 2–16 bit precision — C model](spec_phase27.md) | 1d | 334/334 phase27 向量 bit-exact（P∈{2..7, 9..16} × Ps 1-7 × Pt 0-2 × gray/RGB × DRI 0/2rows），phase06-25c 零退步 |
-| **28** | [SOF11 (lossless + arith)](spec_phase28.md) | 3d | SOF11 |
+| **28** ⚠️ blocked | [SOF11 (lossless + arith)](spec_phase28.md) | 3d | libjpeg-turbo 3.1.3 无 SOF11 支持（encoder `cjpeg -lossless -arith` → "Requested feature was omitted at compile time"；decoder jdmaster `ERREXIT(JERR_ARITH_NOTIMPL)`）。需港 libjpeg-9 的 jcarith/jdarith lossless 路径或构建自回归 reference。 |
 
 ### Wave 6 — Hierarchical
 

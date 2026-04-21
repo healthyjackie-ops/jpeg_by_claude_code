@@ -125,6 +125,12 @@ def main() -> int:
         ("gray", "grad",  17,  13,  80, 0),    # non-MCU-aligned edge
         ("gray", "noise", 100, 75,  50, 0),
         ("gray", "grad",  128, 96,  70, 4),    # DRI=4 MCUs
+        # Phase 24a hardening: larger sizes, more DRI variants, patterns
+        ("gray", "noise", 256, 256, 90, 0),
+        ("gray", "check", 200, 150, 30, 0),    # low quality stresses many-EOB
+        ("gray", "grad",  320, 200, 75, 1),    # DRI=1 (restart per MCU)
+        ("gray", "noise", 160, 120, 85, 8),    # DRI=8
+        ("gray", "noise", 128, 96,  60, 16),   # DRI=16
     ]
     cases.extend(gray_cases)
 
@@ -136,6 +142,12 @@ def main() -> int:
         ("444", "grad",  17,  13,  80, 0),    # non-MCU-aligned
         ("444", "grad",  100, 75,  50, 0),
         ("444", "noise", 128, 96,  70, 4),    # DRI=4 MCUs
+        # Phase 24a hardening
+        ("444", "noise", 256, 256, 90, 0),
+        ("444", "check", 200, 150, 30, 0),
+        ("444", "grad",  320, 200, 75, 1),    # DRI=1 (restart per MCU)
+        ("444", "noise", 160, 120, 85, 8),
+        ("444", "noise", 128, 96,  60, 16),
     ]
     cases.extend(c444_cases)
 
@@ -147,6 +159,12 @@ def main() -> int:
         ("420", "grad",  17,  13,  80, 0),    # non-MCU-aligned
         ("420", "grad",  100, 75,  50, 0),
         ("420", "noise", 128, 96,  70, 4),    # DRI=4 MCUs
+        # Phase 24a hardening
+        ("420", "noise", 256, 256, 90, 0),
+        ("420", "check", 200, 150, 30, 0),
+        ("420", "grad",  320, 200, 75, 1),    # DRI=1 (restart per MCU)
+        ("420", "noise", 160, 120, 85, 8),
+        ("420", "noise", 128, 96,  60, 16),
     ]
     cases.extend(c420_cases)
 
