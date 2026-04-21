@@ -29,6 +29,10 @@ typedef struct {
     uint16_t *cb_plane16_420;  /* sub-res chroma (W/2) × (H/2) */
     uint16_t *cr_plane16_420;
     uint8_t  precision;      /* 8 or 12 */
+    /* Phase 25b: SOF3 lossless 3-component output uses y_plane/cb_plane/
+       cr_plane as R/G/B storage (not YCbCr). golden_compare and downstream
+       consumers must respect this flag and skip YCbCr→RGB conversion. */
+    uint8_t  is_rgb_lossless;
     uint32_t err;
 } jpeg_decoded_t;
 

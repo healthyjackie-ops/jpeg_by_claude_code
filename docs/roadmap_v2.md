@@ -62,7 +62,7 @@
 | Phase | Spec | 时长 | 验收 |
 |---|---|---|---|
 | **25a** ✅ | [SOF3 gray P=8 Pt=0 — C model](spec_phase25.md) | 1d | 28/28 phase25 向量 bit-exact（Ps 1-7 × grad/check/noise × 32/48/73/97/128/192），phase06-18 + phase_prog_dri 零退步 |
-| **25b** | [SOF3 multi-comp + Pt>0 — C model](spec_phase25.md) | 2d | Nf∈{1,2,3,4} lossless，Pt∈{0..15} |
+| **25b** ✅ | [SOF3 Nf=3 RGB + Pt>0 — C model](spec_phase25.md) | 1d | 44/44 phase25b 向量 bit-exact（3-comp RGB interleaved + Nf=1 gray + Pt ∈ {0..4}），phase06-25a 零退步 |
 | **25c** | [SOF3 + DRI — C model](spec_phase25.md) | 1d | lossless restart markers |
 | **26** | [Lossless Huffman (1–16 sizes) — RTL](spec_phase26.md) | 2d | RTL lossless path |
 | **27** | [Lossless 2–16 bit precision](spec_phase27.md) | 3d | SOF3 P∈{2..16} |

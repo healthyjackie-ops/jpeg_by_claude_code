@@ -202,7 +202,75 @@ static int libjpeg_decode_lossless(...);                   // gray-only, JCS_GRA
 
 ---
 
-## 5. 25a 完工记录
+## 5. 25b 完工记录（Nf=3 RGB + Pt>0）
+
+**提交**：<hash-to-fill-in>
+**日期**：2026-04-21
+
+### 5.1 范围与扩展
+
+Phase 25b 在 25a 基础上扩展：
+- **Nf = 3 RGB interleaved scan**（Hi=Vi=1 所有分量，与 cjpeg 默认一致）
+- **Pt > 0 point transform**（0..4 实际测过，理论支持 0..15）
+- 仍保持 DRI = 0、P = 8、不支持 non-interleaved 多分量扫描
+
+### 5.2 关键实现改动（`src/decoder.c`、`decoder.h`、`golden_compare.c`）
+
+1. **predictor 与 output 分离的两级缓冲**：ISO H.1.2 规定 predictor 邻居 Ra/Rb/Rc 在 **pre-Pt-shift domain** 比较（P-Pt 位宽）。
+   - Pt = 0：内部域 == 输出域，`int_planes[c] = out_planes[c]`，零额外分配
+   - Pt > 0：分配 `int_scratch[c]`（8-bit 内部域够 P=8），decode 写入 scratch，EOS 之后 `dst[i] = src[i] << Pt`
+   - `mask = (1 << (P - Pt)) - 1`（25a 的 0xFF 改为 (1 << (P-Pt))-1）
+
+2. **多分量 interleaved 扫描**：外层 y / x，内层 `for (si = 0..Ns-1) { c = scan_comp_idx[si]; ... }`。每分量各自取 `row_c[c]`、`prev_c[c]` 指针，predictor state 互不干扰。
+
+3. **Huffman 表按 component 查表**：`dc_tabs[c] = &info->htables_dc[components[c].td]`。cjpeg 默认 RGB lossless 三分量共享同一张表 Td=0，但代码支持不同表号。
+
+4. **输出映射**：Nf=3 时 `y_plane/cb_plane/cr_plane` 分别接 R/G/B。新增 `jpeg_decoded_t.is_rgb_lossless` 标志让下游消费者跳过 YCbCr→RGB。
+
+5. **golden_compare**：`libjpeg_decode_lossless` 为 Nf=3 改 `out_color_space = JCS_RGB`，`jpeg_read_scanlines` 拿到交织的 R/G/B 行，再拆成 3 个 plane 以便按 4:4:4 路径比较。`cb_width/cb_height = W×H`。
+
+### 5.3 踩坑记
+
+**Pt > 0 初版全挂**（dy_max = 240/208）。
+第一版 decode_lossless 把 `sample << Pt` 后的值直接写进 `cur[x]`，下一轮 predictor 从 plane 里再取出来作为 Ra/Rb/Rc —— 这样 predictor state 变成 Pt-shift 之后的值，而 cjpeg 预测用的是 pre-shift 值，所以 diff 与 predictor 对不上，整张图错。
+
+**修复**：把 predictor 读写都放在 pre-shift 域，内部存一份 `int_scratch`；解码完成再统一 `<< Pt` 写入 `out_planes`。mask 也从 `(1<<P)-1` 改为 `(1<<(P-Pt))-1`。
+
+### 5.4 测试矩阵（`verification/vectors/phase25b/`）
+
+44 张向量：
+
+- **Nf=3 RGB Pt=0**：21 张（7 predictors × 3 patterns × {32×32, 64×48, 97×73}）
+- **Nf=3 RGB Pt∈{1..4}**：12 张（代表性 Ps + 尺寸组合）
+- **Nf=1 gray Pt∈{1..4}**：8 张
+- **大图 Nf=3 RGB**：3 张（192×128，Ps ∈ {1,4,7}）
+
+### 5.5 回归汇总（Phase 25b 验收）
+
+| 套件 | 通过/总 |
+|------|---------|
+| phase25b (new) | 44 / 44 |
+| phase25 | 28 / 28 |
+| phase_prog_dri | 20 / 20 |
+| phase18 | 17 / 17 |
+| phase17 | 16 / 16 |
+| phase16 | 14 / 14 |
+| phase14 | 8 / 8 |
+| phase13 | 20 / 20 |
+| phase12 | 15 / 15 |
+| phase11a/b | 30 / 30 |
+| phase10 | 15 / 15 |
+| phase09 | 15 / 15 |
+| phase08 | 15 / 15 |
+| phase07 | 20 / 20 |
+| phase06 | 20 / 20 |
+| **合计** | **297 / 297** |
+
+单元测试全通。
+
+---
+
+## 6. 25a 完工记录
 
 **提交**：<hash-to-fill-in>
 **日期**：2026-04-21

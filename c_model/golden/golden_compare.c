@@ -80,12 +80,18 @@ static int libjpeg_decode_lossless(const uint8_t *data, size_t size,
     jpeg_mem_src(&cinfo, (unsigned char*)data, size);
     jpeg_read_header(&cinfo, TRUE);
 
-    if (cinfo.num_components != 1) {
-        /* Phase 25a: gray only. */
+    if (cinfo.num_components != 1 && cinfo.num_components != 3) {
+        /* Phase 25a/25b: Nf∈{1,3}. */
         jpeg_destroy_decompress(&cinfo);
         return -1;
     }
-    cinfo.out_color_space = JCS_GRAYSCALE;
+    int is_gray = (cinfo.num_components == 1);
+
+    /* Force no colorspace conversion. For SOF3 3-comp, libjpeg preserves the
+     * source colorspace if we ask for JCS_RGB (vs JCS_YCbCr). Since the Adobe
+     * APP14 marker in cjpeg -lossless output tags this as RGB, JCS_RGB gives
+     * a direct R/G/B readout with no YCbCr transform. */
+    cinfo.out_color_space = is_gray ? JCS_GRAYSCALE : JCS_RGB;
     if (!jpeg_start_decompress(&cinfo)) {
         jpeg_destroy_decompress(&cinfo);
         return -1;
@@ -95,18 +101,46 @@ static int libjpeg_decode_lossless(const uint8_t *data, size_t size,
     uint32_t H = cinfo.output_height;
     out->width          = W;
     out->height         = H;
-    out->num_components = 1;
-    out->chroma_mode    = 0;
+    out->num_components = is_gray ? 1 : 3;
+    out->chroma_mode    = is_gray ? 0 : 2;   /* treat as 4:4:4 layout */
     out->precision      = cinfo.data_precision;
     out->is_lossless    = 1;
+    out->cb_width       = is_gray ? 0 : W;
+    out->cb_height      = is_gray ? 0 : H;
 
-    out->y = (uint8_t*)calloc((size_t)W * H, 1);
-    if (!out->y) { jpeg_destroy_decompress(&cinfo); return -1; }
-
-    while (cinfo.output_scanline < H) {
-        JSAMPROW rows[1];
-        rows[0] = out->y + (size_t)cinfo.output_scanline * W;
-        (void)jpeg_read_scanlines(&cinfo, rows, 1);
+    if (is_gray) {
+        out->y = (uint8_t*)calloc((size_t)W * H, 1);
+        if (!out->y) { jpeg_destroy_decompress(&cinfo); return -1; }
+        while (cinfo.output_scanline < H) {
+            JSAMPROW rows[1];
+            rows[0] = out->y + (size_t)cinfo.output_scanline * W;
+            (void)jpeg_read_scanlines(&cinfo, rows, 1);
+        }
+    } else {
+        /* Allocate R/G/B planes; libjpeg returns interleaved RGB rows. */
+        out->y  = (uint8_t*)calloc((size_t)W * H, 1);   /* R */
+        out->cb = (uint8_t*)calloc((size_t)W * H, 1);   /* G */
+        out->cr = (uint8_t*)calloc((size_t)W * H, 1);   /* B */
+        uint8_t *tmp = (uint8_t*)malloc((size_t)W * 3);
+        if (!out->y || !out->cb || !out->cr || !tmp) {
+            free(tmp);
+            jpeg_destroy_decompress(&cinfo);
+            return -1;
+        }
+        while (cinfo.output_scanline < H) {
+            uint32_t y = cinfo.output_scanline;
+            JSAMPROW rows[1] = { tmp };
+            (void)jpeg_read_scanlines(&cinfo, rows, 1);
+            uint8_t *dr = out->y  + (size_t)y * W;
+            uint8_t *dg = out->cb + (size_t)y * W;
+            uint8_t *db = out->cr + (size_t)y * W;
+            for (uint32_t x = 0; x < W; x++) {
+                dr[x] = tmp[3 * x + 0];
+                dg[x] = tmp[3 * x + 1];
+                db[x] = tmp[3 * x + 2];
+            }
+        }
+        free(tmp);
     }
     jpeg_finish_decompress(&cinfo);
     jpeg_destroy_decompress(&cinfo);

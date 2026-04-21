@@ -1344,49 +1344,67 @@ fail:
 }
 
 /* ========================================================================== */
-/* Phase 25a: Lossless (SOF3) decode — predictor + Huffman, no DCT            */
+/* Phase 25a/25b: Lossless (SOF3) decode — predictor + Huffman, no DCT        */
 /* ========================================================================== */
 /*
- * Scope (Phase 25a):
- *   - Nf=1 grayscale only
- *   - P=8
- *   - Pt ∈ {0..15}  (point transform: output = reconstructed << Pt)
- *   - Ps ∈ {1..7}   (predictors P1..P7 per ISO H.1.2.1)
- *   - Ns=1, DRI=0
+ * Scope (Phase 25a + 25b):
+ *   - Nf ∈ {1, 3}   (Phase 25a: gray; Phase 25b: Nf=3 interleaved RGB)
+ *   - P=8            (Phase 27 extends to 2..16)
+ *   - Pt ∈ {0..15}   (point transform: output = reconstructed << Pt)
+ *   - Ps ∈ {1..7}    (predictors P1..P7 per ISO H.1.2.1)
+ *   - All components Hi = Vi = 1
+ *   - Ns = num_components (fully interleaved) or Ns = 1 (non-interleaved only
+ *     makes sense for gray — for 3-component, we reject non-interleaved).
+ *   - DRI = 0        (Phase 25c adds RSTn)
  *
- * Prediction rules (ISO H.1.2.1):
- *   - First sample of the scan: predictor = 2^(P-Pt-1)
- *   - First sample of any other row (x=0, y>0): predictor = Rb
- *   - Other samples on the first row (y=0, x>0): predictor = Ra
- *   - All other samples: select Ps-indexed predictor
+ * Prediction rules (ISO H.1.2.1). Each component tracks its own predictor
+ * state (y_plane/cb_plane/cr_plane for R/G/B):
+ *   - First sample of the scan: Px = 2^(P-Pt-1)
+ *   - First sample of a new row (x=0, y>0): Px = Rb
+ *   - First row, subsequent samples (y=0, x>0): Px = Ra
+ *   - Otherwise: Ps-indexed predictor
  *       Ps=1: Ra           Ps=2: Rb           Ps=3: Rc
  *       Ps=4: Ra+Rb-Rc
  *       Ps=5: Ra + (Rb-Rc)>>1
  *       Ps=6: Rb + (Ra-Rc)>>1
  *       Ps=7: (Ra+Rb)>>1
  *
- * Reconstruction:
- *   diff = huff_decode_lossless_diff(dc_tab)
+ * Reconstruction (per component):
+ *   diff = huff_decode_lossless_diff(dc_tab[td])
  *   sample_p = (Px + diff) & ((1 << P) - 1)       (modulo 2^P wraparound)
- *   output   = (uint8_t)(sample_p << Pt)          (P=8, Pt=0 → identity)
+ *   output   = (uint8_t)(sample_p << Pt)
  *
- * Output: out->y_plane = reconstructed W×H uint8 sample array.
+ * Scan raster ordering (interleaved, ISO A.2.3 + H.1.2):
+ *   for y:
+ *     for x:
+ *       for c = 0..Ns-1: decode one sample of component scan_comp_idx[c]
+ *
+ * Output:
+ *   Nf=1 gray → out->y_plane
+ *   Nf=3 RGB  → out->y_plane, cb_plane, cr_plane (R, G, B respectively),
+ *               is_rgb_lossless = 1 to let consumers skip YCbCr conversion.
  */
 static int decode_lossless(bitstream_t *bs, jpeg_info_t *info,
                            jpeg_decoded_t *out) {
-    if (info->chroma_mode != CHROMA_GRAY) {
-        /* Phase 25a scope: gray only. Multi-component lossless → Phase 25b. */
-        out->err = JPEG_ERR_UNSUP_CHROMA;
-        return -1;
-    }
+    /* ---- precision / DRI / scope guards ---- */
     if (info->precision != 8) {
-        /* Phase 25a scope: P=8 only. Phase 27 extends to 2..16. */
+        /* Phase 27 extends to 2..16. */
         out->err = JPEG_ERR_UNSUP_PREC;
         return -1;
     }
     if (info->dri != 0) {
         /* Phase 25c will add RSTn handling. */
         out->err = JPEG_ERR_UNSUP_SOF;
+        return -1;
+    }
+
+    /* Nf=3 RGB must use the 4:4:4-shaped component layout. */
+    int is_gray = (info->num_components == 1);
+    int is_rgb3 = (info->num_components == 3 &&
+                   info->chroma_mode == CHROMA_444);
+    if (!is_gray && !is_rgb3) {
+        /* Phase 25b scope: Nf∈{1,3} with all Hi=Vi=1. Nf=2/4 → future. */
+        out->err = JPEG_ERR_UNSUP_CHROMA;
         return -1;
     }
 
@@ -1405,69 +1423,143 @@ static int decode_lossless(bitstream_t *bs, jpeg_info_t *info,
         return -1;
     }
 
-    out->width     = W;
-    out->height    = H;
-    out->precision = P;
-
-    out->y_plane = (uint8_t*)calloc((size_t)W * H, 1);
-    if (!out->y_plane) {
-        out->err = (uint32_t)JPEG_ERR_INTERNAL;
+    /* For Nf=3 we require a fully interleaved scan (all 3 comps). Nf=1
+     * naturally has Ns=1. Non-interleaved multi-component (one scan per
+     * component) is legal ISO but not produced by cjpeg and deferred. */
+    int Nf = info->num_components;
+    int Ns = info->scan_num_comps;
+    if (Nf == 3 && Ns != 3) {
+        out->err = JPEG_ERR_UNSUP_SOF;
+        return -1;
+    }
+    if (Nf == 1 && Ns != 1) {
+        out->err = JPEG_ERR_UNSUP_SOF;
         return -1;
     }
 
-    /* DC Huffman table used for difference SSSS symbols. Td = scan's DC index
-     * for this component, set by parse_sos. */
-    const htable_t *dc_tab = &info->htables_dc[info->components[0].td];
+    out->width     = W;
+    out->height    = H;
+    out->precision = P;
+    out->is_rgb_lossless = (Nf == 3) ? 1 : 0;
 
-    int32_t mask = (int32_t)(((uint32_t)1u << P) - 1u);   /* 0xFF for P=8 */
-    int32_t initial_pred = (int32_t)1 << (P - Pt - 1);    /* 128 for P=8/Pt=0 */
+    /* Output planes (W×H uint8 per component). For 3-comp: R/G/B. */
+    size_t npix = (size_t)W * H;
+    uint8_t *out_planes[3] = { NULL, NULL, NULL };
+    out_planes[0] = (uint8_t*)calloc(npix, 1);
+    if (!out_planes[0]) { out->err = (uint32_t)JPEG_ERR_INTERNAL; return -1; }
+    out->y_plane = out_planes[0];
+    if (Nf == 3) {
+        out_planes[1] = (uint8_t*)calloc(npix, 1);
+        out_planes[2] = (uint8_t*)calloc(npix, 1);
+        if (!out_planes[1] || !out_planes[2]) {
+            free(out_planes[1]); free(out_planes[2]);
+            out->err = (uint32_t)JPEG_ERR_INTERNAL;
+            return -1;
+        }
+        out->cb_plane = out_planes[1];  /* G */
+        out->cr_plane = out_planes[2];  /* B */
+    }
 
-    uint8_t *row = out->y_plane;
-    for (uint16_t y = 0; y < H; y++) {
-        uint8_t *cur  = row;
-        const uint8_t *prev = (y > 0) ? row - W : NULL;
-
-        for (uint16_t x = 0; x < W; x++) {
-            int32_t Px;
-            if (y == 0 && x == 0) {
-                Px = initial_pred;
-            } else if (y == 0) {
-                Px = (int32_t)cur[x - 1];              /* Ra */
-            } else if (x == 0) {
-                Px = (int32_t)prev[0];                 /* Rb */
-            } else {
-                int32_t Ra = (int32_t)cur[x - 1];
-                int32_t Rb = (int32_t)prev[x];
-                int32_t Rc = (int32_t)prev[x - 1];
-                switch (Ps) {
-                    case 1: Px = Ra;                      break;
-                    case 2: Px = Rb;                      break;
-                    case 3: Px = Rc;                      break;
-                    case 4: Px = Ra + Rb - Rc;            break;
-                    case 5: Px = Ra + ((Rb - Rc) >> 1);   break;
-                    case 6: Px = Rb + ((Ra - Rc) >> 1);   break;
-                    case 7: Px = (Ra + Rb) >> 1;          break;
-                    default: Px = 0;                      break;  /* unreachable */
-                }
-            }
-
-            int32_t diff = 0;
-            if (huff_decode_lossless_diff(bs, dc_tab, &diff)) {
-                out->err = JPEG_ERR_BAD_HUFFMAN;
+    /* Phase 25b: internal predictor-domain buffer(s). Predictor neighbors
+     * Ra/Rb/Rc are compared in the domain of the decoded samples pre-Pt-shift
+     * (ISO H.1.2). For Pt==0 internal domain == output domain; for Pt>0 the
+     * internal domain is P-Pt bits wide so ≤ 8 bits for P=8. We can reuse the
+     * out_planes buffer for Pt==0 and allocate separate uint8 scratch only
+     * when Pt>0. */
+    uint8_t *int_planes[3];
+    uint8_t *int_scratch[3] = { NULL, NULL, NULL };
+    if (Pt == 0) {
+        for (int c = 0; c < Nf; c++) int_planes[c] = out_planes[c];
+    } else {
+        for (int c = 0; c < Nf; c++) {
+            int_scratch[c] = (uint8_t*)calloc(npix, 1);
+            if (!int_scratch[c]) {
+                for (int k = 0; k < Nf; k++) free(int_scratch[k]);
+                out->err = (uint32_t)JPEG_ERR_INTERNAL;
                 return -1;
             }
-
-            int32_t sample = (Px + diff) & mask;
-            /* P=8, Pt=0: sample directly; if Pt>0 the reconstructed sample is
-             * scaled back by shifting left (ISO H.1.2: output = sample << Pt).
-             * For P=8 any Pt>0 saturates, but djpeg outputs saturated samples
-             * too so we follow. */
-            int32_t out_val = sample << Pt;
-            if (out_val > 255) out_val = 255;
-            cur[x] = (uint8_t)out_val;
+            int_planes[c] = int_scratch[c];
         }
+    }
 
-        row += W;
+    /* DC Huffman tables — each component has its own Td index (set by
+     * parse_sos). */
+    const htable_t *dc_tabs[3] = { NULL, NULL, NULL };
+    for (int c = 0; c < Nf; c++) {
+        uint8_t idx = info->components[c].td;
+        dc_tabs[c] = &info->htables_dc[idx];
+    }
+
+    /* Wrap mask and initial predictor live in the predictor domain (P-Pt bits).
+     * For Pt=0 this collapses to the sample domain. */
+    int32_t mask = (int32_t)(((uint32_t)1u << (P - Pt)) - 1u);   /* 0xFF for P=8/Pt=0 */
+    int32_t initial_pred = (int32_t)1 << (P - Pt - 1);
+
+    for (uint16_t y = 0; y < H; y++) {
+        uint8_t *row_c[3];
+        const uint8_t *prev_c[3];
+        for (int c = 0; c < Nf; c++) {
+            row_c[c]  = int_planes[c] + (size_t)y * W;
+            prev_c[c] = (y > 0) ? (int_planes[c] + (size_t)(y - 1) * W) : NULL;
+        }
+        for (uint16_t x = 0; x < W; x++) {
+            /* For each (y, x) decode one sample per component, in scan-comp
+             * order. For Nf=3 interleaved scan, that's R, G, B sequentially. */
+            for (int si = 0; si < Ns; si++) {
+                int c = info->scan_comp_idx[si];
+                uint8_t *cur = row_c[c];
+                const uint8_t *prev = prev_c[c];
+
+                int32_t Px;
+                if (y == 0 && x == 0) {
+                    Px = initial_pred;
+                } else if (y == 0) {
+                    Px = (int32_t)cur[x - 1];              /* Ra */
+                } else if (x == 0) {
+                    Px = (int32_t)prev[0];                 /* Rb */
+                } else {
+                    int32_t Ra = (int32_t)cur[x - 1];
+                    int32_t Rb = (int32_t)prev[x];
+                    int32_t Rc = (int32_t)prev[x - 1];
+                    switch (Ps) {
+                        case 1: Px = Ra;                      break;
+                        case 2: Px = Rb;                      break;
+                        case 3: Px = Rc;                      break;
+                        case 4: Px = Ra + Rb - Rc;            break;
+                        case 5: Px = Ra + ((Rb - Rc) >> 1);   break;
+                        case 6: Px = Rb + ((Ra - Rc) >> 1);   break;
+                        case 7: Px = (Ra + Rb) >> 1;          break;
+                        default: Px = 0;                      break;  /* unreachable */
+                    }
+                }
+
+                int32_t diff = 0;
+                if (huff_decode_lossless_diff(bs, dc_tabs[c], &diff)) {
+                    out->err = JPEG_ERR_BAD_HUFFMAN;
+                    for (int k = 0; k < Nf; k++) free(int_scratch[k]);
+                    return -1;
+                }
+
+                /* Predictor-domain sample (P-Pt bits, wrapped). */
+                int32_t sample = (Px + diff) & mask;
+                cur[x] = (uint8_t)sample;
+            }
+        }
+    }
+
+    /* Post-process: shift-left by Pt to produce output samples. For Pt=0
+     * int_planes == out_planes already, skip. */
+    if (Pt > 0) {
+        for (int c = 0; c < Nf; c++) {
+            uint8_t *src = int_planes[c];
+            uint8_t *dst = out_planes[c];
+            for (size_t i = 0; i < npix; i++) {
+                int32_t v = (int32_t)src[i] << Pt;
+                if (v > 255) v = 255;
+                dst[i] = (uint8_t)v;
+            }
+            free(int_scratch[c]);
+        }
     }
 
     /* Consume any pending marker up to EOI. */
