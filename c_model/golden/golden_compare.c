@@ -64,9 +64,12 @@ static int peek_sof_type(const uint8_t *data, size_t size) {
     return -1;
 }
 
-/* Phase 25a: decode a lossless (SOF3) JPEG via libjpeg-turbo's standard
- * scanline API (raw_data_out=FALSE, no color conversion). Gray-only scope
- * matches the C model's Phase 25a scope. */
+/* Phase 25a/27: decode a lossless (SOF3) JPEG via libjpeg-turbo. Supports
+ *   P ≤ 8  → jpeg_read_scanlines (uint8 planes)
+ *   9..12  → jpeg12_read_scanlines (short → uint16 planes)
+ *   13..16 → jpeg16_read_scanlines (uint16 planes direct)
+ * For Nf=3, libjpeg with JCS_RGB returns interleaved R/G/B per row, which we
+ * de-interleave into the three planes. */
 static int libjpeg_decode_lossless(const uint8_t *data, size_t size,
                                    libjpeg_ycc_t *out) {
     struct jpeg_decompress_struct cinfo;
@@ -81,16 +84,15 @@ static int libjpeg_decode_lossless(const uint8_t *data, size_t size,
     jpeg_read_header(&cinfo, TRUE);
 
     if (cinfo.num_components != 1 && cinfo.num_components != 3) {
-        /* Phase 25a/25b: Nf∈{1,3}. */
         jpeg_destroy_decompress(&cinfo);
         return -1;
     }
     int is_gray = (cinfo.num_components == 1);
+    int P = cinfo.data_precision;
 
-    /* Force no colorspace conversion. For SOF3 3-comp, libjpeg preserves the
-     * source colorspace if we ask for JCS_RGB (vs JCS_YCbCr). Since the Adobe
-     * APP14 marker in cjpeg -lossless output tags this as RGB, JCS_RGB gives
-     * a direct R/G/B readout with no YCbCr transform. */
+    /* Force no colorspace conversion. For SOF3 3-comp the Adobe APP14 marker
+     * in cjpeg output tags the stream as RGB, so JCS_RGB gives a direct
+     * R/G/B readout with no YCbCr transform. */
     cinfo.out_color_space = is_gray ? JCS_GRAYSCALE : JCS_RGB;
     if (!jpeg_start_decompress(&cinfo)) {
         jpeg_destroy_decompress(&cinfo);
@@ -103,41 +105,108 @@ static int libjpeg_decode_lossless(const uint8_t *data, size_t size,
     out->height         = H;
     out->num_components = is_gray ? 1 : 3;
     out->chroma_mode    = is_gray ? 0 : 2;   /* treat as 4:4:4 layout */
-    out->precision      = cinfo.data_precision;
+    out->precision      = P;
     out->is_lossless    = 1;
     out->cb_width       = is_gray ? 0 : W;
     out->cb_height      = is_gray ? 0 : H;
 
-    if (is_gray) {
-        out->y = (uint8_t*)calloc((size_t)W * H, 1);
-        if (!out->y) { jpeg_destroy_decompress(&cinfo); return -1; }
-        while (cinfo.output_scanline < H) {
-            JSAMPROW rows[1];
-            rows[0] = out->y + (size_t)cinfo.output_scanline * W;
-            (void)jpeg_read_scanlines(&cinfo, rows, 1);
+    if (P <= 8) {
+        if (is_gray) {
+            out->y = (uint8_t*)calloc((size_t)W * H, 1);
+            if (!out->y) { jpeg_destroy_decompress(&cinfo); return -1; }
+            while (cinfo.output_scanline < H) {
+                JSAMPROW rows[1];
+                rows[0] = out->y + (size_t)cinfo.output_scanline * W;
+                (void)jpeg_read_scanlines(&cinfo, rows, 1);
+            }
+        } else {
+            out->y  = (uint8_t*)calloc((size_t)W * H, 1);   /* R */
+            out->cb = (uint8_t*)calloc((size_t)W * H, 1);   /* G */
+            out->cr = (uint8_t*)calloc((size_t)W * H, 1);   /* B */
+            uint8_t *tmp = (uint8_t*)malloc((size_t)W * 3);
+            if (!out->y || !out->cb || !out->cr || !tmp) {
+                free(tmp);
+                jpeg_destroy_decompress(&cinfo);
+                return -1;
+            }
+            while (cinfo.output_scanline < H) {
+                uint32_t y = cinfo.output_scanline;
+                JSAMPROW rows[1] = { tmp };
+                (void)jpeg_read_scanlines(&cinfo, rows, 1);
+                uint8_t *dr = out->y  + (size_t)y * W;
+                uint8_t *dg = out->cb + (size_t)y * W;
+                uint8_t *db = out->cr + (size_t)y * W;
+                for (uint32_t x = 0; x < W; x++) {
+                    dr[x] = tmp[3 * x + 0];
+                    dg[x] = tmp[3 * x + 1];
+                    db[x] = tmp[3 * x + 2];
+                }
+            }
+            free(tmp);
         }
-    } else {
-        /* Allocate R/G/B planes; libjpeg returns interleaved RGB rows. */
-        out->y  = (uint8_t*)calloc((size_t)W * H, 1);   /* R */
-        out->cb = (uint8_t*)calloc((size_t)W * H, 1);   /* G */
-        out->cr = (uint8_t*)calloc((size_t)W * H, 1);   /* B */
-        uint8_t *tmp = (uint8_t*)malloc((size_t)W * 3);
-        if (!out->y || !out->cb || !out->cr || !tmp) {
+    } else if (P <= 12) {
+        /* Phase 27: 9..12-bit via jpeg12_read_scanlines (J12SAMPLE = short). */
+        out->y16 = (uint16_t*)calloc((size_t)W * H, sizeof(uint16_t));
+        if (!is_gray) {
+            out->cb16 = (uint16_t*)calloc((size_t)W * H, sizeof(uint16_t));
+            out->cr16 = (uint16_t*)calloc((size_t)W * H, sizeof(uint16_t));
+        }
+        uint32_t ch = is_gray ? 1u : 3u;
+        J12SAMPLE *tmp = (J12SAMPLE*)malloc(sizeof(J12SAMPLE) * W * ch);
+        if (!out->y16 || (!is_gray && (!out->cb16 || !out->cr16)) || !tmp) {
             free(tmp);
             jpeg_destroy_decompress(&cinfo);
             return -1;
         }
         while (cinfo.output_scanline < H) {
             uint32_t y = cinfo.output_scanline;
-            JSAMPROW rows[1] = { tmp };
-            (void)jpeg_read_scanlines(&cinfo, rows, 1);
-            uint8_t *dr = out->y  + (size_t)y * W;
-            uint8_t *dg = out->cb + (size_t)y * W;
-            uint8_t *db = out->cr + (size_t)y * W;
-            for (uint32_t x = 0; x < W; x++) {
-                dr[x] = tmp[3 * x + 0];
-                dg[x] = tmp[3 * x + 1];
-                db[x] = tmp[3 * x + 2];
+            J12SAMPROW rows[1] = { tmp };
+            (void)jpeg12_read_scanlines(&cinfo, rows, 1);
+            if (is_gray) {
+                uint16_t *dy = out->y16 + (size_t)y * W;
+                for (uint32_t x = 0; x < W; x++) dy[x] = (uint16_t)tmp[x];
+            } else {
+                uint16_t *dr = out->y16  + (size_t)y * W;
+                uint16_t *dg = out->cb16 + (size_t)y * W;
+                uint16_t *db = out->cr16 + (size_t)y * W;
+                for (uint32_t x = 0; x < W; x++) {
+                    dr[x] = (uint16_t)tmp[3 * x + 0];
+                    dg[x] = (uint16_t)tmp[3 * x + 1];
+                    db[x] = (uint16_t)tmp[3 * x + 2];
+                }
+            }
+        }
+        free(tmp);
+    } else {
+        /* Phase 27: 13..16-bit via jpeg16_read_scanlines (J16SAMPLE = uint16). */
+        out->y16 = (uint16_t*)calloc((size_t)W * H, sizeof(uint16_t));
+        if (!is_gray) {
+            out->cb16 = (uint16_t*)calloc((size_t)W * H, sizeof(uint16_t));
+            out->cr16 = (uint16_t*)calloc((size_t)W * H, sizeof(uint16_t));
+        }
+        uint32_t ch = is_gray ? 1u : 3u;
+        J16SAMPLE *tmp = (J16SAMPLE*)malloc(sizeof(J16SAMPLE) * W * ch);
+        if (!out->y16 || (!is_gray && (!out->cb16 || !out->cr16)) || !tmp) {
+            free(tmp);
+            jpeg_destroy_decompress(&cinfo);
+            return -1;
+        }
+        while (cinfo.output_scanline < H) {
+            uint32_t y = cinfo.output_scanline;
+            J16SAMPROW rows[1] = { tmp };
+            (void)jpeg16_read_scanlines(&cinfo, rows, 1);
+            if (is_gray) {
+                uint16_t *dy = out->y16 + (size_t)y * W;
+                for (uint32_t x = 0; x < W; x++) dy[x] = (uint16_t)tmp[x];
+            } else {
+                uint16_t *dr = out->y16  + (size_t)y * W;
+                uint16_t *dg = out->cb16 + (size_t)y * W;
+                uint16_t *db = out->cr16 + (size_t)y * W;
+                for (uint32_t x = 0; x < W; x++) {
+                    dr[x] = (uint16_t)tmp[3 * x + 0];
+                    dg[x] = (uint16_t)tmp[3 * x + 1];
+                    db[x] = (uint16_t)tmp[3 * x + 2];
+                }
             }
         }
         free(tmp);
@@ -596,15 +665,18 @@ int main(int argc, char **argv) {
 
         int dy_max = 0, dc_max = 0;
         size_t npix = (size_t)gold.width * gold.height;
-        if (gold.precision == 12) {
-            /* Phase 13: compare 16-bit planes (0..4095). */
+        if (gold.precision > 8) {
+            /* Phase 13 (DCT P=12) + Phase 27 (lossless P∈{9..16}):
+             * compare 16-bit planes. Lossless (is_lossless=1) is always gray
+             * or 4:4:4 RGB; DCT P=12 additionally covers 4:2:0 with
+             * sub-resolution chroma planes. */
             for (size_t i = 0; i < npix; i++) {
                 int d = (int)ours.y_plane16[i] - (int)gold.y16[i];
                 if (d < 0) d = -d;
                 if (d > dy_max) dy_max = d;
             }
             if (gold.chroma_mode == 1) {
-                /* 4:2:0 — compare pre-upsample (W/2)×(H/2) chroma */
+                /* 4:2:0 DCT — pre-upsample (W/2)×(H/2) chroma. */
                 size_t ncpix = (size_t)gold.cb_width * gold.cb_height;
                 for (size_t i = 0; i < ncpix; i++) {
                     int d1 = (int)ours.cb_plane16_420[i] - (int)gold.cb16[i];
@@ -615,7 +687,9 @@ int main(int argc, char **argv) {
                     if (d2 > dc_max) dc_max = d2;
                 }
             } else if (gold.chroma_mode == 2) {
-                /* 4:4:4 — full-res uint16 chroma */
+                /* 4:4:4 — full-res uint16 chroma (both DCT P=12 YCbCr and
+                 * lossless P>8 RGB land here; ours populates cb_plane16 /
+                 * cr_plane16 in both cases). */
                 size_t ncpix = (size_t)gold.cb_width * gold.cb_height;
                 for (size_t i = 0; i < ncpix; i++) {
                     int d1 = (int)ours.cb_plane16[i] - (int)gold.cb16[i];
@@ -717,8 +791,9 @@ summary_emit: {
             (gold.chroma_mode == 5) ? "411"  :
             (gold.chroma_mode == 6) ? "CMYK" : "420";
         char tag[24];
-        if (gold.precision == 12) {
-            snprintf(tag, sizeof(tag), " [P12 %s]", chroma_tag);
+        if (gold.precision != 8) {
+            snprintf(tag, sizeof(tag), " [P%d %s]",
+                     gold.precision, chroma_tag);
         } else {
             snprintf(tag, sizeof(tag), " [%s]", chroma_tag);
         }

@@ -123,16 +123,33 @@ static int parse_dht(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
     return 0;
 }
 
-/* Shared SOF parser. allow_p12:
- *   0 → SOF0: only P=8 accepted (baseline)
- *   1 → SOF1: P ∈ {8,12} accepted (extended sequential) */
+/* Shared SOF parser. Caller supplies the allowed precision range; common SOFs
+ * pass narrow ranges while SOF3 (lossless) opens the full ISO H.1 range.
+ *   SOF0 : (8, 8)   baseline
+ *   SOF1 : accept 8 and 12 (extended sequential)
+ *   SOF2 : (8, 8)   progressive, Phase 3 scope
+ *   SOF3 : (2, 16)  lossless, ISO H.1.2.1 P∈{2..16}
+ */
 static int parse_sof_common(bitstream_t *bs, jpeg_info_t *info, uint32_t *err,
-                            int allow_p12) {
+                            uint8_t p_min, uint8_t p_max) {
     uint16_t len;
     if (bs_read_u16(bs, &len)) { *err |= JPEG_ERR_STREAM_TRUNC; return -1; }
     uint8_t p;
     if (bs_read_byte(bs, &p)) { *err |= JPEG_ERR_STREAM_TRUNC; return -1; }
-    if (p != 8 && !(allow_p12 && p == 12)) { *err |= JPEG_ERR_UNSUP_PREC; return -1; }
+    /* SOF1 accepts only 8 and 12 (not 9-11); express via [8,12] range plus
+     * an explicit check for the sequential DCT case. The simplest unified
+     * predicate: p must be in [p_min, p_max]; SOF1 callers pass (8, 12) and
+     * we additionally reject 9-11 here when the range is ≤ 12 and p_min == 8
+     * AND the sequential gap is forbidden by caller convention — handled by
+     * SOF1 passing p_max=12 and SOF3 passing p_max=16.  P in {9,10,11} is OK
+     * for SOF3 but not SOF0/1/2. */
+    if (p < p_min || p > p_max) { *err |= JPEG_ERR_UNSUP_PREC; return -1; }
+    /* SOF0/1/2 carve-out: DCT-family SOFs only allow 8 and 12; reject the
+     * {9,10,11} gap that lossless allows. */
+    if (p_max == 12 && p != 8 && p != 12) {
+        *err |= JPEG_ERR_UNSUP_PREC;
+        return -1;
+    }
     info->precision = p;
     if (bs_read_u16(bs, &info->height)) { *err |= JPEG_ERR_STREAM_TRUNC; return -1; }
     if (bs_read_u16(bs, &info->width))  { *err |= JPEG_ERR_STREAM_TRUNC; return -1; }
@@ -222,12 +239,12 @@ static int parse_sof_common(bitstream_t *bs, jpeg_info_t *info, uint32_t *err,
 
 static int parse_sof0(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
     info->sof_type = 0;
-    return parse_sof_common(bs, info, err, 0);
+    return parse_sof_common(bs, info, err, 8, 8);
 }
 
 static int parse_sof1(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
     info->sof_type = 1;
-    return parse_sof_common(bs, info, err, 1);
+    return parse_sof_common(bs, info, err, 8, 12);
 }
 
 /* Phase 16b: SOF2 progressive. P=8 only for now (progressive + P=12 is rare
@@ -235,17 +252,16 @@ static int parse_sof1(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
  * SOF0; scan-level progressive parameters are validated in parse_sos. */
 static int parse_sof2(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
     info->sof_type = 2;
-    return parse_sof_common(bs, info, err, 0);
+    return parse_sof_common(bs, info, err, 8, 8);
 }
 
-/* Phase 25a: SOF3 lossless. Component layout identical to SOF0/1/2. Precision
- * P ∈ {2..16} per ISO H.1 (Phase 25a: P=8 only; Phase 27 extends). Scan-level
- * params (Ss=predictor 1-7, Se=0, Ah=0, Al=point-transform) validated in
- * parse_sos. Chroma is "gray" (Nf=1) for Phase 25a; multi-component lossless
- * is Phase 25b. */
+/* Phase 25a/27: SOF3 lossless. Component layout identical to SOF0/1/2. Precision
+ * P ∈ {2..16} per ISO H.1.2.1. Phase 25a/b/c gated the decode path to P=8 only;
+ * Phase 27 extends decode to all 15 precisions. Scan-level params (Ss=predictor
+ * 1-7, Se=0, Ah=0, Al=point-transform) validated in parse_sos. */
 static int parse_sof3(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
     info->sof_type = 3;
-    return parse_sof_common(bs, info, err, 0);
+    return parse_sof_common(bs, info, err, 2, 16);
 }
 
 static int parse_sos(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {

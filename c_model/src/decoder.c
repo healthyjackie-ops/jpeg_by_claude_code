@@ -83,9 +83,18 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
 
     out->precision = info.precision;
 
+    /* Phase 25a/27: SOF3 lossless handled by its own predictor-based decoder,
+     * for all P ∈ {2..16}. Keep this BEFORE the P=12 DCT dispatch so that
+     * SOF3 P=12 doesn't get intercepted by the baseline P=12 path. */
+    if (info.sof_type == 3) {
+        return decode_lossless(&bs, &info, out);
+    }
+
     /* Phase 13a.3: P=12 branches to a dedicated 16-bit decode path supporting
        grayscale / 4:4:4 / 4:2:0. Other chroma modes with P=12 (CMYK, 4:2:2,
-       4:4:0, 4:1:1) are out of scope for Phase 13. */
+       4:4:0, 4:1:1) are out of scope for Phase 13. SOF3 was already handled
+       above, so this is strictly SOF0/1 P=12 (and SOF2 P=12 is currently
+       unreachable — decode_progressive asserts P=8 internally). */
     if (info.precision == 12) {
         return decode_p12(&bs, &info, out);
     }
@@ -99,11 +108,6 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
     g_al      = 0;
     if (info.sof_type == 2) {
         return decode_progressive(&bs, &info, out);
-    }
-    /* Phase 25a: SOF3 lossless. Scope = Nf=1 gray, P=8, Pt 0..15, Ps 1..7,
-     * DRI=0 (multi-component + DRI is Phase 25b/c). */
-    if (info.sof_type == 3) {
-        return decode_lossless(&bs, &info, out);
     }
 
     out->width  = info.width;
@@ -1344,12 +1348,12 @@ fail:
 }
 
 /* ========================================================================== */
-/* Phase 25a/25b: Lossless (SOF3) decode — predictor + Huffman, no DCT        */
+/* Phase 25a/25b/25c/27: Lossless (SOF3) decode — predictor + Huffman, no DCT */
 /* ========================================================================== */
 /*
- * Scope (Phase 25a + 25b):
+ * Scope (Phase 25a + 25b + 25c + 27):
  *   - Nf ∈ {1, 3}   (Phase 25a: gray; Phase 25b: Nf=3 interleaved RGB)
- *   - P=8            (Phase 27 extends to 2..16)
+ *   - P ∈ {2..16}    (Phase 25a/b/c gated at P=8; Phase 27 extends to full range)
  *   - Pt ∈ {0..15}   (point transform: output = reconstructed << Pt)
  *   - Ps ∈ {1..7}    (predictors P1..P7 per ISO H.1.2.1)
  *   - All components Hi = Vi = 1
@@ -1386,9 +1390,9 @@ fail:
  */
 static int decode_lossless(bitstream_t *bs, jpeg_info_t *info,
                            jpeg_decoded_t *out) {
-    /* ---- precision / DRI / scope guards ---- */
-    if (info->precision != 8) {
-        /* Phase 27 extends to 2..16. */
+    /* ---- precision / scope guards ---- */
+    uint8_t P = info->precision;
+    if (P < 2 || P > 16) {
         out->err = JPEG_ERR_UNSUP_PREC;
         return -1;
     }
@@ -1408,13 +1412,13 @@ static int decode_lossless(bitstream_t *bs, jpeg_info_t *info,
     uint16_t H = info->height;
     uint8_t  Ps = info->scan_ss;         /* predictor selection */
     uint8_t  Pt = info->scan_al;         /* point transform */
-    uint8_t  P  = info->precision;       /* 8 */
 
     if (Ps < 1 || Ps > 7) {
         out->err = JPEG_ERR_UNSUP_SOF;
         return -1;
     }
-    if (Pt > 15) {
+    /* Pt must leave at least one bit in the predictor domain. ISO: Al ≤ P-1. */
+    if (Pt > 15 || Pt >= P) {
         out->err = JPEG_ERR_UNSUP_SOF;
         return -1;
     }
@@ -1438,44 +1442,61 @@ static int decode_lossless(bitstream_t *bs, jpeg_info_t *info,
     out->precision = P;
     out->is_rgb_lossless = (Nf == 3) ? 1 : 0;
 
-    /* Output planes (W×H uint8 per component). For 3-comp: R/G/B. */
+    /* Phase 27: storage width depends on P. P ≤ 8 stays on the legacy uint8
+     * planes; P > 8 uses the uint16 planes (y_plane16/cb_plane16/cr_plane16),
+     * shared with the Phase 13 DCT P=12 path. We always keep a uint16
+     * scratch buffer for predictor-domain samples so the loop is one
+     * templateless form regardless of P. */
+    int need16 = (P > 8);
     size_t npix = (size_t)W * H;
-    uint8_t *out_planes[3] = { NULL, NULL, NULL };
-    out_planes[0] = (uint8_t*)calloc(npix, 1);
-    if (!out_planes[0]) { out->err = (uint32_t)JPEG_ERR_INTERNAL; return -1; }
-    out->y_plane = out_planes[0];
-    if (Nf == 3) {
-        out_planes[1] = (uint8_t*)calloc(npix, 1);
-        out_planes[2] = (uint8_t*)calloc(npix, 1);
-        if (!out_planes[1] || !out_planes[2]) {
-            free(out_planes[1]); free(out_planes[2]);
-            out->err = (uint32_t)JPEG_ERR_INTERNAL;
-            return -1;
-        }
-        out->cb_plane = out_planes[1];  /* G */
-        out->cr_plane = out_planes[2];  /* B */
-    }
 
-    /* Phase 25b: internal predictor-domain buffer(s). Predictor neighbors
-     * Ra/Rb/Rc are compared in the domain of the decoded samples pre-Pt-shift
-     * (ISO H.1.2). For Pt==0 internal domain == output domain; for Pt>0 the
-     * internal domain is P-Pt bits wide so ≤ 8 bits for P=8. We can reuse the
-     * out_planes buffer for Pt==0 and allocate separate uint8 scratch only
-     * when Pt>0. */
-    uint8_t *int_planes[3];
-    uint8_t *int_scratch[3] = { NULL, NULL, NULL };
-    if (Pt == 0) {
-        for (int c = 0; c < Nf; c++) int_planes[c] = out_planes[c];
-    } else {
-        for (int c = 0; c < Nf; c++) {
-            int_scratch[c] = (uint8_t*)calloc(npix, 1);
-            if (!int_scratch[c]) {
-                for (int k = 0; k < Nf; k++) free(int_scratch[k]);
+    uint8_t  *out8[3]   = { NULL, NULL, NULL };
+    uint16_t *out16[3]  = { NULL, NULL, NULL };
+    uint16_t *int_planes[3] = { NULL, NULL, NULL };
+
+#define LOSSLESS_FAIL(CODE) do { \
+        for (int _k = 0; _k < Nf; _k++) free(int_planes[_k]); \
+        out->err = (CODE); \
+        return -1; \
+    } while (0)
+
+    /* Output planes (W×H) per component. */
+    if (need16) {
+        out16[0] = (uint16_t*)calloc(npix, sizeof(uint16_t));
+        if (!out16[0]) { out->err = (uint32_t)JPEG_ERR_INTERNAL; return -1; }
+        out->y_plane16 = out16[0];
+        if (Nf == 3) {
+            out16[1] = (uint16_t*)calloc(npix, sizeof(uint16_t));
+            out16[2] = (uint16_t*)calloc(npix, sizeof(uint16_t));
+            if (!out16[1] || !out16[2]) {
+                free(out16[1]); free(out16[2]);
                 out->err = (uint32_t)JPEG_ERR_INTERNAL;
                 return -1;
             }
-            int_planes[c] = int_scratch[c];
+            out->cb_plane16 = out16[1];  /* G */
+            out->cr_plane16 = out16[2];  /* B */
         }
+    } else {
+        out8[0] = (uint8_t*)calloc(npix, 1);
+        if (!out8[0]) { out->err = (uint32_t)JPEG_ERR_INTERNAL; return -1; }
+        out->y_plane = out8[0];
+        if (Nf == 3) {
+            out8[1] = (uint8_t*)calloc(npix, 1);
+            out8[2] = (uint8_t*)calloc(npix, 1);
+            if (!out8[1] || !out8[2]) {
+                free(out8[1]); free(out8[2]);
+                out->err = (uint32_t)JPEG_ERR_INTERNAL;
+                return -1;
+            }
+            out->cb_plane = out8[1];  /* G */
+            out->cr_plane = out8[2];  /* B */
+        }
+    }
+
+    /* Predictor-domain scratch buffer (uint16 handles P up to 16). */
+    for (int c = 0; c < Nf; c++) {
+        int_planes[c] = (uint16_t*)calloc(npix, sizeof(uint16_t));
+        if (!int_planes[c]) LOSSLESS_FAIL((uint32_t)JPEG_ERR_INTERNAL);
     }
 
     /* DC Huffman tables — each component has its own Td index (set by
@@ -1488,47 +1509,15 @@ static int decode_lossless(bitstream_t *bs, jpeg_info_t *info,
 
     /* Wrap mask and initial predictor live in the predictor domain (P-Pt bits).
      * For Pt=0 this collapses to the sample domain. */
-    int32_t mask = (int32_t)(((uint32_t)1u << (P - Pt)) - 1u);   /* 0xFF for P=8/Pt=0 */
+    int32_t mask = (int32_t)(((uint32_t)1u << (P - Pt)) - 1u);
     int32_t initial_pred = (int32_t)1 << (P - Pt - 1);
 
-    /* Phase 25c: DRI state.
-     *
-     * libjpeg-turbo's lossless implementation (src/jdlossls.c) splits the
-     * per-component predictor into two phases driven by a function pointer:
-     *
-     *   (a) jpeg_undifference_first_row — applied to the FIRST row of the
-     *       scan, and again to the first row immediately after each RSTn.
-     *       First column uses x = 2^(P-Pt-1); all other columns use Ra
-     *       (horizontal predictor 1), REGARDLESS of the scan header Ps.
-     *
-     *   (b) jpeg_undifference<Ps> — applied to every subsequent row. First
-     *       column uses Rb (vertical predictor 2), REGARDLESS of Ps; other
-     *       columns use the Ps formula.
-     *
-     * After each RST the function pointer is reset back to (a) via
-     * start_pass_lossless (see jddiffct.c:process_restart), so the NEXT
-     * ENTIRE ROW after a restart is treated as a "first row" — NOT just
-     * the first sample. libjpeg-turbo additionally enforces
-     *   (restart_interval % MCUs_per_row) == 0
-     * (see jddiffct.c:start_input_pass), which makes every RST land on a
-     * row boundary. We match that constraint here.
-     *
-     * State:
-     *   - mcu_count counts MCUs within the current restart interval. For
-     *     Nf=1 gray / Nf=3 RGB interleaved (Hi=Vi=1) MCU == 1 pixel, so
-     *     MCUs_per_row == W.
-     *   - first_row_mode[c] = 1 means "this row (or the start of it) is the
-     *     first row of a new restart interval; use 1-D horizontal predictor".
-     *   - Set to 1 at scan start and again at the end of every RST-terminated
-     *     row. Cleared at row end otherwise.
-     */
+    /* Phase 25c: DRI state. See libjpeg-turbo src/jdlossls.c + jddiffct.c:
+     * first-row predictor semantics reapply after every RSTn, and DRI must
+     * be a multiple of MCUs_per_row. */
     uint32_t mcus_per_row = (uint32_t)W;   /* Hi=Vi=1 for all comps */
     if (info->dri != 0 && (info->dri % mcus_per_row) != 0) {
-        /* ISO allows mid-row restarts but libjpeg-turbo does not; matching
-         * that is required for bit-exact parity on cjpeg-generated files. */
-        out->err = JPEG_ERR_UNSUP_SOF;
-        for (int k = 0; k < Nf; k++) free(int_scratch[k]);
-        return -1;
+        LOSSLESS_FAIL(JPEG_ERR_UNSUP_SOF);
     }
 
     uint32_t mcu_count = 0;
@@ -1537,8 +1526,8 @@ static int decode_lossless(bitstream_t *bs, jpeg_info_t *info,
 
     uint32_t mcu_idx = 0;
     for (uint16_t y = 0; y < H; y++) {
-        uint8_t *row_c[3];
-        const uint8_t *prev_c[3];
+        uint16_t *row_c[3];
+        const uint16_t *prev_c[3];
         for (int c = 0; c < Nf; c++) {
             row_c[c]  = int_planes[c] + (size_t)y * W;
             prev_c[c] = (y > 0) ? (int_planes[c] + (size_t)(y - 1) * W) : NULL;
@@ -1549,8 +1538,8 @@ static int decode_lossless(bitstream_t *bs, jpeg_info_t *info,
              * order. For Nf=3 interleaved scan, that's R, G, B sequentially. */
             for (int si = 0; si < Ns; si++) {
                 int c = info->scan_comp_idx[si];
-                uint8_t *cur = row_c[c];
-                const uint8_t *prev = prev_c[c];
+                uint16_t *cur = row_c[c];
+                const uint16_t *prev = prev_c[c];
 
                 int32_t Px;
                 if (first_row_mode[c]) {
@@ -1558,8 +1547,7 @@ static int decode_lossless(bitstream_t *bs, jpeg_info_t *info,
                     if (x == 0) Px = initial_pred;
                     else        Px = (int32_t)cur[x - 1];   /* Ra */
                 } else if (x == 0) {
-                    /* First column of a non-first row: always Rb, regardless
-                     * of Ps (matches libjpeg INITIAL_PREDICTOR2 = prev_row[0]). */
+                    /* First column of a non-first row: always Rb. */
                     Px = (int32_t)prev[0];
                 } else {
                     int32_t Ra = (int32_t)cur[x - 1];
@@ -1579,50 +1567,51 @@ static int decode_lossless(bitstream_t *bs, jpeg_info_t *info,
 
                 int32_t diff = 0;
                 if (huff_decode_lossless_diff(bs, dc_tabs[c], &diff)) {
-                    out->err = JPEG_ERR_BAD_HUFFMAN;
-                    for (int k = 0; k < Nf; k++) free(int_scratch[k]);
-                    return -1;
+                    LOSSLESS_FAIL(JPEG_ERR_BAD_HUFFMAN);
                 }
 
                 /* Predictor-domain sample (P-Pt bits, wrapped). */
                 int32_t sample = (Px + diff) & mask;
-                cur[x] = (uint8_t)sample;
+                cur[x] = (uint16_t)sample;
             }
 
-            /* End of one MCU (all scan components at (y,x)). Apply DRI.
-             * Because DRI is a multiple of mcus_per_row, RST only fires at
-             * end-of-row (x == W-1) if at all. */
             mcu_idx++;
             mcu_count++;
             if (info->dri != 0 && mcu_count == info->dri && mcu_idx < total_mcus) {
                 if (prog_handle_restart(bs, info, Nf, NULL)) {
-                    out->err = JPEG_ERR_BAD_MARKER;
-                    for (int k = 0; k < Nf; k++) free(int_scratch[k]);
-                    return -1;
+                    LOSSLESS_FAIL(JPEG_ERR_BAD_MARKER);
                 }
                 mcu_count = 0;
                 rst_at_row_end = 1;   /* → next row is "first row" again */
             }
         }
-        /* Row transition: next row is "first row" iff a RST just ended this
-         * row; otherwise it's a normal row using Ps. */
         uint8_t next_mode = rst_at_row_end ? 1 : 0;
         for (int c = 0; c < Nf; c++) first_row_mode[c] = next_mode;
     }
 
-    /* Post-process: shift-left by Pt to produce output samples. For Pt=0
-     * int_planes == out_planes already, skip. */
-    if (Pt > 0) {
-        for (int c = 0; c < Nf; c++) {
-            uint8_t *src = int_planes[c];
-            uint8_t *dst = out_planes[c];
+    /* Post-process: shift predictor-domain samples left by Pt to produce the
+     * final output. Clamp to the P-bit range per ISO H.1.2 (the shift can
+     * overflow for some predictor paths; libjpeg masks to P bits). */
+    int32_t out_mask = (P == 16)
+                       ? (int32_t)0xFFFF
+                       : (int32_t)(((uint32_t)1u << P) - 1u);
+    for (int c = 0; c < Nf; c++) {
+        uint16_t *src = int_planes[c];
+        if (need16) {
+            uint16_t *dst = out16[c];
             for (size_t i = 0; i < npix; i++) {
-                int32_t v = (int32_t)src[i] << Pt;
-                if (v > 255) v = 255;
+                int32_t v = ((int32_t)src[i] << Pt) & out_mask;
+                dst[i] = (uint16_t)v;
+            }
+        } else {
+            uint8_t *dst = out8[c];
+            for (size_t i = 0; i < npix; i++) {
+                int32_t v = ((int32_t)src[i] << Pt) & out_mask;
                 dst[i] = (uint8_t)v;
             }
-            free(int_scratch[c]);
         }
+        free(int_planes[c]);
+        int_planes[c] = NULL;
     }
 
     /* Consume any pending marker up to EOI. */
@@ -1646,6 +1635,7 @@ static int decode_lossless(bitstream_t *bs, jpeg_info_t *info,
 
     out->err = 0;
     return 0;
+#undef LOSSLESS_FAIL
 }
 
 void jpeg_free(jpeg_decoded_t *out) {
