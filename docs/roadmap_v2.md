@@ -58,6 +58,7 @@
 | **22c / 23b** ✅ | [SOF9 sequential arith end-to-end — C model](spec_phase22.md) | 1d | 18/18 phase22 向量 bit-exact vs libjpeg-turbo（gray + 4:4:4 + 4:2:0，8x8..128x96，q 50-80，DRI 0/4，含非 16 对齐 17x13），phase06-27 + phase_prog_dri 零退步（726/726） |
 | **23c** | [SOF9 RTL integration](spec_phase23.md) | 5d | RTL arith DC+AC 通路，bit-exact 回归 |
 | **24a** ✅ | [SOF10 progressive arith — C model](spec_phase24.md) | 1d | 33/33 phase24 向量 bit-exact vs libjpeg-turbo（gray + 4:4:4 + 4:2:0，8x8..320x200，q 30-90，DRI ∈ {0,1,4,8,16}，含非 16 对齐 17x13，4 scan types：DC-first / AC-first / AC-refine / DC-refine），phase06-27 + phase_prog_dri + phase22 零退步（1201/1201） |
+| **24c** ✅ | [SOF9/SOF10 extended chroma (4:2:2 / 4:4:0 / 4:1:1) — C model](spec_phase24.md) | 1d | 162/162 phase24c 向量 bit-exact vs libjpeg-turbo（3 sampling × 3 patterns × 9 sizes × {SOF9, SOF10}，含非 MCU 对齐 17x16，DRI ∈ {0,1,4,8}，q 30-90），phase06-27 + phase22 + phase24 + phase_prog_dri 零退步（1363/1363） |
 | **24b** | [SOF10 RTL](spec_phase24.md) | 5d | progressive coef buffer × arith |
 
 ### Wave 5 — Lossless

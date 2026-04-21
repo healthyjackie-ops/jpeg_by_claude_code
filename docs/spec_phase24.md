@@ -1,7 +1,9 @@
-# Phase 24a — SOF10 progressive-arithmetic decode (ISO/IEC 10918-1 Annex F.1.4.4.2)
+# Phase 24a/24c — SOF10 progressive-arithmetic decode (ISO/IEC 10918-1 Annex F.1.4.4.2)
 
-**Status**: ✅ **COMPLETE** — 18/18 phase24 vectors bit-exact vs
-libjpeg-turbo, 1186/1186 全回归零退步 (2026-04-21).
+**Status**: ✅ **COMPLETE**
+- 24a: 33/33 SOF10 vectors bit-exact (gray + 4:4:4 + 4:2:0)
+- 24c: 162/162 SOF9/SOF10 non-420 chroma vectors bit-exact (4:2:2 + 4:4:0 + 4:1:1)
+- 1363/1363 full regression (2026-04-21).
 
 **Parent**: [`roadmap_v2.md`](roadmap_v2.md) Wave 4 Phase 24
 **Prereqs**:
@@ -232,3 +234,92 @@ C-model could extend but are not yet wired:
 
 All of these have libjpeg-turbo reference support, so they are
 unblockable future extensions (not blocked like SOF11).
+
+## 10. Phase 24c — SOF9/SOF10 extended chroma (4:2:2 / 4:4:0 / 4:1:1)
+
+Phases 22c/23b (SOF9) and 24a (SOF10) landed gray / 4:4:4 / 4:2:0 only.
+Phase 24c folds in the three remaining 3-comp YCbCr chroma layouts that
+the baseline Huffman path has supported since Phase 10/11. cjpeg
+supports all three with both `-arithmetic` and `-progressive -arithmetic`.
+
+| Mode | Sampling | MCU | Y blocks | Cb/Cr blocks |
+|---|---|---|---|---|
+| 4:2:2 | Y 2×1, chroma 1×1 | 16×8  | 2 (horizontal) | 1 each |
+| 4:4:0 | Y 1×2, chroma 1×1 | 8×16  | 2 (vertical)   | 1 each |
+| 4:1:1 | Y 4×1, chroma 1×1 | 32×8  | 4 (horizontal) | 1 each |
+
+### Changes to `decode_sof9`
+
+1. **Accept gate** — extend from `gray/444/420` to also accept
+   `422/440/411`.
+2. **MCU footprint** — match baseline:
+   ```
+   mcu_w = is_411 ? 32 : ((is_420 || is_422) ? 16 : 8);
+   mcu_h = (is_420 || is_440) ? 16 : 8;
+   ```
+3. **Sub-sampled chroma pad dims** — match baseline:
+   ```
+   CWp_sub = is_411 ? Wp>>2 : ((is_420 || is_422) ? Wp>>1 : Wp);
+   CHp_sub = (is_420 || is_440) ? Hp>>1 : Hp;
+   ```
+4. **MCU decode loop** — three new branches (`is_422`, `is_440`, `is_411`)
+   mirroring the baseline decode layout but calling `sof9_decode_block`
+   with the scan's arith tables. Same per-component td/ta/qt pointers
+   and same idct_islow → copy_block_8x8 sequence.
+5. **Chroma upsample** — three new cases: horizontal-only (4:2:2),
+   horizontal-4x (4:1:1), vertical-only (4:4:0).
+6. **Sub-res plane copy** — three new cases emitting
+   `out->cb_plane_422 / _440 / _411` (and `cr_` equivalents) so the
+   golden_compare can diff against libjpeg raw component output.
+
+### Changes to `decode_sof10`
+
+Same five changes, plus:
+
+7. **`cg[c]` natural block grid setup** — per-sampling layout. E.g. for
+   4:2:2: `cg[0].blk_rows = mcu_rows, blk_cols = mcu_cols*2` (Y is 2×1
+   per MCU); Cb/Cr use `cw_nat × yh_nat`. The generic AC scan loop then
+   walks each component's nat_rows × nat_cols grid without further
+   per-mode code.
+8. **DC-first MCU loop** — three new per-sampling branches, each
+   emitting `sof10_dc_first_block` calls in the ISO-mandated interleave
+   order (Y blocks first in natural scan, then Cb, then Cr). RSTn and
+   refine paths reuse the existing 420 template.
+9. **Drain pad/stride** — route `c ≥ 1` through `cb_pad_sub / cr_pad_sub`
+   whenever `is_chroma_sub` instead of only when `is_420`.
+
+### Vectors
+
+`tools/gen_phase24c.py` generates 162 vectors:
+- 3 chroma modes × 3 patterns (grad/check/noise) × 9 size/quality/DRI
+  combinations × {SOF9, SOF10}
+- Sizes span 17×16 (non-MCU-aligned) → 320×200
+- DRI ∈ {0, 1, 4, 8} to exercise arith re-prime per MCU-count
+- Quality ∈ {30, 60, 70, 75, 80, 85, 90}
+
+**162/162 pixel-exact vs libjpeg-turbo** on first try, no bring-up issues
+beyond the straightforward branch replication. The coef_buf + cg[c]
+abstraction from Phase 24a already generalized the AC-scan path —
+only the DC-first MCU interleave and drain upsample/copy needed new
+code.
+
+### Regression
+
+- `make test`: ALL TESTS PASSED
+- `full` (phase06-18 legacy): 1150/1150 Y=0 C=0
+- `phase22` (SOF9 arith 420/444/gray): 18/18
+- `phase24` (SOF10 arith 420/444/gray): 33/33
+- `phase24c` (SOF9/SOF10 arith 422/440/411): 162/162
+- `phase_prog_dri`: 20/20
+- **Combined 1363/1363 bit-exact**
+
+### Remaining gaps
+
+After Phase 24c, the arith C-model covers **all 5 common 8-bit 3-comp
+chroma layouts** for both sequential (SOF9) and progressive (SOF10).
+Still deferred (unblockable future work):
+- **CMYK (Nf=4)** in any SOF9/10 path
+- **P=12** in any SOF2/9/10 path (1050-line decode_progressive
+  refactor)
+
+SOF11 lossless+arith remains **blocked** by libjpeg-turbo tooling.
