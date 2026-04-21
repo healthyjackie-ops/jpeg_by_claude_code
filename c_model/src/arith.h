@@ -87,4 +87,40 @@ int arith_dec_dc_diff(arith_decoder_t *d,
                       int L, int U,
                       int *out_diff);
 
+/* ------------------------------------------------------------------ */
+/* Phase 23a: AC block decoder (ISO F.1.4.4.2 / Figure F.20..F.24).
+ *
+ * Decodes the 63 AC coefficients of one 8x8 block (k ∈ [1..63]).
+ *
+ * AC statistics layout (ISO Table F.4, 256 bytes per AC table):
+ *   offset  3*(k-1)  (k=1..63) : EOB + EZR bins for zigzag position k
+ *                                (bin 0 = EOB, bin 1 = zero-run bit)
+ *   offset  3*(k-1)+2          : magnitude category (first M1 bin)
+ *   offset  189                : X-loop bins for low-freq   (k ≤ Kx)
+ *   offset  217                : X-loop bins for high-freq  (k >  Kx)
+ *   offset  203 / 231          : shared M-bins for low/high  (these are
+ *                                X-bin + 14, matching the "st+=14" jump
+ *                                in both encoder and decoder).
+ *
+ *   d          : Q-coder decoder state (already primed)
+ *   ac_stats   : 256-byte statistics area for this AC table
+ *   fixed_bin  : 1-byte shared sign-bin (persists across the scan —
+ *                caller holds one per scan, zero-initialised)
+ *   Kx         : arith_ac_K[tbl] from the DAC marker (default 5)
+ *   block      : 64 int16_t coefs in NATURAL (not zigzag) order.
+ *                Caller must zero-init before calling — we only write
+ *                non-zero coefficients.
+ *   Ss, Se     : spectral-selection range (1..63 for sequential SOF9).
+ *                Pass (1, 63) for sequential scans; caller supplies the
+ *                subset for progressive AC-first scans.
+ *
+ * Returns 0 on success, -1 on corrupt stream (EOB out of range or
+ * magnitude overflow). */
+int arith_dec_ac_block(arith_decoder_t *d,
+                       uint8_t *ac_stats,
+                       uint8_t *fixed_bin,
+                       int Kx,
+                       int Ss, int Se,
+                       int16_t *block);
+
 #endif

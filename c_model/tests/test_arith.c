@@ -671,6 +671,273 @@ static int test_dc_diff_conditioning(void)
     return 0;
 }
 
+/* ---- Test 6: AC-block round-trip (ISO F.1.4.4.2) -------------------- */
+
+/* Local zigzag table — duplicate of JPEG_ZIGZAG in arith.c. Keeps the
+ * test independent of arith.c's file-scope table. */
+static const uint8_t ZZ[64] = {
+     0,  1,  8, 16,  9,  2,  3, 10,
+    17, 24, 32, 25, 18, 11,  4,  5,
+    12, 19, 26, 33, 40, 48, 41, 34,
+    27, 20, 13,  6,  7, 14, 21, 28,
+    35, 42, 49, 56, 57, 50, 43, 36,
+    29, 22, 15, 23, 30, 37, 44, 51,
+    58, 59, 52, 45, 38, 31, 39, 46,
+    53, 60, 61, 54, 47, 55, 62, 63
+};
+
+/* Matching AC block encoder — port of jcarith.c:encode_mcu AC branch.
+ * Test-scope only. */
+static void arith_enc_ac_block(arith_encoder_t *e,
+                               uint8_t *ac_stats,
+                               uint8_t *fixed_bin,
+                               int Kx,
+                               int Ss, int Se,
+                               const int16_t *block)
+{
+    int k, ke, v, v2, m;
+    uint8_t *st;
+
+    /* Find EOB position — highest non-zero zigzag index, within [Ss,Se]. */
+    ke = Ss - 1;
+    for (k = Se; k >= Ss; k--) {
+        if (block[ZZ[k]] != 0) { ke = k; break; }
+    }
+
+    for (k = Ss; k <= ke; k++) {
+        st = ac_stats + 3 * (k - 1);
+        arith_encode(e, st, 0);                /* EOB=0 (more coefs) */
+        /* Zero run: emit "zero at this k" bits. */
+        while ((v = block[ZZ[k]]) == 0) {
+            arith_encode(e, st + 1, 0);
+            st += 3;
+            k++;
+        }
+        arith_encode(e, st + 1, 1);            /* "coef is non-zero" */
+
+        /* Sign on shared fixed_bin. */
+        if (v > 0) {
+            arith_encode(e, fixed_bin, 0);
+        } else {
+            v = -v;
+            arith_encode(e, fixed_bin, 1);
+        }
+        st += 2;
+
+        /* Magnitude category. */
+        m = 0;
+        v -= 1;
+        if (v != 0) {
+            arith_encode(e, st, 1);
+            m = 1;
+            v2 = v;
+            if (v2 >>= 1) {
+                arith_encode(e, st, 1);
+                m <<= 1;
+                st = ac_stats + (k <= Kx ? 189 : 217);
+                while (v2 >>= 1) {
+                    arith_encode(e, st, 1);
+                    m <<= 1;
+                    st += 1;
+                }
+            }
+        }
+        arith_encode(e, st, 0);                /* terminator */
+
+        /* Magnitude bits at shared M-bin (st + 14). */
+        st += 14;
+        while (m >>= 1) {
+            arith_encode(e, st, (m & v) ? 1 : 0);
+        }
+    }
+
+    /* Emit trailing EOB=1 if we didn't run the full band. */
+    if (ke < Se) {
+        st = ac_stats + 3 * (ke);              /* k = ke+1 → 3*((ke+1)-1) = 3*ke */
+        arith_encode(e, st, 1);
+    }
+}
+
+/* Build a block with sparsity `sparsity` (fraction of zero coefs) and
+ * magnitudes in [-max_mag, +max_mag]. DC position (index 0) is always 0
+ * so the caller can reuse this for AC-only tests. */
+static void fill_random_block(int16_t block[64], uint64_t *rs,
+                              int max_mag, int sparsity_32)
+{
+    memset(block, 0, 64 * sizeof(int16_t));
+    for (int k = 1; k < 64; k++) {
+        uint64_t r = xorshift64(rs);
+        if ((int)((r >> 16) & 0x1F) < sparsity_32) continue;  /* zero */
+        int sign = (r & 1) ? -1 : 1;
+        int mag = (int)((r >> 1) & 0x1FFF);
+        mag = mag % max_mag + 1;
+        block[ZZ[k]] = (int16_t)(sign * mag);
+    }
+}
+
+/* 6a: 20 blocks with varying sparsity and magnitudes (q=baseline range). */
+static int test_ac_block_varied(void)
+{
+    const int NB = 20;
+    uint8_t enc_buf[65536];
+    uint8_t stats_e[256] = {0};
+    uint8_t stats_d[256] = {0};
+    uint8_t fb_e = 0, fb_d = 0;
+    int16_t blocks[20][64];
+    uint64_t rs = 0x5a5a5a5a12345678ULL;
+
+    /* Mix sparsity: 0 = dense, 30 = ~94% zeros. */
+    int sparsities[20];
+    int max_mags[20];
+    for (int i = 0; i < NB; i++) {
+        sparsities[i] = (int)(xorshift64(&rs) & 0x1F);          /* 0..31 */
+        max_mags[i]   = (int)((xorshift64(&rs) & 0x3FF) + 1);   /* 1..1024 */
+        fill_random_block(blocks[i], &rs, max_mags[i], sparsities[i]);
+    }
+
+    arith_encoder_t e; enc_init(&e, enc_buf, sizeof(enc_buf));
+    for (int i = 0; i < NB; i++)
+        arith_enc_ac_block(&e, stats_e, &fb_e, 5, 1, 63, blocks[i]);
+    arith_encode_finish(&e);
+
+    arith_decoder_t dd; arith_dec_init(&dd, enc_buf, e.pos);
+    int16_t out[64];
+    for (int i = 0; i < NB; i++) {
+        memset(out, 0, sizeof(out));
+        int rc = arith_dec_ac_block(&dd, stats_d, &fb_d, 5, 1, 63, out);
+        if (rc != 0) {
+            fprintf(stderr, "[test_ac_block_varied] block %d rc=%d\n", i, rc);
+            return 1;
+        }
+        for (int j = 1; j < 64; j++) {          /* AC only — skip DC */
+            if (out[j] != blocks[i][j]) {
+                fprintf(stderr,
+                        "[test_ac_block_varied] block %d coef[%d]: "
+                        "exp=%d got=%d (sparsity=%d max_mag=%d)\n",
+                        i, j, blocks[i][j], out[j], sparsities[i], max_mags[i]);
+                return 1;
+            }
+        }
+    }
+    if (memcmp(stats_e, stats_d, 256) != 0 || fb_e != fb_d) {
+        fprintf(stderr, "[test_ac_block_varied] stats table / fixed_bin diverged\n");
+        return 1;
+    }
+    printf("[PASS] ac_block_varied       %d blocks, encoded=%zu bytes\n",
+           NB, e.pos);
+    return 0;
+}
+
+/* 6b: edge blocks — all-zero AC, single coef at various positions,
+ *     full dense band, long zero-run then late coef. */
+static int test_ac_block_edge_cases(void)
+{
+    uint8_t enc_buf[32768];
+    uint8_t stats_e[256] = {0};
+    uint8_t stats_d[256] = {0};
+    uint8_t fb_e = 0, fb_d = 0;
+    int16_t blocks[8][64] = {0};
+
+    /* 0: all-zero AC (pure EOB at k=1). */
+    /* 1: only block[ZZ[1]] = 7. */
+    blocks[1][ZZ[1]] = 7;
+    /* 2: only block[ZZ[63]] = -511 (last position, large magnitude). */
+    blocks[2][ZZ[63]] = -511;
+    /* 3: single coef at k=32 = 1024. */
+    blocks[3][ZZ[32]] = 1024;
+    /* 4: dense run k=1..8 with small magnitudes. */
+    for (int k = 1; k <= 8; k++) blocks[4][ZZ[k]] = (int16_t)k;
+    /* 5: sparse — zeros at k=1..40 then block[ZZ[41]] = -1. */
+    blocks[5][ZZ[41]] = -1;
+    /* 6: all coefs = 1 (max density, min magnitude). */
+    for (int k = 1; k <= 63; k++) blocks[6][ZZ[k]] = 1;
+    /* 7: alternating ±255 signs. */
+    for (int k = 1; k <= 63; k++) blocks[7][ZZ[k]] = (k & 1) ? 255 : -255;
+
+    arith_encoder_t e; enc_init(&e, enc_buf, sizeof(enc_buf));
+    for (int i = 0; i < 8; i++)
+        arith_enc_ac_block(&e, stats_e, &fb_e, 5, 1, 63, blocks[i]);
+    arith_encode_finish(&e);
+
+    arith_decoder_t dd; arith_dec_init(&dd, enc_buf, e.pos);
+    int16_t out[64];
+    for (int i = 0; i < 8; i++) {
+        memset(out, 0, sizeof(out));
+        int rc = arith_dec_ac_block(&dd, stats_d, &fb_d, 5, 1, 63, out);
+        if (rc != 0) {
+            fprintf(stderr, "[test_ac_block_edge_cases] block %d rc=%d\n", i, rc);
+            return 1;
+        }
+        for (int j = 1; j < 64; j++) {
+            if (out[j] != blocks[i][j]) {
+                fprintf(stderr,
+                        "[test_ac_block_edge_cases] block %d coef[%d]: "
+                        "exp=%d got=%d\n", i, j, blocks[i][j], out[j]);
+                return 1;
+            }
+        }
+    }
+    if (memcmp(stats_e, stats_d, 256) != 0 || fb_e != fb_d) {
+        fprintf(stderr, "[test_ac_block_edge_cases] stats diverged\n");
+        return 1;
+    }
+    printf("[PASS] ac_block_edge_cases   8 specialised blocks, encoded=%zu bytes\n",
+           e.pos);
+    return 0;
+}
+
+/* 6c: Kx conditioning sweep — 5 Kx values × 10 random blocks each,
+ *     check round-trip + stats convergence. */
+static int test_ac_block_conditioning(void)
+{
+    uint8_t enc_buf[32768];
+    uint64_t rs = 0xbadf00dc0ffee123ULL;
+    int total = 0;
+
+    for (int Kx = 1; Kx <= 32; Kx += 8) {
+        uint8_t stats_e[256] = {0};
+        uint8_t stats_d[256] = {0};
+        uint8_t fb_e = 0, fb_d = 0;
+        int16_t blocks[10][64];
+        for (int i = 0; i < 10; i++)
+            fill_random_block(blocks[i], &rs, 512, 10);
+
+        arith_encoder_t e; enc_init(&e, enc_buf, sizeof(enc_buf));
+        for (int i = 0; i < 10; i++)
+            arith_enc_ac_block(&e, stats_e, &fb_e, Kx, 1, 63, blocks[i]);
+        arith_encode_finish(&e);
+
+        arith_decoder_t dd; arith_dec_init(&dd, enc_buf, e.pos);
+        int16_t out[64];
+        for (int i = 0; i < 10; i++) {
+            memset(out, 0, sizeof(out));
+            int rc = arith_dec_ac_block(&dd, stats_d, &fb_d, Kx, 1, 63, out);
+            if (rc != 0) {
+                fprintf(stderr, "[test_ac_block_conditioning] Kx=%d i=%d rc=%d\n",
+                        Kx, i, rc);
+                return 1;
+            }
+            for (int j = 1; j < 64; j++) {
+                if (out[j] != blocks[i][j]) {
+                    fprintf(stderr,
+                            "[test_ac_block_conditioning] Kx=%d block %d coef[%d]: "
+                            "exp=%d got=%d\n",
+                            Kx, i, j, blocks[i][j], out[j]);
+                    return 1;
+                }
+            }
+        }
+        if (memcmp(stats_e, stats_d, 256) != 0 || fb_e != fb_d) {
+            fprintf(stderr, "[test_ac_block_conditioning] Kx=%d stats diverged\n", Kx);
+            return 1;
+        }
+        total++;
+    }
+    printf("[PASS] ac_block_conditioning Kx sweeps=%d  (Kx ∈ {1,9,17,25}, N=10 per Kx)\n",
+           total);
+    return 0;
+}
+
 int main(void)
 {
     int rc = 0;
@@ -681,6 +948,9 @@ int main(void)
     rc |= test_dc_diff_small_range();
     rc |= test_dc_diff_random_12bit();
     rc |= test_dc_diff_conditioning();
+    rc |= test_ac_block_varied();
+    rc |= test_ac_block_edge_cases();
+    rc |= test_ac_block_conditioning();
     if (rc == 0) printf("ALL ARITH TESTS PASSED\n");
     return rc ? 1 : 0;
 }

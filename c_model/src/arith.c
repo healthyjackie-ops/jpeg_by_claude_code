@@ -264,3 +264,82 @@ int arith_dec_dc_diff(arith_decoder_t *d,
     *out_diff = v;
     return 0;
 }
+
+/* ------------------------------------------------------------------ */
+/* Phase 23a: AC-coefficient block decoder (ISO F.1.4.4.2).
+ *
+ * Faithful port of libjpeg-turbo/src/jdarith.c:decode_mcu AC loop. Writes
+ * non-zero coefs into the natural-order `block[64]` via the ZIGZAG
+ * table; caller zero-initialises the block. */
+static const uint8_t JPEG_ZIGZAG[64] = {
+     0,  1,  8, 16,  9,  2,  3, 10,
+    17, 24, 32, 25, 18, 11,  4,  5,
+    12, 19, 26, 33, 40, 48, 41, 34,
+    27, 20, 13,  6,  7, 14, 21, 28,
+    35, 42, 49, 56, 57, 50, 43, 36,
+    29, 22, 15, 23, 30, 37, 44, 51,
+    58, 59, 52, 45, 38, 31, 39, 46,
+    53, 60, 61, 54, 47, 55, 62, 63
+};
+
+int arith_dec_ac_block(arith_decoder_t *d,
+                       uint8_t *ac_stats,
+                       uint8_t *fixed_bin,
+                       int Kx,
+                       int Ss, int Se,
+                       int16_t *block)
+{
+    int k, sign, v, m;
+    uint8_t *st;
+
+    for (k = Ss; k <= Se; k++) {
+        st = ac_stats + 3 * (k - 1);
+        /* Figure F.20: EOB flag — 1 ⇒ no more coefs in this block. */
+        if (arith_dec_decode(d, st)) break;
+
+        /* Zero-run: advance k while "coef is zero" bit is 0. */
+        while (arith_dec_decode(d, st + 1) == 0) {
+            st += 3;
+            k++;
+            if (k > Se) {
+                /* Spectral overflow — corrupt stream. */
+                return -1;
+            }
+        }
+
+        /* Sign: single shared fixed_bin across all AC sign decisions. */
+        sign = arith_dec_decode(d, fixed_bin);
+        st += 2;
+
+        /* Figure F.23: magnitude category. */
+        m = arith_dec_decode(d, st);
+        if (m != 0) {
+            if (arith_dec_decode(d, st)) {
+                m <<= 1;
+                /* Low-freq (k ≤ Kx) and high-freq (k > Kx) get
+                 * independent X-bin regions. */
+                st = ac_stats + (k <= Kx ? 189 : 217);
+                while (arith_dec_decode(d, st)) {
+                    m <<= 1;
+                    if (m == 0x8000) {
+                        return -1;          /* magnitude overflow */
+                    }
+                    st += 1;
+                }
+            }
+        }
+
+        /* Magnitude bits share one M-bin at st+14 (same as DC). */
+        v = m;
+        st += 14;
+        while (m >>= 1) {
+            if (arith_dec_decode(d, st)) v |= m;
+        }
+        v += 1;
+        if (sign) v = -v;
+
+        block[JPEG_ZIGZAG[k]] = (int16_t)v;
+    }
+
+    return 0;
+}
