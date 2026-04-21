@@ -54,9 +54,11 @@
 |---|---|---|---|
 | **21** ✅ | [Q-coder 核 — C model](spec_phase21.md) | 1d | 4/4 round-trip tests bit-exact（single-bin + 8-bin adaptive + skewed Bernoulli + edge cases），phase06-27 零退步 |
 | **22a/b** ✅ | [SOF9 header + DC-diff helper — C model](spec_phase22.md) | 1d | DAC/SOF9/10/11 parse; `arith_dec_dc_diff` 7/7 round-trip tests bit-exact（exhaustive −32..+32 + 4 000 random 12-bit + 18 条件表对），smoke 12/12 + phase25c 143/143 + phase27 334/334 零退步 |
-| **22c** | [DC arith decode end-to-end](spec_phase22.md) | 3d | SOF9 DC-only vs libjpeg-turbo |
-| **23** | [AC arith decode](spec_phase23.md) | 5d | SOF9 完整 |
-| **24** | [SOF10 (progressive + arith)](spec_phase24.md) | 3d | SOF10 |
+| **23a** ✅ | [AC arith block helper — C model](spec_phase22.md) | 1d | `arith_dec_ac_block` 3/3 round-trip tests bit-exact（20 varied blocks + 8 edge blocks + Kx∈{1,9,17,25} sweep） |
+| **22c / 23b** ✅ | [SOF9 sequential arith end-to-end — C model](spec_phase22.md) | 1d | 18/18 phase22 向量 bit-exact vs libjpeg-turbo（gray + 4:4:4 + 4:2:0，8x8..128x96，q 50-80，DRI 0/4，含非 16 对齐 17x13），phase06-27 + phase_prog_dri 零退步（726/726） |
+| **23c** | [SOF9 RTL integration](spec_phase23.md) | 5d | RTL arith DC+AC 通路，bit-exact 回归 |
+| **24a** | [SOF10 progressive arith — C model](spec_phase24.md) | 3d | SOF10 spectral / refine / AC-first vs libjpeg-turbo |
+| **24b** | [SOF10 RTL](spec_phase24.md) | 5d | progressive coef buffer × arith |
 
 ### Wave 5 — Lossless
 
