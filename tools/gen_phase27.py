@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Phase 27 test vectors — **SOF3 Lossless + P ∈ {9..16}**.
+Phase 27 test vectors — **SOF3 Lossless + P ∈ {2..7, 9..16}**.
 
 Builds on Phase 25a/b/c (SOF3 P=8 covered for gray/RGB + DRI) by exercising
 every non-8 precision allowed by ISO H.1.2.1. Scope:
 
-  • P   ∈ {9, 10, 11, 12, 13, 14, 15, 16}
+  • P   ∈ {2, 3, 4, 5, 6, 7}  (low-precision grids F..I)
+  • P   ∈ {9, 10, 11, 12, 13, 14, 15, 16}  (high-precision grids A..E)
   • Ps  ∈ {1..7}  (full predictor set on the 32x32 grid; subset on the rest)
   • Pt  ∈ {0, 2}  (Pt=0 dominant; Pt=2 exercises point-transform with P>8)
   • Nf  ∈ {1, 3}  (grayscale + RGB interleaved, H=V=1)
@@ -202,6 +203,44 @@ def main() -> int:
     # 2 × 3 × 2 = 12 vectors.  Restart every 2 rows (DRI = 64 MCUs for 32-wide).
     for P in (12, 16):
         for ps in (1, 4, 7):
+            cases.append((32, 32, "gray_grad", P, ps, 0, 2))
+            cases.append((32, 32, "rgb_grad",  P, ps, 0, 2))
+
+    # --- Low-precision extension grids (P ∈ {2..7}) ---
+    # Phase 25a/b/c already covered P=8 extensively (215 vectors). Phase 27
+    # grids A..E cover P ∈ {9..16} (208 vectors). These grids fill the ISO
+    # H.1.2.1 range down to the minimum allowed precision P=2.
+    #
+    # Note: at low P the dynamic range is tiny (P=2 → values {0..3}), so the
+    # gradient / checker patterns lose visual meaning but still exercise the
+    # predictor/wrap/mask paths rigorously.
+
+    # Grid F: every P ∈ {2..7} × every Ps ∈ {1..7} × 32x32 gray+RGB gradient.
+    # 6 × 7 × 2 = 84 vectors.
+    for P in range(2, 8):
+        for ps in range(1, 8):
+            cases.append((32, 32, "gray_grad", P, ps, 0, 0))
+            cases.append((32, 32, "rgb_grad",  P, ps, 0, 0))
+
+    # Grid G: noise stress on P ∈ {2, 4, 7} × Ps ∈ {1, 4, 7} × 32x32.
+    # 3 × 3 × 2 = 18 vectors.
+    for P in (2, 4, 7):
+        for ps in (1, 4, 7):
+            cases.append((32, 32, "gray_noise", P, ps, 0, 0))
+            cases.append((32, 32, "rgb_noise",  P, ps, 0, 0))
+
+    # Grid H: Pt > 0 at P ∈ {4, 7} × Ps ∈ {1, 7} × Pt ∈ {1, 2} × gray+RGB.
+    # 2 × 2 × 2 × 2 = 16 vectors. Pt < P so both (P=4,Pt=2) and (P=7,Pt=2) OK.
+    for P in (4, 7):
+        for ps in (1, 7):
+            for pt in (1, 2):
+                cases.append((32, 32, "gray_grad", P, ps, pt, 0))
+                cases.append((32, 32, "rgb_grad",  P, ps, pt, 0))
+
+    # Grid I: DRI at P ∈ {4, 7} × Ps ∈ {1, 7} × gray+RGB gradient × 32x32.
+    # 2 × 2 × 2 = 8 vectors. Restart every 2 rows.
+    for P in (4, 7):
+        for ps in (1, 7):
             cases.append((32, 32, "gray_grad", P, ps, 0, 2))
             cases.append((32, 32, "rgb_grad",  P, ps, 0, 2))
 

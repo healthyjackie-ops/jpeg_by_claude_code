@@ -1,6 +1,6 @@
 # Phase 27 — Lossless 2–16-bit precision (SOF3, P ∈ {2..16})
 
-**Status**: ✅ C-model complete — 208/208 bit-exact (2026-04-21)
+**Status**: ✅ C-model complete — 334/334 bit-exact (2026-04-21)
 **Parent**: [`spec_phase25.md`](spec_phase25.md) (baseline lossless scope)
 **Roadmap entry**: [`roadmap_v2.md`](roadmap_v2.md) Wave 5 Phase 27
 
@@ -105,40 +105,56 @@ existing P=12 DCT plane-compare loop was generalised from
 `precision == 12` to `precision > 8`, letting it cover both Phase 13
 DCT and Phase 27 lossless uint16 paths without further branching.
 
-## 7. Test matrix (208 vectors)
+## 7. Test matrix (334 vectors)
 
 `tools/gen_phase27.py` invokes `cjpeg -lossless Ps[,Pt] -precision P`
-over 5 grids:
+over 9 grids. Grids A-E cover the high-precision range P ∈ {9..16};
+grids F-I extend down to the minimum ISO precision P=2.
 
 | Grid | Combinations | # |
 |---|---|---|
-| A — every P × every Ps × 32×32 gray+RGB gradient | 8 P × 7 Ps × 2 comp | 112 |
-| B — every P × Ps ∈ {1,4,7} × 32×32 noise | 8 × 3 × 2 | 48 |
-| C — P ∈ {9,12,16} × Ps ∈ {1,7} × 48×32 | 3 × 2 × 2 | 12 |
-| D — P ∈ {9,12,16} × Ps ∈ {1,7} × Pt ∈ {1,2} × gradient | 3 × 2 × 2 × 2 | 24 |
-| E — P ∈ {12,16} × Ps ∈ {1,4,7} × 2-row DRI | 2 × 3 × 2 | 12 |
-| **Total** | | **208** |
+| A — P ∈ {9..16} × every Ps × 32×32 gray+RGB gradient | 8 × 7 × 2 | 112 |
+| B — P ∈ {9..16} × Ps ∈ {1,4,7} × 32×32 noise | 8 × 3 × 2 | 48 |
+| C — P ∈ {9,12,16} × Ps ∈ {1,7} × 48×32 gray check + RGB grad | 3 × 2 × 2 | 12 |
+| D — P ∈ {9,12,16} × Ps ∈ {1,7} × Pt ∈ {1,2} × gray+RGB gradient | 3 × 2 × 2 × 2 | 24 |
+| E — P ∈ {12,16} × Ps ∈ {1,4,7} × 2-row DRI × gray+RGB gradient | 2 × 3 × 2 | 12 |
+| F — P ∈ {2..7} × every Ps × 32×32 gray+RGB gradient | 6 × 7 × 2 | 84 |
+| G — P ∈ {2,4,7} × Ps ∈ {1,4,7} × 32×32 gray+RGB noise | 3 × 3 × 2 | 18 |
+| H — P ∈ {4,7} × Ps ∈ {1,7} × Pt ∈ {1,2} × gray+RGB gradient | 2 × 2 × 2 × 2 | 16 |
+| I — P ∈ {4,7} × Ps ∈ {1,7} × 2-row DRI × gray+RGB gradient | 2 × 2 × 2 | 8 |
+| **Total** | | **334** |
 
 Vectors are wrapped in 16-bit big-endian PGM/PPM with `maxval = 2^P - 1`
 so cjpeg preserves the input sample values without rescaling (verified
-via a one-off roundtrip before bulk generation).
+via a one-off roundtrip before bulk generation). For `P ≤ 8` the
+writer falls through to 8-bit binary PNM.
+
+Low-precision sub-range (grids F-I) was added in a follow-up sweep
+after the initial 208-vector matrix — cjpeg was verified to accept
+every `-precision` value down to 2, and djpeg round-trips each.
 
 ## 8. Regression summary (2026-04-21)
 
 ```
-phase06 … phase13        : 150 / 150    (waves 1-2, unchanged)
-phase14 … phase18 + prog_dri : 75 / 75   (wave 3, unchanged)
-phase25 / 25b / 25c      : 215 / 215    (lossless P=8, unchanged)
-phase27                  : 208 / 208    (NEW — P ∈ {9..16})
-smoke                    :  12 / 12
+phase06 … phase13        :  150 / 150    (waves 1-2, unchanged)
+phase14 … phase18 + prog_dri :   75 / 75    (wave 3, unchanged)
+phase25 / 25b / 25c      :  215 / 215    (lossless P=8, unchanged)
+phase27                  :  334 / 334    (P ∈ {2..7, 9..16}; grids A..I)
+smoke                    :   12 / 12
 full                     : 1150 / 1150
-TOTAL                    : 1810 / 1810  bit-exact
+TOTAL                    : 1936 / 1936    bit-exact
 ```
 
 All pre-existing suites remain worst_diff Y=0 C=0 after the refactor of
 `parse_sof_common` (narrow → `(p_min, p_max)` signature),
 `decode_lossless` (uint8 internal → uint16 internal), and the
 dispatch-reorder fix.
+
+The low-P sweep (+126 vectors in grids F-I) passed bit-exact on the
+first run — no code changes needed because `decode_lossless` already
+handles P ∈ {2..16} with uint16 predictor-domain storage and P-bit
+output masking, and the libjpeg-turbo golden picks the 8-bit API path
+for P ≤ 8 automatically.
 
 ## 9. Debugging notes
 

@@ -65,7 +65,7 @@
 | **25b** ✅ | [SOF3 Nf=3 RGB + Pt>0 — C model](spec_phase25.md) | 1d | 44/44 phase25b 向量 bit-exact（3-comp RGB interleaved + Nf=1 gray + Pt ∈ {0..4}），phase06-25a 零退步 |
 | **25c** ✅ | [SOF3 + DRI — C model](spec_phase25.md) | 1d | 143/143 phase25c 向量 bit-exact（gray/RGB × Ps 1-7 × Pt 0-2 × DRI 1/2/4/8 rows），phase06-25b 零退步 |
 | **26** | [Lossless Huffman (1–16 sizes) — RTL](spec_phase26.md) | 2d | RTL lossless path |
-| **27** ✅ | [Lossless 2–16 bit precision — C model](spec_phase27.md) | 1d | 208/208 phase27 向量 bit-exact（P∈{9..16} × Ps 1-7 × Pt 0-2 × gray/RGB × DRI 0/2rows），phase06-25c 零退步 |
+| **27** ✅ | [Lossless 2–16 bit precision — C model](spec_phase27.md) | 1d | 334/334 phase27 向量 bit-exact（P∈{2..7, 9..16} × Ps 1-7 × Pt 0-2 × gray/RGB × DRI 0/2rows），phase06-25c 零退步 |
 | **28** | [SOF11 (lossless + arith)](spec_phase28.md) | 3d | SOF11 |
 
 ### Wave 6 — Hierarchical
