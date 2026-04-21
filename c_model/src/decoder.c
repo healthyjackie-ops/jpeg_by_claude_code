@@ -987,8 +987,11 @@ static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
     int is_gray = (info->chroma_mode == CHROMA_GRAY);
     int is_444  = (info->chroma_mode == CHROMA_444);
     int is_420  = (info->chroma_mode == CHROMA_420);
-    if (!is_gray && !is_444 && !is_420) {
-        /* Phase 17a: scope limited to gray / 4:4:4 / 4:2:0 */
+    int is_422  = (info->chroma_mode == CHROMA_422);
+    int is_440  = (info->chroma_mode == CHROMA_440);
+    int is_411  = (info->chroma_mode == CHROMA_411);
+    if (!is_gray && !is_444 && !is_420 && !is_422 && !is_440 && !is_411) {
+        /* Phase 17a: gray / 4:4:4 / 4:2:0 ; Phase 17d extends to 422/440/411 */
         out->err = JPEG_ERR_UNSUP_CHROMA;
         return -1;
     }
@@ -1000,12 +1003,14 @@ static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
 
     uint16_t W  = info->width;
     uint16_t H  = info->height;
-    uint16_t mcu_w = is_420 ? 16 : 8;
-    uint16_t mcu_h = is_420 ? 16 : 8;
+    /* MCU footprint mirrors baseline (Phase 10/11). */
+    uint16_t mcu_w = is_411 ? 32 : ((is_420 || is_422) ? 16 : 8);
+    uint16_t mcu_h = (is_420 || is_440) ? 16 : 8;
     uint16_t Wp = info->mcu_cols * mcu_w;
     uint16_t Hp = info->mcu_rows * mcu_h;
-    uint16_t CWp_sub = is_420 ? (Wp >> 1) : Wp;
-    uint16_t CHp_sub = is_420 ? (Hp >> 1) : Hp;
+    uint16_t CWp_sub = is_411 ? (uint16_t)(Wp >> 2)
+                              : ((is_420 || is_422) ? (uint16_t)(Wp >> 1) : Wp);
+    uint16_t CHp_sub = (is_420 || is_440) ? (uint16_t)(Hp >> 1) : Hp;
 
     out->width  = W;
     out->height = H;
@@ -1039,7 +1044,7 @@ static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
             cg[c].nat_rows = yh_nat;
             cg[c].nat_cols = yw_nat;
         }
-    } else { /* 4:2:0 */
+    } else if (is_420) {
         uint32_t cw = (uint32_t)((W + 1u) / 2u);
         uint32_t ch = (uint32_t)((H + 1u) / 2u);
         uint32_t cw_nat = (cw + 7u) / 8u;
@@ -1052,6 +1057,45 @@ static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
             cg[c].blk_rows = info->mcu_rows;
             cg[c].blk_cols = info->mcu_cols;
             cg[c].nat_rows = ch_nat;
+            cg[c].nat_cols = cw_nat;
+        }
+    } else if (is_422) {
+        uint32_t cw = (uint32_t)((W + 1u) / 2u);
+        uint32_t cw_nat = (cw + 7u) / 8u;
+        cg[0].blk_rows = info->mcu_rows;
+        cg[0].blk_cols = info->mcu_cols * 2u;
+        cg[0].nat_rows = yh_nat;
+        cg[0].nat_cols = yw_nat;
+        for (int c = 1; c < 3; c++) {
+            cg[c].blk_rows = info->mcu_rows;
+            cg[c].blk_cols = info->mcu_cols;
+            cg[c].nat_rows = yh_nat;
+            cg[c].nat_cols = cw_nat;
+        }
+    } else if (is_440) {
+        uint32_t ch = (uint32_t)((H + 1u) / 2u);
+        uint32_t ch_nat = (ch + 7u) / 8u;
+        cg[0].blk_rows = info->mcu_rows * 2u;
+        cg[0].blk_cols = info->mcu_cols;
+        cg[0].nat_rows = yh_nat;
+        cg[0].nat_cols = yw_nat;
+        for (int c = 1; c < 3; c++) {
+            cg[c].blk_rows = info->mcu_rows;
+            cg[c].blk_cols = info->mcu_cols;
+            cg[c].nat_rows = ch_nat;
+            cg[c].nat_cols = yw_nat;
+        }
+    } else { /* 4:1:1 */
+        uint32_t cw = (uint32_t)((W + 3u) / 4u);
+        uint32_t cw_nat = (cw + 7u) / 8u;
+        cg[0].blk_rows = info->mcu_rows;
+        cg[0].blk_cols = info->mcu_cols * 4u;
+        cg[0].nat_rows = yh_nat;
+        cg[0].nat_cols = yw_nat;
+        for (int c = 1; c < 3; c++) {
+            cg[c].blk_rows = info->mcu_rows;
+            cg[c].blk_cols = info->mcu_cols;
+            cg[c].nat_rows = yh_nat;
             cg[c].nat_cols = cw_nat;
         }
     }
@@ -1135,7 +1179,7 @@ static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
                                 }
                             }
                         }
-                    } else { /* 4:2:0 */
+                    } else if (is_420) {
                         uint32_t y_by0 = my * 2u, y_bx0 = mx * 2u;
                         for (int iy = 0; iy < 2; iy++) {
                             for (int ix = 0; ix < 2; ix++) {
@@ -1155,6 +1199,122 @@ static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
                                             coef_buf[blk], al)) {
                                         out->err = JPEG_ERR_BAD_HUFFMAN; goto fail;
                                     }
+                                }
+                            }
+                        }
+                        for (int c = 1; c < 3; c++) {
+                            uint32_t blk = cg[c].base + my * cg[c].blk_cols + mx;
+                            if (is_refine) {
+                                if (huff_decode_dc_refine(bs, coef_buf[blk], al)) {
+                                    out->err = JPEG_ERR_BAD_HUFFMAN; goto fail;
+                                }
+                            } else {
+                                const htable_t *dc_tab =
+                                    &info->htables_dc[info->components[c].td];
+                                if (huff_decode_dc_progressive(
+                                        bs, dc_tab,
+                                        &info->components[c].dc_pred,
+                                        coef_buf[blk], al)) {
+                                    out->err = JPEG_ERR_BAD_HUFFMAN; goto fail;
+                                }
+                            }
+                        }
+                    } else if (is_422) {
+                        /* 4:2:2 — 2 Y blocks (horizontal) + Cb + Cr */
+                        uint32_t y_bx0 = mx * 2u;
+                        for (int ix = 0; ix < 2; ix++) {
+                            uint32_t blk = cg[0].base +
+                                my * cg[0].blk_cols +
+                                (y_bx0 + (uint32_t)ix);
+                            if (is_refine) {
+                                if (huff_decode_dc_refine(bs, coef_buf[blk], al)) {
+                                    out->err = JPEG_ERR_BAD_HUFFMAN; goto fail;
+                                }
+                            } else {
+                                const htable_t *dc_tab =
+                                    &info->htables_dc[info->components[0].td];
+                                if (huff_decode_dc_progressive(
+                                        bs, dc_tab,
+                                        &info->components[0].dc_pred,
+                                        coef_buf[blk], al)) {
+                                    out->err = JPEG_ERR_BAD_HUFFMAN; goto fail;
+                                }
+                            }
+                        }
+                        for (int c = 1; c < 3; c++) {
+                            uint32_t blk = cg[c].base + my * cg[c].blk_cols + mx;
+                            if (is_refine) {
+                                if (huff_decode_dc_refine(bs, coef_buf[blk], al)) {
+                                    out->err = JPEG_ERR_BAD_HUFFMAN; goto fail;
+                                }
+                            } else {
+                                const htable_t *dc_tab =
+                                    &info->htables_dc[info->components[c].td];
+                                if (huff_decode_dc_progressive(
+                                        bs, dc_tab,
+                                        &info->components[c].dc_pred,
+                                        coef_buf[blk], al)) {
+                                    out->err = JPEG_ERR_BAD_HUFFMAN; goto fail;
+                                }
+                            }
+                        }
+                    } else if (is_440) {
+                        /* 4:4:0 — 2 Y blocks (vertical) + Cb + Cr */
+                        uint32_t y_by0 = my * 2u;
+                        for (int iy = 0; iy < 2; iy++) {
+                            uint32_t blk = cg[0].base +
+                                (y_by0 + (uint32_t)iy) * cg[0].blk_cols +
+                                mx;
+                            if (is_refine) {
+                                if (huff_decode_dc_refine(bs, coef_buf[blk], al)) {
+                                    out->err = JPEG_ERR_BAD_HUFFMAN; goto fail;
+                                }
+                            } else {
+                                const htable_t *dc_tab =
+                                    &info->htables_dc[info->components[0].td];
+                                if (huff_decode_dc_progressive(
+                                        bs, dc_tab,
+                                        &info->components[0].dc_pred,
+                                        coef_buf[blk], al)) {
+                                    out->err = JPEG_ERR_BAD_HUFFMAN; goto fail;
+                                }
+                            }
+                        }
+                        for (int c = 1; c < 3; c++) {
+                            uint32_t blk = cg[c].base + my * cg[c].blk_cols + mx;
+                            if (is_refine) {
+                                if (huff_decode_dc_refine(bs, coef_buf[blk], al)) {
+                                    out->err = JPEG_ERR_BAD_HUFFMAN; goto fail;
+                                }
+                            } else {
+                                const htable_t *dc_tab =
+                                    &info->htables_dc[info->components[c].td];
+                                if (huff_decode_dc_progressive(
+                                        bs, dc_tab,
+                                        &info->components[c].dc_pred,
+                                        coef_buf[blk], al)) {
+                                    out->err = JPEG_ERR_BAD_HUFFMAN; goto fail;
+                                }
+                            }
+                        }
+                    } else { /* 4:1:1 — 4 Y blocks (horizontal) + Cb + Cr */
+                        uint32_t y_bx0 = mx * 4u;
+                        for (int ix = 0; ix < 4; ix++) {
+                            uint32_t blk = cg[0].base +
+                                my * cg[0].blk_cols +
+                                (y_bx0 + (uint32_t)ix);
+                            if (is_refine) {
+                                if (huff_decode_dc_refine(bs, coef_buf[blk], al)) {
+                                    out->err = JPEG_ERR_BAD_HUFFMAN; goto fail;
+                                }
+                            } else {
+                                const htable_t *dc_tab =
+                                    &info->htables_dc[info->components[0].td];
+                                if (huff_decode_dc_progressive(
+                                        bs, dc_tab,
+                                        &info->components[0].dc_pred,
+                                        coef_buf[blk], al)) {
+                                    out->err = JPEG_ERR_BAD_HUFFMAN; goto fail;
                                 }
                             }
                         }
@@ -1279,9 +1439,10 @@ static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
     /* Drain: dequant + IDCT per block, place into pad planes              */
     /* -------------------------------------------------------------------- */
 
+    int is_chroma_sub = (is_420 || is_422 || is_440 || is_411);
     uint8_t *y_pad      = (uint8_t*)calloc((size_t)Wp * Hp, 1);
-    uint8_t *cb_pad_sub = is_420 ? (uint8_t*)calloc((size_t)CWp_sub * CHp_sub, 1) : NULL;
-    uint8_t *cr_pad_sub = is_420 ? (uint8_t*)calloc((size_t)CWp_sub * CHp_sub, 1) : NULL;
+    uint8_t *cb_pad_sub = is_chroma_sub ? (uint8_t*)calloc((size_t)CWp_sub * CHp_sub, 1) : NULL;
+    uint8_t *cr_pad_sub = is_chroma_sub ? (uint8_t*)calloc((size_t)CWp_sub * CHp_sub, 1) : NULL;
     uint8_t *cb_pad     = is_gray ? NULL : (uint8_t*)calloc((size_t)Wp * Hp, 1);
     uint8_t *cr_pad     = is_gray ? NULL : (uint8_t*)calloc((size_t)Wp * Hp, 1);
 
@@ -1293,12 +1454,34 @@ static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
             out->cb_plane_420 = (uint8_t*)calloc((size_t)(W >> 1) * (H >> 1), 1);
             out->cr_plane_420 = (uint8_t*)calloc((size_t)(W >> 1) * (H >> 1), 1);
         }
+        if (is_422) {
+            out->cb_plane_422 = (uint8_t*)calloc((size_t)(W >> 1) * H, 1);
+            out->cr_plane_422 = (uint8_t*)calloc((size_t)(W >> 1) * H, 1);
+        }
+        if (is_440) {
+            out->cb_plane_440 = (uint8_t*)calloc((size_t)W * (H >> 1), 1);
+            out->cr_plane_440 = (uint8_t*)calloc((size_t)W * (H >> 1), 1);
+        }
+        if (is_411) {
+            out->cb_plane_411 = (uint8_t*)calloc((size_t)(W >> 2) * H, 1);
+            out->cr_plane_411 = (uint8_t*)calloc((size_t)(W >> 2) * H, 1);
+        }
     }
     int alloc_ok = y_pad && out->y_plane &&
                    (is_gray ||
                     (cb_pad && cr_pad && out->cb_plane && out->cr_plane &&
-                     (!is_420 || (cb_pad_sub && cr_pad_sub &&
-                                  out->cb_plane_420 && out->cr_plane_420))));
+                     (!is_420 ||
+                      (cb_pad_sub && cr_pad_sub &&
+                       out->cb_plane_420 && out->cr_plane_420)) &&
+                     (!is_422 ||
+                      (cb_pad_sub && cr_pad_sub &&
+                       out->cb_plane_422 && out->cr_plane_422)) &&
+                     (!is_440 ||
+                      (cb_pad_sub && cr_pad_sub &&
+                       out->cb_plane_440 && out->cr_plane_440)) &&
+                     (!is_411 ||
+                      (cb_pad_sub && cr_pad_sub &&
+                       out->cb_plane_411 && out->cr_plane_411))));
     if (!alloc_ok) {
         free(y_pad); free(cb_pad_sub); free(cr_pad_sub); free(cb_pad); free(cr_pad);
         out->err = (uint32_t)JPEG_ERR_INTERNAL; goto fail;
@@ -1315,7 +1498,7 @@ static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
         if (c == 0) {
             pad = y_pad;
             pad_stride = Wp;
-        } else if (is_420) {
+        } else if (is_chroma_sub) {
             pad = (c == 1) ? cb_pad_sub : cr_pad_sub;
             pad_stride = CWp_sub;
         } else { /* 4:4:4 */
@@ -1336,10 +1519,56 @@ static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
 
     free(coef_buf);
 
-    /* Chroma upsample (4:2:0 NN, same as baseline) */
+    /* Chroma upsample — mirrors baseline Phase 10/11 helpers. */
     if (is_420) {
         chroma_upsample_nn(cb_pad_sub, cb_pad, Wp, Hp);
         chroma_upsample_nn(cr_pad_sub, cr_pad, Wp, Hp);
+    } else if (is_422) {
+        /* 4:2:2 — horizontal 2x nearest-neighbor upsample. */
+        for (uint16_t r = 0; r < Hp; r++) {
+            const uint8_t *cb_src = cb_pad_sub + (size_t)r * CWp_sub;
+            const uint8_t *cr_src = cr_pad_sub + (size_t)r * CWp_sub;
+            uint8_t *cb_dst = cb_pad + (size_t)r * Wp;
+            uint8_t *cr_dst = cr_pad + (size_t)r * Wp;
+            for (uint16_t c = 0; c < CWp_sub; c++) {
+                cb_dst[2*c    ] = cb_src[c];
+                cb_dst[2*c + 1] = cb_src[c];
+                cr_dst[2*c    ] = cr_src[c];
+                cr_dst[2*c + 1] = cr_src[c];
+            }
+        }
+    } else if (is_411) {
+        /* 4:1:1 — horizontal 4x nearest-neighbor upsample. */
+        for (uint16_t r = 0; r < Hp; r++) {
+            const uint8_t *cb_src = cb_pad_sub + (size_t)r * CWp_sub;
+            const uint8_t *cr_src = cr_pad_sub + (size_t)r * CWp_sub;
+            uint8_t *cb_dst = cb_pad + (size_t)r * Wp;
+            uint8_t *cr_dst = cr_pad + (size_t)r * Wp;
+            for (uint16_t c = 0; c < CWp_sub; c++) {
+                cb_dst[4*c    ] = cb_src[c];
+                cb_dst[4*c + 1] = cb_src[c];
+                cb_dst[4*c + 2] = cb_src[c];
+                cb_dst[4*c + 3] = cb_src[c];
+                cr_dst[4*c    ] = cr_src[c];
+                cr_dst[4*c + 1] = cr_src[c];
+                cr_dst[4*c + 2] = cr_src[c];
+                cr_dst[4*c + 3] = cr_src[c];
+            }
+        }
+    } else if (is_440) {
+        /* 4:4:0 — vertical 2x nearest-neighbor upsample. */
+        for (uint16_t r = 0; r < CHp_sub; r++) {
+            const uint8_t *cb_src = cb_pad_sub + (size_t)r * CWp_sub;
+            const uint8_t *cr_src = cr_pad_sub + (size_t)r * CWp_sub;
+            uint8_t *cb_dst0 = cb_pad + (size_t)(2*r    ) * Wp;
+            uint8_t *cb_dst1 = cb_pad + (size_t)(2*r + 1) * Wp;
+            uint8_t *cr_dst0 = cr_pad + (size_t)(2*r    ) * Wp;
+            uint8_t *cr_dst1 = cr_pad + (size_t)(2*r + 1) * Wp;
+            memcpy(cb_dst0, cb_src, Wp);
+            memcpy(cb_dst1, cb_src, Wp);
+            memcpy(cr_dst0, cr_src, Wp);
+            memcpy(cr_dst1, cr_src, Wp);
+        }
     }
 
     /* Crop padded → output planes */
@@ -1356,6 +1585,30 @@ static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
                    cb_pad_sub + (size_t)r * CWp_sub, (W >> 1));
             memcpy(out->cr_plane_420 + (size_t)r * (W >> 1),
                    cr_pad_sub + (size_t)r * CWp_sub, (W >> 1));
+        }
+    }
+    if (is_422) {
+        for (uint16_t r = 0; r < H; r++) {
+            memcpy(out->cb_plane_422 + (size_t)r * (W >> 1),
+                   cb_pad_sub + (size_t)r * CWp_sub, (W >> 1));
+            memcpy(out->cr_plane_422 + (size_t)r * (W >> 1),
+                   cr_pad_sub + (size_t)r * CWp_sub, (W >> 1));
+        }
+    }
+    if (is_440) {
+        for (uint16_t r = 0; r < (H >> 1); r++) {
+            memcpy(out->cb_plane_440 + (size_t)r * W,
+                   cb_pad_sub + (size_t)r * CWp_sub, W);
+            memcpy(out->cr_plane_440 + (size_t)r * W,
+                   cr_pad_sub + (size_t)r * CWp_sub, W);
+        }
+    }
+    if (is_411) {
+        for (uint16_t r = 0; r < H; r++) {
+            memcpy(out->cb_plane_411 + (size_t)r * (W >> 2),
+                   cb_pad_sub + (size_t)r * CWp_sub, (W >> 2));
+            memcpy(out->cr_plane_411 + (size_t)r * (W >> 2),
+                   cr_pad_sub + (size_t)r * CWp_sub, (W >> 2));
         }
     }
 

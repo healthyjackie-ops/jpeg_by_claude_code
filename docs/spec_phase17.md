@@ -332,3 +332,87 @@ ISO 10918-1 A.2.3 规定非交错扫描的块数 = ceil(Xi/8) × ceil(Yi/8)（�
 ### 8.4 交付
 - `Makefile`：新增 `phase17` target + PHASE17_DIR
 - `c_model/tools/dump_coefs.c`：libjpeg 的 `jpeg_read_coefficients()` 包装，block-by-block coef dump，用于 bug 排查
+
+## 9. Phase 17d — SOF2 Huffman extended chroma (4:2:2 / 4:4:0 / 4:1:1)
+
+**Status**: ✅ **COMPLETE** — 81/81 phase17d bit-exact (2026-04-21).
+
+Phases 17a/b/c + 18a/b/c covered gray / 4:4:4 / 4:2:0 only. Phase 24c
+then extended the **arith** progressive path (SOF10) to 4:2:2 / 4:4:0 /
+4:1:1, which left the Huffman progressive path (SOF2) trailing. Phase
+17d closes that asymmetry by folding the same three 3-comp YCbCr
+layouts into `decode_progressive`.
+
+| Mode | Sampling | MCU | Y blocks | Cb/Cr blocks |
+|---|---|---|---|---|
+| 4:2:2 | Y 2×1, chroma 1×1 | 16×8  | 2 (horizontal) | 1 each |
+| 4:4:0 | Y 1×2, chroma 1×1 | 8×16  | 2 (vertical)   | 1 each |
+| 4:1:1 | Y 4×1, chroma 1×1 | 32×8  | 4 (horizontal) | 1 each |
+
+### 9.1 Changes to `decode_progressive`
+
+Same five-step shape as Phase 24c `decode_sof10` (and identical branch
+layout — coef_buf + cg[c] natural grid already generalize to any
+sampling; only explicit MCU-interleave + drain upsample are per-mode):
+
+1. **Accept gate** extended from `{gray, 444, 420}` to also admit
+   `{422, 440, 411}`; `is_chroma_sub` replaces `is_420` in the drain
+   buffer-allocation predicate.
+2. **MCU footprint** mirrors baseline:
+   ```
+   mcu_w = is_411 ? 32 : ((is_420 || is_422) ? 16 : 8);
+   mcu_h = (is_420 || is_440) ? 16 : 8;
+   CWp_sub = is_411 ? Wp>>2 : ((is_420 || is_422) ? Wp>>1 : Wp);
+   CHp_sub = (is_420 || is_440) ? Hp>>1 : Hp;
+   ```
+3. **`cg[c]` natural block grid** per sampling — three new branches
+   set `blk_rows × blk_cols` for Y (mcu-major, 2× horiz / 2× vert /
+   4× horiz) and chroma (1×1). AC non-interleaved scan walks
+   `nat_rows × nat_cols` on each component's grid without per-mode code.
+4. **DC-first MCU interleave** — three new branches emit
+   `huff_decode_dc_progressive` (or `huff_decode_dc_refine` in refine
+   scans) in ISO-mandated order: Y blocks in natural scan order, then
+   Cb, then Cr. DRI restart handling and AC scan loop are both mode-
+   agnostic (they already walk `cg[c]` / `nat_rows × nat_cols`).
+5. **Drain upsample + sub-res copy** — three new cases for chroma
+   upsample (horiz 2x / horiz 4x / vert 2x) and three new cases to
+   emit `cb_plane_422 / _440 / _411` (and Cr counterparts). These
+   mirror the baseline Phase 10/11 helpers verbatim.
+
+### 9.2 Vectors
+
+`tools/gen_phase17d.py` generates **81 vectors** (3 chroma × 3 patterns
+× 9 size/quality/DRI combos). Each file is encoded with cjpeg's
+default progressive script, so every vector exercises all 4 scan types
+(DC-first, DC-refine, AC-first, AC-refine).
+
+- Sizes span 17×16 (non-MCU-aligned) → 320×200
+- DRI ∈ {0, 1, 4, 8}
+- Quality ∈ {30, 60, 70, 75, 80, 85, 90}
+
+**81/81 pixel-exact vs libjpeg-turbo on first try, no bring-up issues.**
+The coef_buf + cg[c] abstraction from Phase 24a/24c generalized the
+scan loop enough that only DC-first MCU interleave + drain upsample/copy
+needed new code — the AC scan loop was mode-agnostic.
+
+### 9.3 Regression
+
+- `make test`: ALL TESTS PASSED
+- full (phase06-18 legacy, incl. phase_prog_dri + smoke): 1150/1150 Y=0 C=0
+- phase22 (SOF9 sequential arith gray/444/420): 18/18
+- phase24 (SOF10 progressive arith gray/444/420): 33/33
+- phase24c (SOF9/SOF10 arith 422/440/411): 162/162
+- phase17d (SOF2 Huffman 422/440/411): 81/81
+- **Combined 1444/1444 bit-exact**
+
+### 9.4 Remaining gaps (after Phase 17d)
+
+After Phase 17d, SOF2 Huffman covers all 5 common 8-bit 3-comp YCbCr
+chroma layouts — matching arith parity reached in Phase 24c. Still
+deferred:
+
+- **CMYK (Nf=4)** in any SOF2/SOF9/SOF10 path
+- **P=12** in any SOF2/SOF9/SOF10 path (decode_progressive asserts P=8)
+
+Both are unblockable future extensions; libjpeg-turbo supports them so
+bit-exact reference decodes are available whenever the scope pickup lands.

@@ -43,6 +43,7 @@
 | **17a** ✅ | [AC spectral selection — C model](spec_phase17.md) | 2d | 16/16 phase17 向量 pixel-exact vs libjpeg-turbo（gray/444/420，Ah=0） |
 | **17b** | [AC spectral selection — RTL](spec_phase17.md) | 3–4d | huffman AC-only + coef_buffer writeback；16/16 RTL bit-exact |
 | **17c / 18c** ✅ | [Progressive + DRI — C model](spec_phase17.md) | 1d | 20/20 phase_prog_dri 向量 pixel-exact（spectral + refine × gray/444/420 × DRI 1-16），phase06-18 零退步 |
+| **17d** ✅ | [SOF2 Huffman extended chroma (4:2:2 / 4:4:0 / 4:1:1) — C model](spec_phase17.md) | 1d | 81/81 phase17d 向量 bit-exact vs libjpeg-turbo（3 sampling × 3 patterns × 9 sizes，含非 MCU 对齐 17x16，DRI ∈ {0,1,4,8}，q 30-90，cjpeg 默认 progressive script 覆盖 4 种 scan 类型），full + phase22 + phase24 + phase24c 零退步（1444/1444） |
 | **18a** ✅ | [Successive approximation — C model](spec_phase18.md) | 1d | 17/17 phase18 向量 pixel-exact（DC+AC refine，Ah>0），phase16/17 零退步 |
 | **18b** | [Successive approximation — RTL](spec_phase18.md) | 3–5d | RTL refine path + coef_buffer read-modify-write；17/17 RTL bit-exact |
 | **19** | [Drain → IDCT → 输出](spec_phase19.md) | 3–4d | 1080p progressive 端到端 |
