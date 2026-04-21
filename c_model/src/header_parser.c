@@ -328,11 +328,14 @@ static int parse_sos(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
     if (bs_read_byte(bs, &ns)) { *err |= JPEG_ERR_STREAM_TRUNC; return -1; }
     /* Phase 8: baseline requires Ns == num_components.
      * Phase 17a: SOF2 progressive allows non-interleaved AC scans (Ns=1).
+     * Phase 24a: SOF10 (progressive + arithmetic) uses the same scan
+     *            topology as SOF2 — accept both.
      *            ISO G.1.1.1 also permits Ns <= 4 for interleaved scans. */
-    if (info->sof_type != 2 && ns != info->num_components) {
+    int is_progressive = (info->sof_type == 2 || info->sof_type == 10);
+    if (!is_progressive && ns != info->num_components) {
         *err |= JPEG_ERR_UNSUP_CHROMA; return -1;
     }
-    if (info->sof_type == 2) {
+    if (is_progressive) {
         if (ns == 0 || ns > info->num_components) {
             *err |= JPEG_ERR_UNSUP_CHROMA; return -1;
         }
@@ -365,15 +368,16 @@ static int parse_sos(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
     info->scan_ah = ah_al >> 4;
     info->scan_al = ah_al & 0x0F;
 
-    /* Baseline (SOF0/SOF1) requires the full-block scan. SOF2 is validated
-     * inside decode_progressive. SOF3 (Phase 25a) uses Ss as predictor Ps
-     * ∈ {1..7}, Se=0, Ah=0, Al=Pt (0..15). */
+    /* Baseline (SOF0/SOF1/SOF9) requires the full-block scan. SOF2 /
+     * SOF10 (progressive) validated inside the respective decode
+     * dispatch. SOF3 (Phase 25a) uses Ss as predictor Ps ∈ {1..7},
+     * Se=0, Ah=0, Al=Pt (0..15). */
     if (info->sof_type == 3) {
         if (ss < 1 || ss > 7 || se != 0 || (ah_al >> 4) != 0) {
             *err |= JPEG_ERR_UNSUP_SOF;
             return -1;
         }
-    } else if (info->sof_type != 2) {
+    } else if (info->sof_type != 2 && info->sof_type != 10) {
         if (ss != 0 || se != 63 || ah_al != 0) {
             *err |= JPEG_ERR_UNSUP_SOF;
             return -1;
@@ -445,6 +449,12 @@ int jpeg_parse_between_scans(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) 
                 break;
             case MARKER_DRI:
                 if (parse_dri(bs, info, err)) return -1;
+                break;
+            case MARKER_DAC:
+                /* Phase 24a: SOF10 progressive arith streams commonly emit a
+                 * DAC before each new scan to restate conditioning. Absorb
+                 * it like any other table marker. */
+                if (parse_dac(bs, info, err)) return -1;
                 break;
             case MARKER_COM:
                 if (skip_segment(bs, err)) return -1;

@@ -299,6 +299,7 @@ int arith_dec_ac_block(arith_decoder_t *d,
                        uint8_t *fixed_bin,
                        int Kx,
                        int Ss, int Se,
+                       int Al,
                        int16_t *block)
 {
     int k, sign, v, m;
@@ -350,7 +351,85 @@ int arith_dec_ac_block(arith_decoder_t *d,
         v += 1;
         if (sign) v = -v;
 
-        block[JPEG_ZIGZAG[k]] = (int16_t)v;
+        /* Phase 24a: progressive AC-first scans apply the SOS point
+         * transform here (<< Al). Sequential SOF9 passes Al=0. */
+        block[JPEG_ZIGZAG[k]] = (int16_t)((uint32_t)v << Al);
+    }
+
+    return 0;
+}
+
+/* -------------------------------------------------------------------- */
+/* Phase 24a: AC refinement (ISO F.1.4.4.2 refinement path).
+ *
+ * Port of libjpeg-turbo/src/jdarith.c:decode_mcu_AC_refine (lines
+ * 436..497). p1 = 1<<Al, m1 = -1<<Al. For each k ∈ [Ss..Se]:
+ *   - EOB check at ac_stats[3*(k-1)]   (only if k > kex)
+ *   - inner loop: if coef nonzero → st+2 decides ±p1 refinement
+ *                 else if st+1 → newly-nonzero, sign from fixed_bin
+ *                 else advance (st+=3, k++) past the zero slot
+ * kex = index of last previously non-zero coef (0 if block all-zero).
+ * This function reads AND writes block — caller passes the coef
+ * buffer from the last scan and we mutate it in place. */
+int arith_dec_ac_refine(arith_decoder_t *d,
+                        uint8_t *ac_stats,
+                        uint8_t *fixed_bin,
+                        int Ss, int Se, int Al,
+                        int16_t *block)
+{
+    int16_t p1 = (int16_t)((uint32_t)1 << Al);
+    int16_t m1 = (int16_t)(-((int32_t)1 << Al));   /* -p1, precomputed */
+    int kex;
+
+    /* kex = largest k in [1..Se] whose coef is nonzero, or 0. */
+    for (kex = Se; kex > 0; kex--) {
+        if (block[JPEG_ZIGZAG[kex]] != 0) break;
+    }
+
+    int k = Ss;
+    while (k <= Se) {
+        uint8_t *st = ac_stats + 3 * (k - 1);
+        if (k > kex) {
+            /* EOB decision only applies past the last known non-zero. */
+            if (arith_dec_decode(d, st)) {
+                /* EOB — terminate the scan band for this block. */
+                break;
+            }
+        }
+        /* Inner loop: walk until we decide on k (refine or new or skip). */
+        for (;;) {
+            int16_t *thiscoef = &block[JPEG_ZIGZAG[k]];
+            if (*thiscoef != 0) {
+                /* Previously nonzero — maybe add a refinement bit. */
+                if (arith_dec_decode(d, st + 2)) {
+                    if (*thiscoef < 0) {
+                        *thiscoef = (int16_t)(*thiscoef + m1);
+                    } else {
+                        *thiscoef = (int16_t)(*thiscoef + p1);
+                    }
+                }
+                break;
+            }
+            /* Zero slot: st+1 decides newly-nonzero vs skip. */
+            if (arith_dec_decode(d, st + 1)) {
+                /* Newly-nonzero — sign from fixed_bin. */
+                if (arith_dec_decode(d, fixed_bin)) {
+                    *thiscoef = m1;
+                } else {
+                    *thiscoef = p1;
+                }
+                break;
+            }
+            /* Still zero — advance k. */
+            st += 3;
+            k++;
+            if (k > Se) {
+                /* Ran off the end without finding EOB nor a nonzero —
+                 * corrupt stream per ISO. */
+                return -1;
+            }
+        }
+        k++;   /* outer advance past the coef we just decided. */
     }
 
     return 0;

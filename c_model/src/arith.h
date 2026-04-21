@@ -120,6 +120,9 @@ int arith_dec_dc_diff(arith_decoder_t *d,
  *   Ss, Se     : spectral-selection range (1..63 for sequential SOF9).
  *                Pass (1, 63) for sequential scans; caller supplies the
  *                subset for progressive AC-first scans.
+ *   Al         : point-transform shift. Coefs are written as v << Al.
+ *                Pass 0 for sequential SOF9; caller supplies the
+ *                SOS Al for progressive AC-first scans.
  *
  * Returns 0 on success, -1 on corrupt stream (EOB out of range or
  * magnitude overflow). */
@@ -128,6 +131,34 @@ int arith_dec_ac_block(arith_decoder_t *d,
                        uint8_t *fixed_bin,
                        int Kx,
                        int Ss, int Se,
+                       int Al,
                        int16_t *block);
+
+/* ------------------------------------------------------------------ */
+/* Phase 24a: AC successive-approximation refinement decoder
+ *            (ISO F.1.4.4.2 refinement path).
+ *
+ * For each k in [Ss..Se], decides whether each existing non-zero
+ * coefficient gets a ±p1 refinement bit (p1 = 1<<Al), and whether
+ * any zero slot becomes newly-nonzero (±p1). The order of decisions
+ * matches libjpeg-turbo's decode_mcu_AC_refine.
+ *
+ *   d          : Q-coder decoder state (already primed)
+ *   ac_stats   : 256-byte statistics area for this AC table (same
+ *                layout as AC-first; no Kx/X-loop use — refinement
+ *                only uses offsets 3*(k-1)+0/1/2 and fixed_bin).
+ *   fixed_bin  : 1-byte shared sign-bin (shared with AC-first).
+ *   Ss, Se, Al : SOS spectral selection and point transform.
+ *   block      : 64 int16_t coefs in NATURAL order. Read-modified:
+ *                existing non-zero coefs may receive ±p1, zero slots
+ *                may become ±p1. Caller passes the coef buffer from
+ *                the previous scan (coef_buf[blk]).
+ *
+ * Returns 0 on success, -1 on spectral overflow. */
+int arith_dec_ac_refine(arith_decoder_t *d,
+                        uint8_t *ac_stats,
+                        uint8_t *fixed_bin,
+                        int Ss, int Se, int Al,
+                        int16_t *block);
 
 #endif

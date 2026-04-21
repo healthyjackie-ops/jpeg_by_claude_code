@@ -804,7 +804,7 @@ static int test_ac_block_varied(void)
     int16_t out[64];
     for (int i = 0; i < NB; i++) {
         memset(out, 0, sizeof(out));
-        int rc = arith_dec_ac_block(&dd, stats_d, &fb_d, 5, 1, 63, out);
+        int rc = arith_dec_ac_block(&dd, stats_d, &fb_d, 5, 1, 63, 0, out);
         if (rc != 0) {
             fprintf(stderr, "[test_ac_block_varied] block %d rc=%d\n", i, rc);
             return 1;
@@ -863,7 +863,7 @@ static int test_ac_block_edge_cases(void)
     int16_t out[64];
     for (int i = 0; i < 8; i++) {
         memset(out, 0, sizeof(out));
-        int rc = arith_dec_ac_block(&dd, stats_d, &fb_d, 5, 1, 63, out);
+        int rc = arith_dec_ac_block(&dd, stats_d, &fb_d, 5, 1, 63, 0, out);
         if (rc != 0) {
             fprintf(stderr, "[test_ac_block_edge_cases] block %d rc=%d\n", i, rc);
             return 1;
@@ -911,7 +911,7 @@ static int test_ac_block_conditioning(void)
         int16_t out[64];
         for (int i = 0; i < 10; i++) {
             memset(out, 0, sizeof(out));
-            int rc = arith_dec_ac_block(&dd, stats_d, &fb_d, Kx, 1, 63, out);
+            int rc = arith_dec_ac_block(&dd, stats_d, &fb_d, Kx, 1, 63, 0, out);
             if (rc != 0) {
                 fprintf(stderr, "[test_ac_block_conditioning] Kx=%d i=%d rc=%d\n",
                         Kx, i, rc);
