@@ -435,6 +435,242 @@ static int test_edge_cases(void)
     return 0;
 }
 
+/* ---- Test 5: DC-diff symbol round-trip (ISO F.1.4.4.1) -------------- */
+
+/* Matching encoder helper — port of jcarith.c:encode_mcu_DC_first inner
+ * loop (minus last_dc_val bookkeeping, which the test driver manages).
+ * Test-scope only; product decoder does not need a symmetric encoder. */
+static void arith_enc_dc_diff(arith_encoder_t *e,
+                              uint8_t *dc_stats,
+                              int *dc_context,
+                              int L, int U,
+                              int diff)
+{
+    uint8_t *st = dc_stats + *dc_context;
+    int v, v2, m;
+
+    if (diff == 0) {
+        arith_encode(e, st, 0);
+        *dc_context = 0;
+        return;
+    }
+
+    arith_encode(e, st, 1);
+    if (diff > 0) {
+        v    = diff;
+        arith_encode(e, st + 1, 0);
+        st += 2;                               /* SP */
+        *dc_context = 4;                       /* small positive (provisional) */
+    } else {
+        v    = -diff;
+        arith_encode(e, st + 1, 1);
+        st += 3;                               /* SN */
+        *dc_context = 8;                       /* small negative (provisional) */
+    }
+
+    /* Figure F.8: magnitude category (unary on X1..X14). */
+    m = 0;
+    v -= 1;
+    if (v != 0) {
+        arith_encode(e, st, 1);
+        m  = 1;
+        v2 = v;
+        st = dc_stats + 20;                    /* X1 */
+        while (v2 >>= 1) {
+            arith_encode(e, st, 1);
+            m <<= 1;
+            st += 1;
+        }
+    }
+    arith_encode(e, st, 0);                     /* terminator (always emitted) */
+
+    /* ISO F.1.4.4.1.2: update dc_context for next block. */
+    if (m < ((1 << L) >> 1)) {
+        *dc_context = 0;
+    } else if (m > ((1 << U) >> 1)) {
+        *dc_context += 8;                       /* small -> large (12 or 16) */
+    }
+
+    /* Figure F.9: magnitude bit pattern at shared M-bin (st+14). */
+    st += 14;
+    while (m >>= 1) {
+        arith_encode(e, st, (m & v) ? 1 : 0);
+    }
+}
+
+/* 5a: exhaustive coverage of the critical diff magnitudes 0..±32
+ *     (hits zero-path, ±1 m=0 path, every X-loop depth up to 5). */
+static int test_dc_diff_small_range(void)
+{
+    uint8_t enc_buf[16384];
+    uint8_t stats_e[64] = {0};
+    uint8_t stats_d[64] = {0};
+    int ctx_e = 0, ctx_d = 0;
+    int N = 0;
+    int diffs[200];
+
+    for (int d = -32; d <= 32; d++) diffs[N++] = d;
+
+    /* Record per-symbol encoder contexts so we can cross-check against the
+     * decoder without having to replay encoding in sync. */
+    int ctx_e_log[200];
+    arith_encoder_t e; enc_init(&e, enc_buf, sizeof(enc_buf));
+    for (int i = 0; i < N; i++) {
+        arith_enc_dc_diff(&e, stats_e, &ctx_e, 0, 1, diffs[i]);
+        ctx_e_log[i] = ctx_e;
+    }
+    arith_encode_finish(&e);
+
+    arith_decoder_t dd; arith_dec_init(&dd, enc_buf, e.pos);
+    for (int i = 0; i < N; i++) {
+        int got, rc;
+        rc = arith_dec_dc_diff(&dd, stats_d, &ctx_d, 0, 1, &got);
+        if (rc != 0) {
+            fprintf(stderr, "[test_dc_diff_small_range] rc=%d at i=%d\n", rc, i);
+            return 1;
+        }
+        if (got != diffs[i]) {
+            fprintf(stderr,
+                    "[test_dc_diff_small_range] mismatch at %d: "
+                    "exp=%d got=%d (ctx_e=%d ctx_d=%d)\n",
+                    i, diffs[i], got, ctx_e_log[i], ctx_d);
+            return 1;
+        }
+        if (ctx_e_log[i] != ctx_d) {
+            fprintf(stderr,
+                    "[test_dc_diff_small_range] dc_context diverged at %d: "
+                    "diff=%d enc=%d dec=%d\n",
+                    i, diffs[i], ctx_e_log[i], ctx_d);
+            return 1;
+        }
+    }
+    /* Encoder/decoder stats must also agree byte-for-byte. */
+    if (memcmp(stats_e, stats_d, 64) != 0) {
+        fprintf(stderr, "[test_dc_diff_small_range] stats table diverged\n");
+        return 1;
+    }
+    printf("[PASS] dc_diff_small_range  diffs=-32..+32  N=%d encoded=%zu bytes\n",
+           N, e.pos);
+    return 0;
+}
+
+/* 5b: random 12-bit signed diffs (full JPEG DC range for P=12 lossy).
+ *     Exercises deep X-loop iterations (m up to 0x800 / 2048). */
+static int test_dc_diff_random_12bit(void)
+{
+    const int N = 4000;
+    uint8_t enc_buf[32768];
+    int16_t diffs[4000];
+    uint8_t stats_e[64] = {0};
+    uint8_t stats_d[64] = {0};
+    int ctx_e = 0, ctx_d = 0;
+    uint64_t rs = 0x0f1e2d3c4b5a6978ULL;
+
+    /* Generate diffs in [-2047, +2047]. Most 12-bit DC deltas fall
+     * within this range per ISO F.1.4.1. */
+    for (int i = 0; i < N; i++) {
+        uint64_t r = xorshift64(&rs);
+        int mag = (int)(r & 0x7FF);             /* 0..2047 */
+        int sign = (r >> 11) & 1;
+        diffs[i] = (int16_t)(sign ? -mag : mag);
+    }
+
+    arith_encoder_t e; enc_init(&e, enc_buf, sizeof(enc_buf));
+    for (int i = 0; i < N; i++)
+        arith_enc_dc_diff(&e, stats_e, &ctx_e, 0, 1, diffs[i]);
+    arith_encode_finish(&e);
+
+    arith_decoder_t dd; arith_dec_init(&dd, enc_buf, e.pos);
+    for (int i = 0; i < N; i++) {
+        int got, rc;
+        rc = arith_dec_dc_diff(&dd, stats_d, &ctx_d, 0, 1, &got);
+        if (rc != 0) {
+            fprintf(stderr, "[test_dc_diff_random_12bit] rc=%d at i=%d\n", rc, i);
+            return 1;
+        }
+        if (got != diffs[i]) {
+            fprintf(stderr,
+                    "[test_dc_diff_random_12bit] mismatch at %d: "
+                    "exp=%d got=%d\n", i, diffs[i], got);
+            return 1;
+        }
+    }
+    if (ctx_e != ctx_d) {
+        fprintf(stderr, "[test_dc_diff_random_12bit] final ctx diverged e=%d d=%d\n",
+                ctx_e, ctx_d);
+        return 1;
+    }
+    printf("[PASS] dc_diff_random_12bit N=%d encoded=%zu bytes "
+           "(avg=%.2f bits/symbol)\n",
+           N, e.pos, (double)e.pos * 8.0 / (double)N);
+    return 0;
+}
+
+/* 5c: non-default conditioning — sweep L ∈ {0..3}, U ∈ {L..5} and
+ *     confirm each (L,U) pair round-trips.  Independent stats tables
+ *     per sub-test so context classification stays coherent. */
+static int test_dc_diff_conditioning(void)
+{
+    uint8_t enc_buf[16384];
+    uint64_t rs = 0xfacefeed12345678ULL;
+    const int N = 500;
+    int total_ok = 0;
+
+    for (int L = 0; L <= 3; L++) {
+        for (int U = L; U <= 5; U++) {
+            uint8_t stats_e[64] = {0};
+            uint8_t stats_d[64] = {0};
+            int ctx_e = 0, ctx_d = 0;
+            int16_t diffs[500];
+
+            for (int i = 0; i < N; i++) {
+                uint64_t r = xorshift64(&rs);
+                /* Mix small + large magnitudes so we touch both
+                 * classifier branches. */
+                int mag = (int)((r & 0x3FF) + 1);  /* 1..1024 */
+                int sign = (r >> 10) & 1;
+                int zero = ((r >> 11) & 7) == 0;    /* ~12% zero-diffs */
+                diffs[i] = (int16_t)(zero ? 0 : (sign ? -mag : mag));
+            }
+
+            arith_encoder_t e; enc_init(&e, enc_buf, sizeof(enc_buf));
+            for (int i = 0; i < N; i++)
+                arith_enc_dc_diff(&e, stats_e, &ctx_e, L, U, diffs[i]);
+            arith_encode_finish(&e);
+
+            arith_decoder_t dd; arith_dec_init(&dd, enc_buf, e.pos);
+            for (int i = 0; i < N; i++) {
+                int got, rc;
+                rc = arith_dec_dc_diff(&dd, stats_d, &ctx_d, L, U, &got);
+                if (rc != 0) {
+                    fprintf(stderr,
+                            "[test_dc_diff_conditioning] rc=%d L=%d U=%d i=%d\n",
+                            rc, L, U, i);
+                    return 1;
+                }
+                if (got != diffs[i]) {
+                    fprintf(stderr,
+                            "[test_dc_diff_conditioning] mismatch L=%d U=%d "
+                            "at %d: exp=%d got=%d\n",
+                            L, U, i, diffs[i], got);
+                    return 1;
+                }
+            }
+            if (ctx_e != ctx_d || memcmp(stats_e, stats_d, 64) != 0) {
+                fprintf(stderr,
+                        "[test_dc_diff_conditioning] state diverged at "
+                        "L=%d U=%d (ctx_e=%d ctx_d=%d)\n",
+                        L, U, ctx_e, ctx_d);
+                return 1;
+            }
+            total_ok++;
+        }
+    }
+    printf("[PASS] dc_diff_conditioning pairs=%d  (L∈0..3, U∈L..5, N=%d per pair)\n",
+           total_ok, N);
+    return 0;
+}
+
 int main(void)
 {
     int rc = 0;
@@ -442,6 +678,9 @@ int main(void)
     rc |= test_multi_bin_adaptive();
     rc |= test_skewed_bernoulli();
     rc |= test_edge_cases();
+    rc |= test_dc_diff_small_range();
+    rc |= test_dc_diff_random_12bit();
+    rc |= test_dc_diff_conditioning();
     if (rc == 0) printf("ALL ARITH TESTS PASSED\n");
     return rc ? 1 : 0;
 }

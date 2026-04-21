@@ -19,6 +19,10 @@
 #define MARKER_SOF2      0xC2
 #define MARKER_SOF3      0xC3
 #define MARKER_SOF5      0xC5
+#define MARKER_SOF9      0xC9  /* Phase 22: extended sequential arith */
+#define MARKER_SOF10     0xCA  /* Phase 24: progressive arith */
+#define MARKER_SOF11     0xCB  /* Phase 28: lossless arith */
+#define MARKER_DAC       0xCC  /* Phase 22: define arithmetic conditioning */
 #define MARKER_SOF15     0xCF
 #define MARKER_DHT       0xC4
 #define MARKER_DQT       0xDB
@@ -98,6 +102,14 @@ typedef struct {
     uint8_t  scan_al;       /* Phase 16a: SOS Al (0..13) */
     uint8_t  scan_num_comps;                       /* Phase 17a: Ns of current scan */
     uint8_t  scan_comp_idx[JPEG_MAX_COMPONENTS];   /* Phase 17a: component indexes in scan order */
+
+    /* Phase 22: arithmetic conditioning tables (DAC marker, ISO B.2.4.3).
+     * Indexes 0..3 addressable by Tc/Tb nibble. Defaults per ISO F.1.4.4.1:
+     *   arith_dc_L = 0, arith_dc_U = 1, arith_ac_K = 5.
+     * Only meaningful when sof_type ∈ {9, 10, 11, 13, 14, 15}. */
+    uint8_t  arith_dc_L[4];
+    uint8_t  arith_dc_U[4];
+    uint8_t  arith_ac_K[4];
 } jpeg_info_t;
 
 typedef struct {

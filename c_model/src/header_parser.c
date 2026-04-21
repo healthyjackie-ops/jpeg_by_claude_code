@@ -264,6 +264,63 @@ static int parse_sof3(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
     return parse_sof_common(bs, info, err, 2, 16);
 }
 
+/* Phase 22: SOF9 extended sequential arithmetic. Same component layout as
+ * SOF1 (P ∈ {8, 12}); only the entropy-coding differs. decode_arith path
+ * remains a stub (UNSUP_SOF) for Phase 22a/b — header parse green to allow
+ * DAC + unit-test infrastructure to land first. */
+static int parse_sof9(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
+    info->sof_type = 9;
+    return parse_sof_common(bs, info, err, 8, 12);
+}
+
+/* Phase 22: SOF10 progressive arithmetic. Same layout as SOF2. */
+static int parse_sof10(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
+    info->sof_type = 10;
+    return parse_sof_common(bs, info, err, 8, 12);
+}
+
+/* Phase 22: SOF11 lossless arithmetic. Same layout as SOF3. */
+static int parse_sof11(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
+    info->sof_type = 11;
+    return parse_sof_common(bs, info, err, 2, 16);
+}
+
+/* Phase 22: DAC (Define Arithmetic Conditioning) per ISO B.2.4.3.
+ *   segment body = [Tc/Tb byte, Cs byte] repeated until length consumed.
+ *     Tc = class (0 = DC, 1 = AC); Tb = table id (0..3).
+ *     Cs meaning:
+ *       Tc=0 (DC): bits 0..3 = L (lower bound), bits 4..7 = U (upper bound).
+ *                   Valid range 0 ≤ L ≤ U ≤ 15. Default 0x10 (L=0, U=1).
+ *       Tc=1 (AC): Cs = Kx spectral conditioning (1 ≤ Kx ≤ 63). Default 5.
+ * Multiple conditioning triples may appear in one DAC; later triples
+ * overwrite earlier for the same (Tc,Tb). */
+static int parse_dac(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
+    uint16_t len;
+    if (bs_read_u16(bs, &len)) { *err |= JPEG_ERR_STREAM_TRUNC; return -1; }
+    int remain = len - 2;
+    while (remain > 0) {
+        uint8_t tctb, cs;
+        if (bs_read_byte(bs, &tctb)) { *err |= JPEG_ERR_STREAM_TRUNC; return -1; }
+        if (bs_read_byte(bs, &cs))   { *err |= JPEG_ERR_STREAM_TRUNC; return -1; }
+        remain -= 2;
+        uint8_t tc = tctb >> 4;
+        uint8_t tb = tctb & 0x0F;
+        if (tc > 1 || tb > 3) { *err |= JPEG_ERR_BAD_MARKER; return -1; }
+        if (tc == 0) {
+            uint8_t L = cs & 0x0F;
+            uint8_t U = cs >> 4;
+            if (U < L || U > 15) { *err |= JPEG_ERR_BAD_MARKER; return -1; }
+            info->arith_dc_L[tb] = L;
+            info->arith_dc_U[tb] = U;
+        } else {
+            if (cs < 1 || cs > 63) { *err |= JPEG_ERR_BAD_MARKER; return -1; }
+            info->arith_ac_K[tb] = cs;
+        }
+    }
+    if (remain != 0) { *err |= JPEG_ERR_BAD_MARKER; return -1; }
+    return 0;
+}
+
 static int parse_sos(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
     uint16_t len;
     if (bs_read_u16(bs, &len)) { *err |= JPEG_ERR_STREAM_TRUNC; return -1; }
@@ -440,6 +497,21 @@ int jpeg_parse_headers(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
                 if (parse_sof3(bs, info, err)) return -1;
                 got_sof = 1;
                 break;
+            case MARKER_SOF9:
+                if (parse_sof9(bs, info, err)) return -1;
+                got_sof = 1;
+                break;
+            case MARKER_SOF10:
+                if (parse_sof10(bs, info, err)) return -1;
+                got_sof = 1;
+                break;
+            case MARKER_SOF11:
+                if (parse_sof11(bs, info, err)) return -1;
+                got_sof = 1;
+                break;
+            case MARKER_DAC:
+                if (parse_dac(bs, info, err)) return -1;
+                break;
             case MARKER_DQT:
                 if (parse_dqt(bs, info, err)) return -1;
                 break;
@@ -465,8 +537,11 @@ int jpeg_parse_headers(bitstream_t *bs, jpeg_info_t *info, uint32_t *err) {
                 } else if (marker >= MARKER_SOF5 && marker <= MARKER_SOF15) {
                     /* Phase 16b: SOF2 (progressive) now handled above.
                      * Phase 25a: SOF3 (lossless) now handled above.
-                     * SOF5..SOF15 (hierarchical / arith / lossless+arith) remain
-                     * unsupported — Waves 4/5/6. */
+                     * Phase 22a: SOF9/10/11 (arith) now handled above (header
+                     *            parses, decode still errors UNSUP_SOF until
+                     *            Phase 22c wires up the entropy decoder).
+                     * Remaining SOF5/6/7 (hierarchical Huffman) and SOF13/14/15
+                     * (hierarchical arith) stay unsupported — Waves 4/5/6. */
                     *err |= JPEG_ERR_UNSUP_SOF;
                     return -1;
                 } else {

@@ -193,3 +193,74 @@ int arith_dec_decode(arith_decoder_t *d, uint8_t *stat)
 
     return sv >> 7;
 }
+
+/* ------------------------------------------------------------------ */
+/* Phase 22: DC-difference symbol decoder (ISO F.1.4.4.1).
+ *
+ * Faithful port of libjpeg-turbo/src/jdarith.c:decode_mcu_DC_first
+ * (inner loop over one block). Statistics layout documented in
+ * arith.h. The helper does not touch last_dc_val — the caller maintains
+ * the 16-bit accumulator (per Table F.4, DC value wraps mod 2^16). */
+int arith_dec_dc_diff(arith_decoder_t *d,
+                      uint8_t *dc_stats,
+                      int *dc_context,
+                      int L, int U,
+                      int *out_diff)
+{
+    uint8_t *st = dc_stats + *dc_context;
+    int sign;
+    int v, m;
+
+    /* Figure F.19: zero vs nonzero diff. */
+    if (arith_dec_decode(d, st) == 0) {
+        *dc_context = 0;
+        *out_diff   = 0;
+        return 0;
+    }
+
+    /* Figure F.22: sign bit. */
+    sign = arith_dec_decode(d, st + 1);
+    st += 2 + sign;                      /* SP or SN entry bin */
+
+    /* Figure F.23: magnitude category (unary on X1..X14). */
+    m = arith_dec_decode(d, st);
+    if (m != 0) {
+        st = dc_stats + 20;              /* X1 */
+        while (arith_dec_decode(d, st)) {
+            m <<= 1;
+            if (m == 0x8000) {
+                /* ISO F.1.4.4.1.4: magnitude overflow → corrupt stream. */
+                return -1;
+            }
+            st += 1;
+        }
+    }
+
+    /* Section F.1.4.4.1.2: derive next-block dc_context. Boundaries use
+     * L (zero-category threshold) and U (small/large threshold) from the
+     * DAC marker. Defaults (L=0, U=1) land m ∈ {0,1} in the "small"
+     * bucket and m ≥ 2 in the "large" bucket — matching the usual
+     * libjpeg behaviour for the common case. */
+    if (m < ((1 << L) >> 1)) {
+        *dc_context = 0;                          /* zero-diff category */
+    } else if (m > ((1 << U) >> 1)) {
+        *dc_context = 12 + (sign * 4);            /* large diff */
+    } else {
+        *dc_context = 4 + (sign * 4);             /* small diff */
+    }
+
+    /* Figure F.24: magnitude bit pattern. All bits share the M-bin at
+     * st+14 for this magnitude category (st currently points at the
+     * X-bin whose '0' terminated the category loop, so +14 lands in the
+     * 14-bin M region at offset 34..47 of dc_stats). */
+    v = m;
+    st += 14;
+    while (m >>= 1) {
+        if (arith_dec_decode(d, st)) v |= m;
+    }
+    v += 1;
+    if (sign) v = -v;
+
+    *out_diff = v;
+    return 0;
+}

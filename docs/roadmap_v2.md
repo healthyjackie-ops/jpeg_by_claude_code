@@ -53,7 +53,8 @@
 | Phase | Spec | 时长 | 验收 |
 |---|---|---|---|
 | **21** ✅ | [Q-coder 核 — C model](spec_phase21.md) | 1d | 4/4 round-trip tests bit-exact（single-bin + 8-bin adaptive + skewed Bernoulli + edge cases），phase06-27 零退步 |
-| **22** | [DC arith decode](spec_phase22.md) | 4d | SOF9 DC-only |
+| **22a/b** ✅ | [SOF9 header + DC-diff helper — C model](spec_phase22.md) | 1d | DAC/SOF9/10/11 parse; `arith_dec_dc_diff` 7/7 round-trip tests bit-exact（exhaustive −32..+32 + 4 000 random 12-bit + 18 条件表对），smoke 12/12 + phase25c 143/143 + phase27 334/334 零退步 |
+| **22c** | [DC arith decode end-to-end](spec_phase22.md) | 3d | SOF9 DC-only vs libjpeg-turbo |
 | **23** | [AC arith decode](spec_phase23.md) | 5d | SOF9 完整 |
 | **24** | [SOF10 (progressive + arith)](spec_phase24.md) | 3d | SOF10 |
 

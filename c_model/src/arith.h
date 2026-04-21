@@ -55,4 +55,36 @@ int arith_dec_decode(arith_decoder_t *d, uint8_t *stat);
  */
 extern const uint32_t jpeg_aritab[114];
 
+/* ------------------------------------------------------------------ */
+/* Phase 22: DC-difference symbol decoder (ISO F.1.4.4.1 / Figure F.19..F.24).
+ *
+ * Decodes one DC-difference symbol against a per-table statistics area.
+ * The statistics layout (ISO Table F.4):
+ *   offsets  0..19  : S0/SS/SP/SN entry bins (one 4-bin triple per
+ *                     dc_context ∈ {0,4,8,12,16}, selected by the caller).
+ *   offsets 20..33 : X1..X14 magnitude-category continuation bins.
+ *   offsets 34..47 : M-bit bins (one per magnitude category).
+ * Allocate at least DC_STAT_BINS (48) bytes per DC table; the libjpeg
+ * convention is 64 to match AC_STAT_BINS boundary but only 48 are live.
+ *
+ *   d           : Q-coder decoder state, already primed via arith_dec_init
+ *   dc_stats    : pointer to the 48+ byte statistics area for this table
+ *   dc_context  : in/out — last-scan DC category for this component
+ *                  (0, 4, 8, 12, 16 per ISO F.1.4.4.1.2)
+ *   L, U        : arith conditioning bounds from the DAC marker
+ *                  (defaults: L=0, U=1)
+ *   out_diff    : decoded signed DC difference (caller adds to
+ *                  last_dc_val, mask to 16-bit per ISO)
+ *
+ * Returns 0 on success, -1 on magnitude overflow (corrupt stream —
+ * matches libjpeg's JWRN_ARITH_BAD_CODE path).
+ */
+#define JPEG_DC_STAT_BINS 64
+
+int arith_dec_dc_diff(arith_decoder_t *d,
+                      uint8_t *dc_stats,
+                      int *dc_context,
+                      int L, int U,
+                      int *out_diff);
+
 #endif

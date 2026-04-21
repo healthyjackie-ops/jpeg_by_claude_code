@@ -90,6 +90,15 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
         return decode_lossless(&bs, &info, out);
     }
 
+    /* Phase 22a: SOF9/10/11 (arithmetic-coded) parse through the header
+     * (including DAC conditioning) but the entropy decoder is still under
+     * construction. Fail fast with UNSUP_SOF so the error surface stays
+     * consistent with pre-Phase-22 behaviour on arith inputs. */
+    if (info.sof_type == 9 || info.sof_type == 10 || info.sof_type == 11) {
+        out->err = JPEG_ERR_UNSUP_SOF;
+        return -1;
+    }
+
     /* Phase 13a.3: P=12 branches to a dedicated 16-bit decode path supporting
        grayscale / 4:4:4 / 4:2:0. Other chroma modes with P=12 (CMYK, 4:2:2,
        4:4:0, 4:1:1) are out of scope for Phase 13. SOF3 was already handled
