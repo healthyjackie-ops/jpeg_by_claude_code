@@ -11,7 +11,7 @@ BUILD_DIR := build
 
 CORE_SRCS := $(SRC_DIR)/bitstream.c $(SRC_DIR)/header_parser.c \
              $(SRC_DIR)/huffman.c $(SRC_DIR)/dequant.c $(SRC_DIR)/idct.c \
-             $(SRC_DIR)/chroma.c $(SRC_DIR)/decoder.c
+             $(SRC_DIR)/chroma.c $(SRC_DIR)/decoder.c $(SRC_DIR)/arith.c
 CORE_OBJS := $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(CORE_SRCS))
 
 MAIN_SRC := $(SRC_DIR)/main.c
