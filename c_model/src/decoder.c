@@ -990,8 +990,10 @@ static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
     int is_422  = (info->chroma_mode == CHROMA_422);
     int is_440  = (info->chroma_mode == CHROMA_440);
     int is_411  = (info->chroma_mode == CHROMA_411);
-    if (!is_gray && !is_444 && !is_420 && !is_422 && !is_440 && !is_411) {
-        /* Phase 17a: gray / 4:4:4 / 4:2:0 ; Phase 17d extends to 422/440/411 */
+    int is_cmyk = (info->chroma_mode == CHROMA_CMYK);
+    if (!is_gray && !is_444 && !is_420 && !is_422 && !is_440 && !is_411 && !is_cmyk) {
+        /* Phase 17a: gray / 4:4:4 / 4:2:0 ; Phase 17d extends to 422/440/411
+         * Phase 12c extends to CMYK Nf=4 all-1x1 progressive. */
         out->err = JPEG_ERR_UNSUP_CHROMA;
         return -1;
     }
@@ -1016,7 +1018,7 @@ static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
     out->height = H;
     out->precision = info->precision;
 
-    int num_comps = is_gray ? 1 : 3;
+    int num_comps = is_gray ? 1 : (is_cmyk ? 4 : 3);
 
     /* Block grid per component.
      *
@@ -1025,12 +1027,13 @@ static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
      * AC scan traversal:
      *   x_i = ceil(X * Hi / Hmax), y_i = ceil(Y * Vi / Vmax)
      *   natural blocks = ceil(x_i/8) × ceil(y_i/8)
-     * For gray and 4:4:4 natural == MCU-padded. For 4:2:0 the Y component
-     * can differ when image width/height is not a multiple of 16.
+     * For gray, 4:4:4, and CMYK (all 1x1) natural == MCU-padded. For 4:2:0
+     * the Y component can differ when image width/height is not a multiple
+     * of 16.
      */
     uint32_t yw_nat = (uint32_t)((W + 7u) / 8u);
     uint32_t yh_nat = (uint32_t)((H + 7u) / 8u);
-    comp_grid_t cg[3] = {0};
+    comp_grid_t cg[4] = {0};
     uint32_t total_blocks = 0;
     if (is_gray) {
         cg[0].blk_rows = info->mcu_rows;
@@ -1039,6 +1042,15 @@ static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
         cg[0].nat_cols = yw_nat;
     } else if (is_444) {
         for (int c = 0; c < 3; c++) {
+            cg[c].blk_rows = info->mcu_rows;
+            cg[c].blk_cols = info->mcu_cols;
+            cg[c].nat_rows = yh_nat;
+            cg[c].nat_cols = yw_nat;
+        }
+    } else if (is_cmyk) {
+        /* Phase 12c: CMYK all-1x1, MCU=8x8 with 4 blocks (C/M/Y/K). Natural
+         * grid matches MCU-padded grid for every component. */
+        for (int c = 0; c < 4; c++) {
             cg[c].blk_rows = info->mcu_rows;
             cg[c].blk_cols = info->mcu_cols;
             cg[c].nat_rows = yh_nat;
@@ -1163,6 +1175,26 @@ static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
                         }
                     } else if (is_444) {
                         for (int c = 0; c < 3; c++) {
+                            uint32_t blk = cg[c].base + my * cg[c].blk_cols + mx;
+                            if (is_refine) {
+                                if (huff_decode_dc_refine(bs, coef_buf[blk], al)) {
+                                    out->err = JPEG_ERR_BAD_HUFFMAN; goto fail;
+                                }
+                            } else {
+                                const htable_t *dc_tab =
+                                    &info->htables_dc[info->components[c].td];
+                                if (huff_decode_dc_progressive(
+                                        bs, dc_tab,
+                                        &info->components[c].dc_pred,
+                                        coef_buf[blk], al)) {
+                                    out->err = JPEG_ERR_BAD_HUFFMAN; goto fail;
+                                }
+                            }
+                        }
+                    } else if (is_cmyk) {
+                        /* Phase 12c: CMYK — 4 blocks/MCU, all 1x1. Stream order
+                         * matches SOF/SOS ordering (C,M,Y,K). */
+                        for (int c = 0; c < 4; c++) {
                             uint32_t blk = cg[c].base + my * cg[c].blk_cols + mx;
                             if (is_refine) {
                                 if (huff_decode_dc_refine(bs, coef_buf[blk], al)) {
@@ -1443,47 +1475,64 @@ static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
     uint8_t *y_pad      = (uint8_t*)calloc((size_t)Wp * Hp, 1);
     uint8_t *cb_pad_sub = is_chroma_sub ? (uint8_t*)calloc((size_t)CWp_sub * CHp_sub, 1) : NULL;
     uint8_t *cr_pad_sub = is_chroma_sub ? (uint8_t*)calloc((size_t)CWp_sub * CHp_sub, 1) : NULL;
-    uint8_t *cb_pad     = is_gray ? NULL : (uint8_t*)calloc((size_t)Wp * Hp, 1);
-    uint8_t *cr_pad     = is_gray ? NULL : (uint8_t*)calloc((size_t)Wp * Hp, 1);
+    uint8_t *cb_pad     = (is_gray || is_cmyk) ? NULL : (uint8_t*)calloc((size_t)Wp * Hp, 1);
+    uint8_t *cr_pad     = (is_gray || is_cmyk) ? NULL : (uint8_t*)calloc((size_t)Wp * Hp, 1);
+    /* Phase 12c: CMYK drain needs 3 extra padded buffers (M, Y-comp, K);
+     * y_pad above holds the C component when is_cmyk. */
+    uint8_t *m_pad      = is_cmyk ? (uint8_t*)calloc((size_t)Wp * Hp, 1) : NULL;
+    uint8_t *yc_pad     = is_cmyk ? (uint8_t*)calloc((size_t)Wp * Hp, 1) : NULL;
+    uint8_t *k_pad      = is_cmyk ? (uint8_t*)calloc((size_t)Wp * Hp, 1) : NULL;
 
-    out->y_plane = (uint8_t*)calloc((size_t)W * H, 1);
-    if (!is_gray) {
-        out->cb_plane = (uint8_t*)calloc((size_t)W * H, 1);
-        out->cr_plane = (uint8_t*)calloc((size_t)W * H, 1);
-        if (is_420) {
-            out->cb_plane_420 = (uint8_t*)calloc((size_t)(W >> 1) * (H >> 1), 1);
-            out->cr_plane_420 = (uint8_t*)calloc((size_t)(W >> 1) * (H >> 1), 1);
-        }
-        if (is_422) {
-            out->cb_plane_422 = (uint8_t*)calloc((size_t)(W >> 1) * H, 1);
-            out->cr_plane_422 = (uint8_t*)calloc((size_t)(W >> 1) * H, 1);
-        }
-        if (is_440) {
-            out->cb_plane_440 = (uint8_t*)calloc((size_t)W * (H >> 1), 1);
-            out->cr_plane_440 = (uint8_t*)calloc((size_t)W * (H >> 1), 1);
-        }
-        if (is_411) {
-            out->cb_plane_411 = (uint8_t*)calloc((size_t)(W >> 2) * H, 1);
-            out->cr_plane_411 = (uint8_t*)calloc((size_t)(W >> 2) * H, 1);
+    if (is_cmyk) {
+        out->c_plane      = (uint8_t*)calloc((size_t)W * H, 1);
+        out->m_plane      = (uint8_t*)calloc((size_t)W * H, 1);
+        out->y_plane_cmyk = (uint8_t*)calloc((size_t)W * H, 1);
+        out->k_plane      = (uint8_t*)calloc((size_t)W * H, 1);
+    } else {
+        out->y_plane = (uint8_t*)calloc((size_t)W * H, 1);
+        if (!is_gray) {
+            out->cb_plane = (uint8_t*)calloc((size_t)W * H, 1);
+            out->cr_plane = (uint8_t*)calloc((size_t)W * H, 1);
+            if (is_420) {
+                out->cb_plane_420 = (uint8_t*)calloc((size_t)(W >> 1) * (H >> 1), 1);
+                out->cr_plane_420 = (uint8_t*)calloc((size_t)(W >> 1) * (H >> 1), 1);
+            }
+            if (is_422) {
+                out->cb_plane_422 = (uint8_t*)calloc((size_t)(W >> 1) * H, 1);
+                out->cr_plane_422 = (uint8_t*)calloc((size_t)(W >> 1) * H, 1);
+            }
+            if (is_440) {
+                out->cb_plane_440 = (uint8_t*)calloc((size_t)W * (H >> 1), 1);
+                out->cr_plane_440 = (uint8_t*)calloc((size_t)W * (H >> 1), 1);
+            }
+            if (is_411) {
+                out->cb_plane_411 = (uint8_t*)calloc((size_t)(W >> 2) * H, 1);
+                out->cr_plane_411 = (uint8_t*)calloc((size_t)(W >> 2) * H, 1);
+            }
         }
     }
-    int alloc_ok = y_pad && out->y_plane &&
-                   (is_gray ||
-                    (cb_pad && cr_pad && out->cb_plane && out->cr_plane &&
-                     (!is_420 ||
-                      (cb_pad_sub && cr_pad_sub &&
-                       out->cb_plane_420 && out->cr_plane_420)) &&
-                     (!is_422 ||
-                      (cb_pad_sub && cr_pad_sub &&
-                       out->cb_plane_422 && out->cr_plane_422)) &&
-                     (!is_440 ||
-                      (cb_pad_sub && cr_pad_sub &&
-                       out->cb_plane_440 && out->cr_plane_440)) &&
-                     (!is_411 ||
-                      (cb_pad_sub && cr_pad_sub &&
-                       out->cb_plane_411 && out->cr_plane_411))));
+    int alloc_ok = y_pad &&
+                   (is_cmyk
+                    ? (m_pad && yc_pad && k_pad &&
+                       out->c_plane && out->m_plane && out->y_plane_cmyk && out->k_plane)
+                    : (out->y_plane &&
+                       (is_gray ||
+                        (cb_pad && cr_pad && out->cb_plane && out->cr_plane &&
+                         (!is_420 ||
+                          (cb_pad_sub && cr_pad_sub &&
+                           out->cb_plane_420 && out->cr_plane_420)) &&
+                         (!is_422 ||
+                          (cb_pad_sub && cr_pad_sub &&
+                           out->cb_plane_422 && out->cr_plane_422)) &&
+                         (!is_440 ||
+                          (cb_pad_sub && cr_pad_sub &&
+                           out->cb_plane_440 && out->cr_plane_440)) &&
+                         (!is_411 ||
+                          (cb_pad_sub && cr_pad_sub &&
+                           out->cb_plane_411 && out->cr_plane_411))))));
     if (!alloc_ok) {
         free(y_pad); free(cb_pad_sub); free(cr_pad_sub); free(cb_pad); free(cr_pad);
+        free(m_pad); free(yc_pad); free(k_pad);
         out->err = (uint32_t)JPEG_ERR_INTERNAL; goto fail;
     }
 
@@ -1495,7 +1544,16 @@ static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
         uint32_t base = cg[c].base;
         uint8_t *pad;
         uint16_t pad_stride;
-        if (c == 0) {
+        if (is_cmyk) {
+            /* Phase 12c: CMYK — 4 full-res pads, one per component.
+             * c=0 (C) lands in y_pad, c=1 (M) in m_pad, c=2 (Y) in yc_pad,
+             * c=3 (K) in k_pad. All at Wp stride. */
+            if (c == 0)      pad = y_pad;
+            else if (c == 1) pad = m_pad;
+            else if (c == 2) pad = yc_pad;
+            else             pad = k_pad;
+            pad_stride = Wp;
+        } else if (c == 0) {
             pad = y_pad;
             pad_stride = Wp;
         } else if (is_chroma_sub) {
@@ -1572,11 +1630,21 @@ static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
     }
 
     /* Crop padded → output planes */
-    for (uint16_t r = 0; r < H; r++) {
-        memcpy(out->y_plane + (size_t)r * W, y_pad + (size_t)r * Wp, W);
-        if (!is_gray) {
-            memcpy(out->cb_plane + (size_t)r * W, cb_pad + (size_t)r * Wp, W);
-            memcpy(out->cr_plane + (size_t)r * W, cr_pad + (size_t)r * Wp, W);
+    if (is_cmyk) {
+        /* Phase 12c: CMYK — 4 full-res planes, no upsample. */
+        for (uint16_t r = 0; r < H; r++) {
+            memcpy(out->c_plane      + (size_t)r * W, y_pad  + (size_t)r * Wp, W);
+            memcpy(out->m_plane      + (size_t)r * W, m_pad  + (size_t)r * Wp, W);
+            memcpy(out->y_plane_cmyk + (size_t)r * W, yc_pad + (size_t)r * Wp, W);
+            memcpy(out->k_plane      + (size_t)r * W, k_pad  + (size_t)r * Wp, W);
+        }
+    } else {
+        for (uint16_t r = 0; r < H; r++) {
+            memcpy(out->y_plane + (size_t)r * W, y_pad + (size_t)r * Wp, W);
+            if (!is_gray) {
+                memcpy(out->cb_plane + (size_t)r * W, cb_pad + (size_t)r * Wp, W);
+                memcpy(out->cr_plane + (size_t)r * W, cr_pad + (size_t)r * Wp, W);
+            }
         }
     }
     if (is_420) {
@@ -1613,6 +1681,7 @@ static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
     }
 
     free(y_pad); free(cb_pad_sub); free(cr_pad_sub); free(cb_pad); free(cr_pad);
+    free(m_pad); free(yc_pad); free(k_pad);
 
     out->err = 0;
     return 0;
@@ -2011,15 +2080,16 @@ static int sof9_find_eoi(arith_decoder_t *ad)
 
 static int decode_sof9(bitstream_t *bs, jpeg_info_t *info, jpeg_decoded_t *out)
 {
-    /* Accept gray + 4:4:4 + 4:2:0 + 4:2:2 + 4:4:0 + 4:1:1. CMYK (Nf=4)
-     * and 12-bit precision remain out of scope for this phase. */
+    /* Accept gray + 4:4:4 + 4:2:0 + 4:2:2 + 4:4:0 + 4:1:1 + CMYK (Phase 12c).
+     * 12-bit precision remains out of scope for this phase. */
     int is_gray = (info->chroma_mode == CHROMA_GRAY);
     int is_444  = (info->chroma_mode == CHROMA_444);
     int is_420  = (info->chroma_mode == CHROMA_420);
     int is_422  = (info->chroma_mode == CHROMA_422);
     int is_440  = (info->chroma_mode == CHROMA_440);
     int is_411  = (info->chroma_mode == CHROMA_411);
-    if (!is_gray && !is_444 && !is_420 && !is_422 && !is_440 && !is_411) {
+    int is_cmyk = (info->chroma_mode == CHROMA_CMYK);
+    if (!is_gray && !is_444 && !is_420 && !is_422 && !is_440 && !is_411 && !is_cmyk) {
         out->err = JPEG_ERR_UNSUP_SOF;
         return -1;
     }
@@ -2052,48 +2122,65 @@ static int decode_sof9(bitstream_t *bs, jpeg_info_t *info, jpeg_decoded_t *out)
     uint8_t *y_pad      = (uint8_t*)calloc((size_t)Wp * Hp, 1);
     uint8_t *cb_pad_sub = is_chroma_sub ? (uint8_t*)calloc((size_t)CWp_sub * CHp_sub, 1) : NULL;
     uint8_t *cr_pad_sub = is_chroma_sub ? (uint8_t*)calloc((size_t)CWp_sub * CHp_sub, 1) : NULL;
-    uint8_t *cb_pad     = is_gray ? NULL : (uint8_t*)calloc((size_t)Wp * Hp, 1);
-    uint8_t *cr_pad     = is_gray ? NULL : (uint8_t*)calloc((size_t)Wp * Hp, 1);
+    uint8_t *cb_pad     = (is_gray || is_cmyk) ? NULL : (uint8_t*)calloc((size_t)Wp * Hp, 1);
+    uint8_t *cr_pad     = (is_gray || is_cmyk) ? NULL : (uint8_t*)calloc((size_t)Wp * Hp, 1);
+    /* Phase 12c: CMYK drain needs 3 extra pads for M / Y-comp / K;
+     * y_pad above holds the C component when is_cmyk. */
+    uint8_t *m_pad      = is_cmyk ? (uint8_t*)calloc((size_t)Wp * Hp, 1) : NULL;
+    uint8_t *yc_pad     = is_cmyk ? (uint8_t*)calloc((size_t)Wp * Hp, 1) : NULL;
+    uint8_t *k_pad      = is_cmyk ? (uint8_t*)calloc((size_t)Wp * Hp, 1) : NULL;
 
-    out->y_plane = (uint8_t*)calloc((size_t)W * H, 1);
-    if (!is_gray) {
-        out->cb_plane = (uint8_t*)calloc((size_t)W * H, 1);
-        out->cr_plane = (uint8_t*)calloc((size_t)W * H, 1);
-        if (is_420) {
-            out->cb_plane_420 = (uint8_t*)calloc((size_t)(W >> 1) * (H >> 1), 1);
-            out->cr_plane_420 = (uint8_t*)calloc((size_t)(W >> 1) * (H >> 1), 1);
-        }
-        if (is_422) {
-            out->cb_plane_422 = (uint8_t*)calloc((size_t)(W >> 1) * H, 1);
-            out->cr_plane_422 = (uint8_t*)calloc((size_t)(W >> 1) * H, 1);
-        }
-        if (is_440) {
-            out->cb_plane_440 = (uint8_t*)calloc((size_t)W * (H >> 1), 1);
-            out->cr_plane_440 = (uint8_t*)calloc((size_t)W * (H >> 1), 1);
-        }
-        if (is_411) {
-            out->cb_plane_411 = (uint8_t*)calloc((size_t)(W >> 2) * H, 1);
-            out->cr_plane_411 = (uint8_t*)calloc((size_t)(W >> 2) * H, 1);
+    if (is_cmyk) {
+        out->c_plane      = (uint8_t*)calloc((size_t)W * H, 1);
+        out->m_plane      = (uint8_t*)calloc((size_t)W * H, 1);
+        out->y_plane_cmyk = (uint8_t*)calloc((size_t)W * H, 1);
+        out->k_plane      = (uint8_t*)calloc((size_t)W * H, 1);
+    } else {
+        out->y_plane = (uint8_t*)calloc((size_t)W * H, 1);
+        if (!is_gray) {
+            out->cb_plane = (uint8_t*)calloc((size_t)W * H, 1);
+            out->cr_plane = (uint8_t*)calloc((size_t)W * H, 1);
+            if (is_420) {
+                out->cb_plane_420 = (uint8_t*)calloc((size_t)(W >> 1) * (H >> 1), 1);
+                out->cr_plane_420 = (uint8_t*)calloc((size_t)(W >> 1) * (H >> 1), 1);
+            }
+            if (is_422) {
+                out->cb_plane_422 = (uint8_t*)calloc((size_t)(W >> 1) * H, 1);
+                out->cr_plane_422 = (uint8_t*)calloc((size_t)(W >> 1) * H, 1);
+            }
+            if (is_440) {
+                out->cb_plane_440 = (uint8_t*)calloc((size_t)W * (H >> 1), 1);
+                out->cr_plane_440 = (uint8_t*)calloc((size_t)W * (H >> 1), 1);
+            }
+            if (is_411) {
+                out->cb_plane_411 = (uint8_t*)calloc((size_t)(W >> 2) * H, 1);
+                out->cr_plane_411 = (uint8_t*)calloc((size_t)(W >> 2) * H, 1);
+            }
         }
     }
-    int alloc_ok = y_pad && out->y_plane &&
-                   (is_gray ||
-                    (cb_pad && cr_pad && out->cb_plane && out->cr_plane &&
-                     (!is_420 ||
-                      (cb_pad_sub && cr_pad_sub &&
-                       out->cb_plane_420 && out->cr_plane_420)) &&
-                     (!is_422 ||
-                      (cb_pad_sub && cr_pad_sub &&
-                       out->cb_plane_422 && out->cr_plane_422)) &&
-                     (!is_440 ||
-                      (cb_pad_sub && cr_pad_sub &&
-                       out->cb_plane_440 && out->cr_plane_440)) &&
-                     (!is_411 ||
-                      (cb_pad_sub && cr_pad_sub &&
-                       out->cb_plane_411 && out->cr_plane_411))));
+    int alloc_ok = y_pad &&
+                   (is_cmyk
+                    ? (m_pad && yc_pad && k_pad &&
+                       out->c_plane && out->m_plane && out->y_plane_cmyk && out->k_plane)
+                    : (out->y_plane &&
+                       (is_gray ||
+                        (cb_pad && cr_pad && out->cb_plane && out->cr_plane &&
+                         (!is_420 ||
+                          (cb_pad_sub && cr_pad_sub &&
+                           out->cb_plane_420 && out->cr_plane_420)) &&
+                         (!is_422 ||
+                          (cb_pad_sub && cr_pad_sub &&
+                           out->cb_plane_422 && out->cr_plane_422)) &&
+                         (!is_440 ||
+                          (cb_pad_sub && cr_pad_sub &&
+                           out->cb_plane_440 && out->cr_plane_440)) &&
+                         (!is_411 ||
+                          (cb_pad_sub && cr_pad_sub &&
+                           out->cb_plane_411 && out->cr_plane_411))))));
     if (!alloc_ok) {
         free(y_pad); free(cb_pad); free(cr_pad);
         free(cb_pad_sub); free(cr_pad_sub);
+        free(m_pad); free(yc_pad); free(k_pad);
         out->err = (uint32_t)JPEG_ERR_INTERNAL;
         return -1;
     }
@@ -2133,10 +2220,11 @@ static int decode_sof9(bitstream_t *bs, jpeg_info_t *info, jpeg_decoded_t *out)
     int     dc_context[JPEG_MAX_COMPONENTS] = {0};
     int16_t last_dc[JPEG_MAX_COMPONENTS]    = {0};
 
-    /* Component-level table/qtable pointers (matches baseline shape). */
-    int Nf = is_gray ? 1 : 3;
-    int td[3] = {0}, ta[3] = {0};
-    const uint16_t *qt[3] = {0};
+    /* Component-level table/qtable pointers (matches baseline shape).
+     * Phase 12c: expand to [4] to accommodate CMYK (Nf=4). */
+    int Nf = is_gray ? 1 : (is_cmyk ? 4 : 3);
+    int td[4] = {0}, ta[4] = {0};
+    const uint16_t *qt[4] = {0};
     for (int c = 0; c < Nf; c++) {
         td[c] = info->components[c].td;
         ta[c] = info->components[c].ta;
@@ -2153,6 +2241,8 @@ static int decode_sof9(bitstream_t *bs, jpeg_info_t *info, jpeg_decoded_t *out)
     int16_t coef[64];
     uint8_t y_blk[4][64];
     uint8_t cb_blk[64], cr_blk[64];
+    /* Phase 12c: scratch for CMYK K block (C/M/Y reuse y_blk[0]/cb_blk/cr_blk). */
+    uint8_t k_blk[64];
 
     uint16_t restart_cnt = 0;
     uint8_t  next_rst    = MARKER_RST0;
@@ -2316,6 +2406,51 @@ static int decode_sof9(bitstream_t *bs, jpeg_info_t *info, jpeg_decoded_t *out)
                 uint8_t *cr_dst = cr_pad_sub + (size_t)(my * 8) * CWp_sub + (mx * 8);
                 copy_block_8x8(cb_blk, cb_dst, CWp_sub);
                 copy_block_8x8(cr_blk, cr_dst, CWp_sub);
+            } else if (is_cmyk) {
+                /* Phase 12c: CMYK — 4 blocks/MCU, all 1x1. Block order
+                 * matches SOF/SOS ordering (C, M, Y, K). Routes:
+                 *   C → y_pad,  M → m_pad,  Y → yc_pad,  K → k_pad. */
+                if (sof9_decode_block(&ad, dc_stats[td[0]], ac_stats[ta[0]],
+                                      &fixed_bin, dc_L[td[0]], dc_U[td[0]],
+                                      ac_Kx[ta[0]],
+                                      &dc_context[0], &last_dc[0],
+                                      qt[0], coef)) {
+                    goto entropy_fail;
+                }
+                idct_islow(coef, y_blk[0]);   /* C */
+                if (sof9_decode_block(&ad, dc_stats[td[1]], ac_stats[ta[1]],
+                                      &fixed_bin, dc_L[td[1]], dc_U[td[1]],
+                                      ac_Kx[ta[1]],
+                                      &dc_context[1], &last_dc[1],
+                                      qt[1], coef)) {
+                    goto entropy_fail;
+                }
+                idct_islow(coef, cb_blk);      /* M */
+                if (sof9_decode_block(&ad, dc_stats[td[2]], ac_stats[ta[2]],
+                                      &fixed_bin, dc_L[td[2]], dc_U[td[2]],
+                                      ac_Kx[ta[2]],
+                                      &dc_context[2], &last_dc[2],
+                                      qt[2], coef)) {
+                    goto entropy_fail;
+                }
+                idct_islow(coef, cr_blk);      /* Y-comp */
+                if (sof9_decode_block(&ad, dc_stats[td[3]], ac_stats[ta[3]],
+                                      &fixed_bin, dc_L[td[3]], dc_U[td[3]],
+                                      ac_Kx[ta[3]],
+                                      &dc_context[3], &last_dc[3],
+                                      qt[3], coef)) {
+                    goto entropy_fail;
+                }
+                idct_islow(coef, k_blk);       /* K */
+
+                uint8_t *c_dst  = y_pad  + (size_t)(my * 8) * Wp + (mx * 8);
+                uint8_t *m_dst  = m_pad  + (size_t)(my * 8) * Wp + (mx * 8);
+                uint8_t *yc_dst = yc_pad + (size_t)(my * 8) * Wp + (mx * 8);
+                uint8_t *k_dst  = k_pad  + (size_t)(my * 8) * Wp + (mx * 8);
+                copy_block_8x8(y_blk[0], c_dst,  Wp);
+                copy_block_8x8(cb_blk,   m_dst,  Wp);
+                copy_block_8x8(cr_blk,   yc_dst, Wp);
+                copy_block_8x8(k_blk,    k_dst,  Wp);
             } else {
                 /* 4:4:4 — Y, Cb, Cr: one 8x8 each per MCU. */
                 if (sof9_decode_block(&ad, dc_stats[td[0]], ac_stats[ta[0]],
@@ -2431,11 +2566,21 @@ static int decode_sof9(bitstream_t *bs, jpeg_info_t *info, jpeg_decoded_t *out)
         }
     }
 
-    for (uint16_t r = 0; r < H; r++) {
-        memcpy(out->y_plane + (size_t)r * W, y_pad + (size_t)r * Wp, W);
-        if (!is_gray) {
-            memcpy(out->cb_plane + (size_t)r * W, cb_pad + (size_t)r * Wp, W);
-            memcpy(out->cr_plane + (size_t)r * W, cr_pad + (size_t)r * Wp, W);
+    if (is_cmyk) {
+        /* Phase 12c: CMYK — 4 full-res planes, no upsample. */
+        for (uint16_t r = 0; r < H; r++) {
+            memcpy(out->c_plane      + (size_t)r * W, y_pad  + (size_t)r * Wp, W);
+            memcpy(out->m_plane      + (size_t)r * W, m_pad  + (size_t)r * Wp, W);
+            memcpy(out->y_plane_cmyk + (size_t)r * W, yc_pad + (size_t)r * Wp, W);
+            memcpy(out->k_plane      + (size_t)r * W, k_pad  + (size_t)r * Wp, W);
+        }
+    } else {
+        for (uint16_t r = 0; r < H; r++) {
+            memcpy(out->y_plane + (size_t)r * W, y_pad + (size_t)r * Wp, W);
+            if (!is_gray) {
+                memcpy(out->cb_plane + (size_t)r * W, cb_pad + (size_t)r * Wp, W);
+                memcpy(out->cr_plane + (size_t)r * W, cr_pad + (size_t)r * Wp, W);
+            }
         }
     }
     if (is_420) {
@@ -2473,6 +2618,7 @@ static int decode_sof9(bitstream_t *bs, jpeg_info_t *info, jpeg_decoded_t *out)
 
     free(y_pad); free(cb_pad); free(cr_pad);
     free(cb_pad_sub); free(cr_pad_sub);
+    free(m_pad); free(yc_pad); free(k_pad);
 
     /* Final framing: arith decoder owns bytes up to the first non-
      * stuffed 0xFF marker; after the last MCU that's EOI. */
@@ -2489,6 +2635,7 @@ entropy_fail:
 cleanup_fail:
     free(y_pad); free(cb_pad); free(cr_pad);
     free(cb_pad_sub); free(cr_pad_sub);
+    free(m_pad); free(yc_pad); free(k_pad);
     return -1;
 }
 
@@ -2618,7 +2765,8 @@ static int decode_sof10(bitstream_t *bs, jpeg_info_t *info, jpeg_decoded_t *out)
     int is_422  = (info->chroma_mode == CHROMA_422);
     int is_440  = (info->chroma_mode == CHROMA_440);
     int is_411  = (info->chroma_mode == CHROMA_411);
-    if (!is_gray && !is_444 && !is_420 && !is_422 && !is_440 && !is_411) {
+    int is_cmyk = (info->chroma_mode == CHROMA_CMYK);
+    if (!is_gray && !is_444 && !is_420 && !is_422 && !is_440 && !is_411 && !is_cmyk) {
         out->err = JPEG_ERR_UNSUP_CHROMA;
         return -1;
     }
@@ -2643,13 +2791,13 @@ static int decode_sof10(bitstream_t *bs, jpeg_info_t *info, jpeg_decoded_t *out)
     out->height = H;
     out->precision = info->precision;
 
-    int num_comps = is_gray ? 1 : 3;
+    int num_comps = is_gray ? 1 : (is_cmyk ? 4 : 3);
 
     /* Natural block grid — identical layout to decode_progressive so the
      * drain path can reuse idct/dequant/upsample/crop directly. */
     uint32_t yw_nat = (uint32_t)((W + 7u) / 8u);
     uint32_t yh_nat = (uint32_t)((H + 7u) / 8u);
-    comp_grid_t cg[3] = {0};
+    comp_grid_t cg[4] = {0};
     uint32_t total_blocks = 0;
     if (is_gray) {
         cg[0].blk_rows = info->mcu_rows;
@@ -2658,6 +2806,14 @@ static int decode_sof10(bitstream_t *bs, jpeg_info_t *info, jpeg_decoded_t *out)
         cg[0].nat_cols = yw_nat;
     } else if (is_444) {
         for (int c = 0; c < 3; c++) {
+            cg[c].blk_rows = info->mcu_rows;
+            cg[c].blk_cols = info->mcu_cols;
+            cg[c].nat_rows = yh_nat;
+            cg[c].nat_cols = yw_nat;
+        }
+    } else if (is_cmyk) {
+        /* Phase 12c: CMYK all-1x1, MCU=8x8 with 4 blocks (C/M/Y/K). */
+        for (int c = 0; c < 4; c++) {
             cg[c].blk_rows = info->mcu_rows;
             cg[c].blk_cols = info->mcu_cols;
             cg[c].nat_rows = yh_nat;
@@ -2800,6 +2956,25 @@ static int decode_sof10(bitstream_t *bs, jpeg_info_t *info, jpeg_decoded_t *out)
                         }
                     } else if (is_444) {
                         for (int c = 0; c < 3; c++) {
+                            uint32_t blk = cg[c].base + my * cg[c].blk_cols + mx;
+                            int tbl = info->components[c].td;
+                            if (is_refine) {
+                                if (arith_dec_decode(&ad, &fixed_bin)) {
+                                    coef_buf[blk][0] |= (int16_t)((uint32_t)1 << Al);
+                                }
+                            } else {
+                                if (sof10_dc_first_block(&ad, dc_stats[tbl],
+                                        dc_L_arr[tbl], dc_U_arr[tbl],
+                                        &dc_context[c], &last_dc[c],
+                                        Al, &coef_buf[blk][0])) {
+                                    out->err = JPEG_ERR_BAD_HUFFMAN; goto fail;
+                                }
+                            }
+                        }
+                    } else if (is_cmyk) {
+                        /* Phase 12c: CMYK — 4 blocks/MCU, all 1x1, stream order
+                         * C/M/Y/K matches SOF/SOS component ordering. */
+                        for (int c = 0; c < 4; c++) {
                             uint32_t blk = cg[c].base + my * cg[c].blk_cols + mx;
                             int tbl = info->components[c].td;
                             if (is_refine) {
@@ -3065,48 +3240,64 @@ static int decode_sof10(bitstream_t *bs, jpeg_info_t *info, jpeg_decoded_t *out)
     uint8_t *y_pad      = (uint8_t*)calloc((size_t)Wp * Hp, 1);
     uint8_t *cb_pad_sub = is_chroma_sub ? (uint8_t*)calloc((size_t)CWp_sub * CHp_sub, 1) : NULL;
     uint8_t *cr_pad_sub = is_chroma_sub ? (uint8_t*)calloc((size_t)CWp_sub * CHp_sub, 1) : NULL;
-    uint8_t *cb_pad     = is_gray ? NULL : (uint8_t*)calloc((size_t)Wp * Hp, 1);
-    uint8_t *cr_pad     = is_gray ? NULL : (uint8_t*)calloc((size_t)Wp * Hp, 1);
+    uint8_t *cb_pad     = (is_gray || is_cmyk) ? NULL : (uint8_t*)calloc((size_t)Wp * Hp, 1);
+    uint8_t *cr_pad     = (is_gray || is_cmyk) ? NULL : (uint8_t*)calloc((size_t)Wp * Hp, 1);
+    /* Phase 12c: CMYK drain needs 3 extra pads for M / Y-comp / K. */
+    uint8_t *m_pad      = is_cmyk ? (uint8_t*)calloc((size_t)Wp * Hp, 1) : NULL;
+    uint8_t *yc_pad     = is_cmyk ? (uint8_t*)calloc((size_t)Wp * Hp, 1) : NULL;
+    uint8_t *k_pad      = is_cmyk ? (uint8_t*)calloc((size_t)Wp * Hp, 1) : NULL;
 
-    out->y_plane = (uint8_t*)calloc((size_t)W * H, 1);
-    if (!is_gray) {
-        out->cb_plane = (uint8_t*)calloc((size_t)W * H, 1);
-        out->cr_plane = (uint8_t*)calloc((size_t)W * H, 1);
-        if (is_420) {
-            out->cb_plane_420 = (uint8_t*)calloc((size_t)(W >> 1) * (H >> 1), 1);
-            out->cr_plane_420 = (uint8_t*)calloc((size_t)(W >> 1) * (H >> 1), 1);
-        }
-        if (is_422) {
-            out->cb_plane_422 = (uint8_t*)calloc((size_t)(W >> 1) * H, 1);
-            out->cr_plane_422 = (uint8_t*)calloc((size_t)(W >> 1) * H, 1);
-        }
-        if (is_440) {
-            out->cb_plane_440 = (uint8_t*)calloc((size_t)W * (H >> 1), 1);
-            out->cr_plane_440 = (uint8_t*)calloc((size_t)W * (H >> 1), 1);
-        }
-        if (is_411) {
-            out->cb_plane_411 = (uint8_t*)calloc((size_t)(W >> 2) * H, 1);
-            out->cr_plane_411 = (uint8_t*)calloc((size_t)(W >> 2) * H, 1);
+    if (is_cmyk) {
+        out->c_plane      = (uint8_t*)calloc((size_t)W * H, 1);
+        out->m_plane      = (uint8_t*)calloc((size_t)W * H, 1);
+        out->y_plane_cmyk = (uint8_t*)calloc((size_t)W * H, 1);
+        out->k_plane      = (uint8_t*)calloc((size_t)W * H, 1);
+    } else {
+        out->y_plane = (uint8_t*)calloc((size_t)W * H, 1);
+        if (!is_gray) {
+            out->cb_plane = (uint8_t*)calloc((size_t)W * H, 1);
+            out->cr_plane = (uint8_t*)calloc((size_t)W * H, 1);
+            if (is_420) {
+                out->cb_plane_420 = (uint8_t*)calloc((size_t)(W >> 1) * (H >> 1), 1);
+                out->cr_plane_420 = (uint8_t*)calloc((size_t)(W >> 1) * (H >> 1), 1);
+            }
+            if (is_422) {
+                out->cb_plane_422 = (uint8_t*)calloc((size_t)(W >> 1) * H, 1);
+                out->cr_plane_422 = (uint8_t*)calloc((size_t)(W >> 1) * H, 1);
+            }
+            if (is_440) {
+                out->cb_plane_440 = (uint8_t*)calloc((size_t)W * (H >> 1), 1);
+                out->cr_plane_440 = (uint8_t*)calloc((size_t)W * (H >> 1), 1);
+            }
+            if (is_411) {
+                out->cb_plane_411 = (uint8_t*)calloc((size_t)(W >> 2) * H, 1);
+                out->cr_plane_411 = (uint8_t*)calloc((size_t)(W >> 2) * H, 1);
+            }
         }
     }
-    int alloc_ok = y_pad && out->y_plane &&
-                   (is_gray ||
-                    (cb_pad && cr_pad && out->cb_plane && out->cr_plane &&
-                     (!is_420 ||
-                      (cb_pad_sub && cr_pad_sub &&
-                       out->cb_plane_420 && out->cr_plane_420)) &&
-                     (!is_422 ||
-                      (cb_pad_sub && cr_pad_sub &&
-                       out->cb_plane_422 && out->cr_plane_422)) &&
-                     (!is_440 ||
-                      (cb_pad_sub && cr_pad_sub &&
-                       out->cb_plane_440 && out->cr_plane_440)) &&
-                     (!is_411 ||
-                      (cb_pad_sub && cr_pad_sub &&
-                       out->cb_plane_411 && out->cr_plane_411))));
+    int alloc_ok = y_pad &&
+                   (is_cmyk
+                    ? (m_pad && yc_pad && k_pad &&
+                       out->c_plane && out->m_plane && out->y_plane_cmyk && out->k_plane)
+                    : (out->y_plane &&
+                       (is_gray ||
+                        (cb_pad && cr_pad && out->cb_plane && out->cr_plane &&
+                         (!is_420 ||
+                          (cb_pad_sub && cr_pad_sub &&
+                           out->cb_plane_420 && out->cr_plane_420)) &&
+                         (!is_422 ||
+                          (cb_pad_sub && cr_pad_sub &&
+                           out->cb_plane_422 && out->cr_plane_422)) &&
+                         (!is_440 ||
+                          (cb_pad_sub && cr_pad_sub &&
+                           out->cb_plane_440 && out->cr_plane_440)) &&
+                         (!is_411 ||
+                          (cb_pad_sub && cr_pad_sub &&
+                           out->cb_plane_411 && out->cr_plane_411))))));
     if (!alloc_ok) {
         free(y_pad); free(cb_pad_sub); free(cr_pad_sub);
         free(cb_pad); free(cr_pad);
+        free(m_pad); free(yc_pad); free(k_pad);
         out->err = (uint32_t)JPEG_ERR_INTERNAL; goto fail;
     }
 
@@ -3118,7 +3309,14 @@ static int decode_sof10(bitstream_t *bs, jpeg_info_t *info, jpeg_decoded_t *out)
         uint32_t base = cg[c].base;
         uint8_t *pad;
         uint16_t pad_stride;
-        if (c == 0) {
+        if (is_cmyk) {
+            /* Phase 12c: CMYK — 4 full-res pads, one per component. */
+            if (c == 0)      pad = y_pad;
+            else if (c == 1) pad = m_pad;
+            else if (c == 2) pad = yc_pad;
+            else             pad = k_pad;
+            pad_stride = Wp;
+        } else if (c == 0) {
             pad = y_pad; pad_stride = Wp;
         } else if (is_chroma_sub) {
             pad = (c == 1) ? cb_pad_sub : cr_pad_sub;
@@ -3191,11 +3389,21 @@ static int decode_sof10(bitstream_t *bs, jpeg_info_t *info, jpeg_decoded_t *out)
         }
     }
 
-    for (uint16_t r = 0; r < H; r++) {
-        memcpy(out->y_plane + (size_t)r * W, y_pad + (size_t)r * Wp, W);
-        if (!is_gray) {
-            memcpy(out->cb_plane + (size_t)r * W, cb_pad + (size_t)r * Wp, W);
-            memcpy(out->cr_plane + (size_t)r * W, cr_pad + (size_t)r * Wp, W);
+    if (is_cmyk) {
+        /* Phase 12c: CMYK — 4 full-res planes, no upsample. */
+        for (uint16_t r = 0; r < H; r++) {
+            memcpy(out->c_plane      + (size_t)r * W, y_pad  + (size_t)r * Wp, W);
+            memcpy(out->m_plane      + (size_t)r * W, m_pad  + (size_t)r * Wp, W);
+            memcpy(out->y_plane_cmyk + (size_t)r * W, yc_pad + (size_t)r * Wp, W);
+            memcpy(out->k_plane      + (size_t)r * W, k_pad  + (size_t)r * Wp, W);
+        }
+    } else {
+        for (uint16_t r = 0; r < H; r++) {
+            memcpy(out->y_plane + (size_t)r * W, y_pad + (size_t)r * Wp, W);
+            if (!is_gray) {
+                memcpy(out->cb_plane + (size_t)r * W, cb_pad + (size_t)r * Wp, W);
+                memcpy(out->cr_plane + (size_t)r * W, cr_pad + (size_t)r * Wp, W);
+            }
         }
     }
     if (is_420) {
@@ -3233,6 +3441,7 @@ static int decode_sof10(bitstream_t *bs, jpeg_info_t *info, jpeg_decoded_t *out)
 
     free(y_pad); free(cb_pad_sub); free(cr_pad_sub);
     free(cb_pad); free(cr_pad);
+    free(m_pad); free(yc_pad); free(k_pad);
 
     out->err = 0;
     return 0;

@@ -411,8 +411,30 @@ After Phase 17d, SOF2 Huffman covers all 5 common 8-bit 3-comp YCbCr
 chroma layouts — matching arith parity reached in Phase 24c. Still
 deferred:
 
-- **CMYK (Nf=4)** in any SOF2/SOF9/SOF10 path
+- **CMYK (Nf=4)** in any SOF2/SOF9/SOF10 path → **closed in Phase 12c** ✅
 - **P=12** in any SOF2/SOF9/SOF10 path (decode_progressive asserts P=8)
 
 Both are unblockable future extensions; libjpeg-turbo supports them so
 bit-exact reference decodes are available whenever the scope pickup lands.
+
+## 10. Phase 12c — CMYK (Nf=4) across SOF2 / SOF9 / SOF10
+
+**Status**: ✅ **COMPLETE** — 51/51 phase12c bit-exact, 1495/1495 aggregate (2026-04-21).
+**Detail spec**: [`spec_phase12c.md`](spec_phase12c.md).
+
+Closes the last CMYK gap identified in §9.4: Phase 12 baseline already
+covered SOF0 CMYK; Phase 12c extends the same Nf=4 all-1×1 geometry to
+the three remaining entropy-coded DCT paths (SOF2 progressive Huffman,
+SOF9 sequential arith, SOF10 progressive arith).
+
+The `cg[c]` natural-block-grid abstraction (introduced in Phase 17a,
+generalized in Phase 24a/c) made the Nf=4 extension a mostly mechanical
+patch: expand `cg[3] → cg[4]`, add a CMYK accept-gate branch, add 4-way
+DC-first MCU interleave, and route 4 pad buffers (C/M/Y/K) into the
+corresponding output planes. AC non-interleaved scan loop required no
+mode-specific code. First-try 51/51 bit-exact.
+
+Vectors: `tools/gen_phase12c_prog.py` (PIL `progressive=True` → SOF2)
+and `tools/gen_phase12c_arith.py` (PIL baseline → `jpegtran -arithmetic
+[-progressive]` for SOF9/SOF10); Pillow's `arithmetic=True` kwarg is a
+no-op in its libjpeg binding, which forced the jpegtran transcode path.
