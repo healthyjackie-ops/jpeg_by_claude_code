@@ -23,82 +23,27 @@ TEST_BINS := $(patsubst $(TEST_DIR)/test_%.c,$(BUILD_DIR)/test_%,$(TEST_SRCS))
 GOLDEN_SRC := $(GOLDEN_DIR)/golden_compare.c
 GOLDEN_BIN := $(BUILD_DIR)/golden_compare
 
-.PHONY: all test golden phase16 phase17 phase18 phase_prog_dri phase25 phase25b phase25c phase27 clean
+.PHONY: all test golden regress clean
 all: $(BUILD_DIR)/jpeg_decode $(GOLDEN_BIN)
 
 VECTORS_ROOT ?= ../verification/vectors
-PHASE16_DIR  := $(VECTORS_ROOT)/phase16
-PHASE17_DIR  := $(VECTORS_ROOT)/phase17
-PHASE18_DIR  := $(VECTORS_ROOT)/phase18
-PHASE_PROG_DRI_DIR := $(VECTORS_ROOT)/phase_prog_dri
-PHASE25_DIR  := $(VECTORS_ROOT)/phase25
-PHASE25B_DIR := $(VECTORS_ROOT)/phase25b
-PHASE25C_DIR := $(VECTORS_ROOT)/phase25c
-PHASE27_DIR  := $(VECTORS_ROOT)/phase27
 
-phase16: $(GOLDEN_BIN)
-	@if ls $(PHASE16_DIR)/*.jpg >/dev/null 2>&1; then \
-	  $(GOLDEN_BIN) $(PHASE16_DIR)/*.jpg; \
+# Per-phase golden run: `make phase17d`, `make phase_prog_dri`, ... works for
+# any verification/vectors/phase* directory. (Pattern targets can't be .PHONY,
+# but no file named phaseXX ever exists here, so the recipe always runs.)
+phase%: $(GOLDEN_BIN)
+	@if ls $(VECTORS_ROOT)/phase$*/*.jpg >/dev/null 2>&1; then \
+	  $(GOLDEN_BIN) $(VECTORS_ROOT)/phase$*/*.jpg; \
 	else \
-	  echo "[phase16] no vectors in $(PHASE16_DIR) — run tools/gen_phase16.py" >&2; \
+	  echo "[phase$*] no vectors in $(VECTORS_ROOT)/phase$* — run tools/gen_phase$*.py" >&2; \
 	  exit 2; \
 	fi
 
-phase17: $(GOLDEN_BIN)
-	@if ls $(PHASE17_DIR)/*.jpg >/dev/null 2>&1; then \
-	  $(GOLDEN_BIN) $(PHASE17_DIR)/*.jpg; \
-	else \
-	  echo "[phase17] no vectors in $(PHASE17_DIR) — run tools/gen_phase17.py" >&2; \
-	  exit 2; \
-	fi
-
-phase18: $(GOLDEN_BIN)
-	@if ls $(PHASE18_DIR)/*.jpg >/dev/null 2>&1; then \
-	  $(GOLDEN_BIN) $(PHASE18_DIR)/*.jpg; \
-	else \
-	  echo "[phase18] no vectors in $(PHASE18_DIR) — run tools/gen_phase18.py" >&2; \
-	  exit 2; \
-	fi
-
-phase_prog_dri: $(GOLDEN_BIN)
-	@if ls $(PHASE_PROG_DRI_DIR)/*.jpg >/dev/null 2>&1; then \
-	  $(GOLDEN_BIN) $(PHASE_PROG_DRI_DIR)/*.jpg; \
-	else \
-	  echo "[phase_prog_dri] no vectors in $(PHASE_PROG_DRI_DIR) — run tools/gen_phase_prog_dri.py" >&2; \
-	  exit 2; \
-	fi
-
-phase25: $(GOLDEN_BIN)
-	@if ls $(PHASE25_DIR)/*.jpg >/dev/null 2>&1; then \
-	  $(GOLDEN_BIN) $(PHASE25_DIR)/*.jpg; \
-	else \
-	  echo "[phase25] no vectors in $(PHASE25_DIR) — run tools/gen_phase25.py" >&2; \
-	  exit 2; \
-	fi
-
-phase25b: $(GOLDEN_BIN)
-	@if ls $(PHASE25B_DIR)/*.jpg >/dev/null 2>&1; then \
-	  $(GOLDEN_BIN) $(PHASE25B_DIR)/*.jpg; \
-	else \
-	  echo "[phase25b] no vectors in $(PHASE25B_DIR) — run tools/gen_phase25b.py" >&2; \
-	  exit 2; \
-	fi
-
-phase25c: $(GOLDEN_BIN)
-	@if ls $(PHASE25C_DIR)/*.jpg >/dev/null 2>&1; then \
-	  $(GOLDEN_BIN) $(PHASE25C_DIR)/*.jpg; \
-	else \
-	  echo "[phase25c] no vectors in $(PHASE25C_DIR) — run tools/gen_phase25c.py" >&2; \
-	  exit 2; \
-	fi
-
-phase27: $(GOLDEN_BIN)
-	@if ls $(PHASE27_DIR)/*.jpg >/dev/null 2>&1; then \
-	  $(GOLDEN_BIN) $(PHASE27_DIR)/*.jpg; \
-	else \
-	  echo "[phase27] no vectors in $(PHASE27_DIR) — run tools/gen_phase27.py" >&2; \
-	  exit 2; \
-	fi
+# Full-corpus regression: every vector in every directory, except phase14
+# (RTL error-out vectors, not golden-comparable). This is the number to quote
+# in landing commits — hand-assembled per-phase lists silently rot.
+regress: $(GOLDEN_BIN)
+	@find $(VECTORS_ROOT) -name '*.jpg' -not -path '*phase14*' | sort | xargs $(GOLDEN_BIN)
 
 $(BUILD_DIR):
 	@mkdir -p $@
