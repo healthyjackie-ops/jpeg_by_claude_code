@@ -961,6 +961,316 @@ typedef struct {
     uint32_t base;
 } comp_grid_t;
 
+/* -------------------------------------------------------------------------
+ * Shared drain for coef-buf decoders (SOF2 progressive Huffman and SOF10
+ * progressive arith): dequant + IDCT every block of every component,
+ * assemble MCU-padded pad planes, chroma-upsample, crop into the output
+ * planes. Previously triplicated across decode_progressive (P=8 and P=12
+ * variants) and decode_sof10.
+ *
+ * P=8 handles all 7 chroma modes; P=12 handles gray/444/420 (callers gate
+ * which combinations may reach here). Takes ownership of coef_buf — freed
+ * on every path, success or failure. On alloc failure sets out->err; any
+ * planes already attached to *out are released by the jpeg_decode wrapper.
+ * ------------------------------------------------------------------------- */
+static int drain_coef_buf_to_planes(int16_t (*coef_buf)[64],
+                                    const comp_grid_t cg[4],
+                                    const jpeg_info_t *info,
+                                    jpeg_decoded_t *out)
+{
+    int is_gray = (info->chroma_mode == CHROMA_GRAY);
+    int is_420  = (info->chroma_mode == CHROMA_420);
+    int is_422  = (info->chroma_mode == CHROMA_422);
+    int is_440  = (info->chroma_mode == CHROMA_440);
+    int is_411  = (info->chroma_mode == CHROMA_411);
+    int is_cmyk = (info->chroma_mode == CHROMA_CMYK);
+
+    uint16_t W  = info->width;
+    uint16_t H  = info->height;
+    uint16_t mcu_w = is_411 ? 32 : ((is_420 || is_422) ? 16 : 8);
+    uint16_t mcu_h = (is_420 || is_440) ? 16 : 8;
+    uint16_t Wp = info->mcu_cols * mcu_w;
+    uint16_t Hp = info->mcu_rows * mcu_h;
+    uint16_t CWp_sub = is_411 ? (uint16_t)(Wp >> 2)
+                              : ((is_420 || is_422) ? (uint16_t)(Wp >> 1) : Wp);
+    uint16_t CHp_sub = (is_420 || is_440) ? (uint16_t)(Hp >> 1) : Hp;
+    int num_comps = is_gray ? 1 : (is_cmyk ? 4 : 3);
+
+    if (info->precision == 12) {
+        size_t y_samples  = (size_t)Wp * Hp;
+        size_t cb_samples_sub = is_420 ? (size_t)CWp_sub * CHp_sub : 0;
+        uint16_t *y_pad16      = (uint16_t*)calloc(y_samples, sizeof(uint16_t));
+        uint16_t *cb_pad16_sub = is_420 ? (uint16_t*)calloc(cb_samples_sub, sizeof(uint16_t)) : NULL;
+        uint16_t *cr_pad16_sub = is_420 ? (uint16_t*)calloc(cb_samples_sub, sizeof(uint16_t)) : NULL;
+        uint16_t *cb_pad16     = is_gray ? NULL : (uint16_t*)calloc(y_samples, sizeof(uint16_t));
+        uint16_t *cr_pad16     = is_gray ? NULL : (uint16_t*)calloc(y_samples, sizeof(uint16_t));
+
+        out->y_plane16 = (uint16_t*)calloc((size_t)W * H, sizeof(uint16_t));
+        if (!is_gray) {
+            out->cb_plane16 = (uint16_t*)calloc((size_t)W * H, sizeof(uint16_t));
+            out->cr_plane16 = (uint16_t*)calloc((size_t)W * H, sizeof(uint16_t));
+            if (is_420) {
+                out->cb_plane16_420 = (uint16_t*)calloc((size_t)(W >> 1) * (H >> 1), sizeof(uint16_t));
+                out->cr_plane16_420 = (uint16_t*)calloc((size_t)(W >> 1) * (H >> 1), sizeof(uint16_t));
+            }
+        }
+        int alloc_ok16 = y_pad16 && out->y_plane16 &&
+                         (is_gray ||
+                          (cb_pad16 && cr_pad16 && out->cb_plane16 && out->cr_plane16 &&
+                           (!is_420 || (cb_pad16_sub && cr_pad16_sub &&
+                                        out->cb_plane16_420 && out->cr_plane16_420))));
+        if (!alloc_ok16) {
+            free(y_pad16); free(cb_pad16_sub); free(cr_pad16_sub);
+            free(cb_pad16); free(cr_pad16);
+            free(coef_buf);
+            out->err = (uint32_t)JPEG_ERR_INTERNAL;
+            return -1;
+        }
+
+        int32_t dq[64];
+        uint16_t blk_u16[64];
+        for (int c = 0; c < num_comps; c++) {
+            const uint16_t *qt = info->qtables[info->components[c].qt_id].q;
+            uint32_t blk_rows = cg[c].blk_rows;
+            uint32_t blk_cols = cg[c].blk_cols;
+            uint32_t base = cg[c].base;
+            uint16_t *pad;
+            uint16_t pad_stride;
+            if (c == 0) {
+                pad = y_pad16;
+                pad_stride = Wp;
+            } else if (is_420) {
+                pad = (c == 1) ? cb_pad16_sub : cr_pad16_sub;
+                pad_stride = CWp_sub;
+            } else { /* 4:4:4 */
+                pad = (c == 1) ? cb_pad16 : cr_pad16;
+                pad_stride = Wp;
+            }
+            for (uint32_t by = 0; by < blk_rows; by++) {
+                for (uint32_t bx = 0; bx < blk_cols; bx++) {
+                    uint32_t blk = base + by * blk_cols + bx;
+                    dequant_block_i32(coef_buf[blk], qt, dq);
+                    idct_islow_p12(dq, blk_u16);
+                    uint16_t *dst = pad + ((size_t)by * 8u) * pad_stride + (bx * 8u);
+                    copy_block_8x8_u16(blk_u16, dst, pad_stride);
+                }
+            }
+        }
+        free(coef_buf);
+
+        if (is_420) {
+            chroma_upsample_nn_u16(cb_pad16_sub, cb_pad16, Wp, Hp);
+            chroma_upsample_nn_u16(cr_pad16_sub, cr_pad16, Wp, Hp);
+        }
+
+        for (uint16_t r = 0; r < H; r++) {
+            memcpy(out->y_plane16 + (size_t)r * W,
+                   y_pad16 + (size_t)r * Wp, W * sizeof(uint16_t));
+            if (!is_gray) {
+                memcpy(out->cb_plane16 + (size_t)r * W,
+                       cb_pad16 + (size_t)r * Wp, W * sizeof(uint16_t));
+                memcpy(out->cr_plane16 + (size_t)r * W,
+                       cr_pad16 + (size_t)r * Wp, W * sizeof(uint16_t));
+            }
+        }
+        if (is_420) {
+            for (uint16_t r = 0; r < (H >> 1); r++) {
+                memcpy(out->cb_plane16_420 + (size_t)r * (W >> 1),
+                       cb_pad16_sub + (size_t)r * CWp_sub,
+                       (size_t)(W >> 1) * sizeof(uint16_t));
+                memcpy(out->cr_plane16_420 + (size_t)r * (W >> 1),
+                       cr_pad16_sub + (size_t)r * CWp_sub,
+                       (size_t)(W >> 1) * sizeof(uint16_t));
+            }
+        }
+
+        free(y_pad16); free(cb_pad16_sub); free(cr_pad16_sub);
+        free(cb_pad16); free(cr_pad16);
+        out->err = 0;
+        return 0;
+    }
+
+    int is_chroma_sub = (is_420 || is_422 || is_440 || is_411);
+    uint8_t *y_pad      = (uint8_t*)calloc((size_t)Wp * Hp, 1);
+    uint8_t *cb_pad_sub = is_chroma_sub ? (uint8_t*)calloc((size_t)CWp_sub * CHp_sub, 1) : NULL;
+    uint8_t *cr_pad_sub = is_chroma_sub ? (uint8_t*)calloc((size_t)CWp_sub * CHp_sub, 1) : NULL;
+    uint8_t *cb_pad     = (is_gray || is_cmyk) ? NULL : (uint8_t*)calloc((size_t)Wp * Hp, 1);
+    uint8_t *cr_pad     = (is_gray || is_cmyk) ? NULL : (uint8_t*)calloc((size_t)Wp * Hp, 1);
+    /* Phase 12c: CMYK drain needs 3 extra padded buffers (M, Y-comp, K);
+     * y_pad above holds the C component when is_cmyk. */
+    uint8_t *m_pad      = is_cmyk ? (uint8_t*)calloc((size_t)Wp * Hp, 1) : NULL;
+    uint8_t *yc_pad     = is_cmyk ? (uint8_t*)calloc((size_t)Wp * Hp, 1) : NULL;
+    uint8_t *k_pad      = is_cmyk ? (uint8_t*)calloc((size_t)Wp * Hp, 1) : NULL;
+
+    if (is_cmyk) {
+        out->c_plane      = (uint8_t*)calloc((size_t)W * H, 1);
+        out->m_plane      = (uint8_t*)calloc((size_t)W * H, 1);
+        out->y_plane_cmyk = (uint8_t*)calloc((size_t)W * H, 1);
+        out->k_plane      = (uint8_t*)calloc((size_t)W * H, 1);
+    } else {
+        out->y_plane = (uint8_t*)calloc((size_t)W * H, 1);
+        if (!is_gray) {
+            out->cb_plane = (uint8_t*)calloc((size_t)W * H, 1);
+            out->cr_plane = (uint8_t*)calloc((size_t)W * H, 1);
+            if (is_420) {
+                out->cb_plane_420 = (uint8_t*)calloc((size_t)(W >> 1) * (H >> 1), 1);
+                out->cr_plane_420 = (uint8_t*)calloc((size_t)(W >> 1) * (H >> 1), 1);
+            }
+            if (is_422) {
+                out->cb_plane_422 = (uint8_t*)calloc((size_t)(W >> 1) * H, 1);
+                out->cr_plane_422 = (uint8_t*)calloc((size_t)(W >> 1) * H, 1);
+            }
+            if (is_440) {
+                out->cb_plane_440 = (uint8_t*)calloc((size_t)W * (H >> 1), 1);
+                out->cr_plane_440 = (uint8_t*)calloc((size_t)W * (H >> 1), 1);
+            }
+            if (is_411) {
+                out->cb_plane_411 = (uint8_t*)calloc((size_t)(W >> 2) * H, 1);
+                out->cr_plane_411 = (uint8_t*)calloc((size_t)(W >> 2) * H, 1);
+            }
+        }
+    }
+    int alloc_ok = y_pad &&
+                   (is_cmyk
+                    ? (m_pad && yc_pad && k_pad &&
+                       out->c_plane && out->m_plane && out->y_plane_cmyk && out->k_plane)
+                    : (out->y_plane &&
+                       (is_gray ||
+                        (cb_pad && cr_pad && out->cb_plane && out->cr_plane &&
+                         (!is_420 ||
+                          (cb_pad_sub && cr_pad_sub &&
+                           out->cb_plane_420 && out->cr_plane_420)) &&
+                         (!is_422 ||
+                          (cb_pad_sub && cr_pad_sub &&
+                           out->cb_plane_422 && out->cr_plane_422)) &&
+                         (!is_440 ||
+                          (cb_pad_sub && cr_pad_sub &&
+                           out->cb_plane_440 && out->cr_plane_440)) &&
+                         (!is_411 ||
+                          (cb_pad_sub && cr_pad_sub &&
+                           out->cb_plane_411 && out->cr_plane_411))))));
+    if (!alloc_ok) {
+        free(y_pad); free(cb_pad_sub); free(cr_pad_sub); free(cb_pad); free(cr_pad);
+        free(m_pad); free(yc_pad); free(k_pad);
+        free(coef_buf);
+        out->err = (uint32_t)JPEG_ERR_INTERNAL;
+        return -1;
+    }
+
+    uint8_t blk_out[64];
+    for (int c = 0; c < num_comps; c++) {
+        const uint16_t *qt = info->qtables[info->components[c].qt_id].q;
+        uint32_t blk_rows = cg[c].blk_rows;
+        uint32_t blk_cols = cg[c].blk_cols;
+        uint32_t base = cg[c].base;
+        uint8_t *pad;
+        uint16_t pad_stride;
+        if (is_cmyk) {
+            /* Phase 12c: CMYK — 4 full-res pads, one per component.
+             * c=0 (C) lands in y_pad, c=1 (M) in m_pad, c=2 (Y) in yc_pad,
+             * c=3 (K) in k_pad. All at Wp stride. */
+            if (c == 0)      pad = y_pad;
+            else if (c == 1) pad = m_pad;
+            else if (c == 2) pad = yc_pad;
+            else             pad = k_pad;
+            pad_stride = Wp;
+        } else if (c == 0) {
+            pad = y_pad;
+            pad_stride = Wp;
+        } else if (is_chroma_sub) {
+            pad = (c == 1) ? cb_pad_sub : cr_pad_sub;
+            pad_stride = CWp_sub;
+        } else { /* 4:4:4 */
+            pad = (c == 1) ? cb_pad : cr_pad;
+            pad_stride = Wp;
+        }
+
+        for (uint32_t by = 0; by < blk_rows; by++) {
+            for (uint32_t bx = 0; bx < blk_cols; bx++) {
+                uint32_t blk = base + by * blk_cols + bx;
+                dequant_block(coef_buf[blk], qt);
+                idct_islow(coef_buf[blk], blk_out);
+                uint8_t *dst = pad + ((size_t)by * 8u) * pad_stride + (bx * 8u);
+                copy_block_8x8(blk_out, dst, pad_stride);
+            }
+        }
+    }
+
+    free(coef_buf);
+
+    /* Chroma upsample — nearest-neighbor per mode geometry. */
+    if (is_420) {
+        chroma_upsample_nn(cb_pad_sub, cb_pad, Wp, Hp);
+        chroma_upsample_nn(cr_pad_sub, cr_pad, Wp, Hp);
+    } else if (is_422) {
+        chroma_upsample_h2(cb_pad_sub, cb_pad, Wp, Hp);
+        chroma_upsample_h2(cr_pad_sub, cr_pad, Wp, Hp);
+    } else if (is_411) {
+        chroma_upsample_h4(cb_pad_sub, cb_pad, Wp, Hp);
+        chroma_upsample_h4(cr_pad_sub, cr_pad, Wp, Hp);
+    } else if (is_440) {
+        chroma_upsample_v2(cb_pad_sub, cb_pad, Wp, Hp);
+        chroma_upsample_v2(cr_pad_sub, cr_pad, Wp, Hp);
+    }
+
+    /* Crop padded → output planes */
+    if (is_cmyk) {
+        /* Phase 12c: CMYK — 4 full-res planes, no upsample. */
+        for (uint16_t r = 0; r < H; r++) {
+            memcpy(out->c_plane      + (size_t)r * W, y_pad  + (size_t)r * Wp, W);
+            memcpy(out->m_plane      + (size_t)r * W, m_pad  + (size_t)r * Wp, W);
+            memcpy(out->y_plane_cmyk + (size_t)r * W, yc_pad + (size_t)r * Wp, W);
+            memcpy(out->k_plane      + (size_t)r * W, k_pad  + (size_t)r * Wp, W);
+        }
+    } else {
+        for (uint16_t r = 0; r < H; r++) {
+            memcpy(out->y_plane + (size_t)r * W, y_pad + (size_t)r * Wp, W);
+            if (!is_gray) {
+                memcpy(out->cb_plane + (size_t)r * W, cb_pad + (size_t)r * Wp, W);
+                memcpy(out->cr_plane + (size_t)r * W, cr_pad + (size_t)r * Wp, W);
+            }
+        }
+    }
+    if (is_420) {
+        for (uint16_t r = 0; r < (H >> 1); r++) {
+            memcpy(out->cb_plane_420 + (size_t)r * (W >> 1),
+                   cb_pad_sub + (size_t)r * CWp_sub, (W >> 1));
+            memcpy(out->cr_plane_420 + (size_t)r * (W >> 1),
+                   cr_pad_sub + (size_t)r * CWp_sub, (W >> 1));
+        }
+    }
+    if (is_422) {
+        for (uint16_t r = 0; r < H; r++) {
+            memcpy(out->cb_plane_422 + (size_t)r * (W >> 1),
+                   cb_pad_sub + (size_t)r * CWp_sub, (W >> 1));
+            memcpy(out->cr_plane_422 + (size_t)r * (W >> 1),
+                   cr_pad_sub + (size_t)r * CWp_sub, (W >> 1));
+        }
+    }
+    if (is_440) {
+        for (uint16_t r = 0; r < (H >> 1); r++) {
+            memcpy(out->cb_plane_440 + (size_t)r * W,
+                   cb_pad_sub + (size_t)r * CWp_sub, W);
+            memcpy(out->cr_plane_440 + (size_t)r * W,
+                   cr_pad_sub + (size_t)r * CWp_sub, W);
+        }
+    }
+    if (is_411) {
+        for (uint16_t r = 0; r < H; r++) {
+            memcpy(out->cb_plane_411 + (size_t)r * (W >> 2),
+                   cb_pad_sub + (size_t)r * CWp_sub, (W >> 2));
+            memcpy(out->cr_plane_411 + (size_t)r * (W >> 2),
+                   cr_pad_sub + (size_t)r * CWp_sub, (W >> 2));
+        }
+    }
+
+    free(y_pad); free(cb_pad_sub); free(cr_pad_sub); free(cb_pad); free(cr_pad);
+    free(m_pad); free(yc_pad); free(k_pad);
+
+    out->err = 0;
+    return 0;
+}
+
 static int pdbg_enabled(void) {
     static int v = -1;
     if (v < 0) v = (getenv("PROG_DBG") != NULL) ? 1 : 0;
@@ -1027,14 +1337,6 @@ static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
 
     uint16_t W  = info->width;
     uint16_t H  = info->height;
-    /* MCU footprint mirrors baseline (Phase 10/11). */
-    uint16_t mcu_w = is_411 ? 32 : ((is_420 || is_422) ? 16 : 8);
-    uint16_t mcu_h = (is_420 || is_440) ? 16 : 8;
-    uint16_t Wp = info->mcu_cols * mcu_w;
-    uint16_t Hp = info->mcu_rows * mcu_h;
-    uint16_t CWp_sub = is_411 ? (uint16_t)(Wp >> 2)
-                              : ((is_420 || is_422) ? (uint16_t)(Wp >> 1) : Wp);
-    uint16_t CHp_sub = (is_420 || is_440) ? (uint16_t)(Hp >> 1) : Hp;
 
     out->width  = W;
     out->height = H;
@@ -1498,325 +1800,7 @@ static int decode_progressive(bitstream_t *bs, jpeg_info_t *info,
      * 12-bit mode). At drain we need wider IDCT (int32 dq + uint16 block
      * output) and uint16 pads/planes. Gray/4:4:4/4:2:0 only — guarded
      * at the top of the function. */
-    if (info->precision == 12) {
-        out->precision = 12;
-        size_t y_samples  = (size_t)Wp * Hp;
-        size_t cb_samples_sub = is_420 ? (size_t)CWp_sub * CHp_sub : 0;
-        uint16_t *y_pad16      = (uint16_t*)calloc(y_samples, sizeof(uint16_t));
-        uint16_t *cb_pad16_sub = is_420 ? (uint16_t*)calloc(cb_samples_sub, sizeof(uint16_t)) : NULL;
-        uint16_t *cr_pad16_sub = is_420 ? (uint16_t*)calloc(cb_samples_sub, sizeof(uint16_t)) : NULL;
-        uint16_t *cb_pad16     = is_gray ? NULL : (uint16_t*)calloc(y_samples, sizeof(uint16_t));
-        uint16_t *cr_pad16     = is_gray ? NULL : (uint16_t*)calloc(y_samples, sizeof(uint16_t));
-
-        out->y_plane16 = (uint16_t*)calloc((size_t)W * H, sizeof(uint16_t));
-        if (!is_gray) {
-            out->cb_plane16 = (uint16_t*)calloc((size_t)W * H, sizeof(uint16_t));
-            out->cr_plane16 = (uint16_t*)calloc((size_t)W * H, sizeof(uint16_t));
-            if (is_420) {
-                out->cb_plane16_420 = (uint16_t*)calloc((size_t)(W >> 1) * (H >> 1), sizeof(uint16_t));
-                out->cr_plane16_420 = (uint16_t*)calloc((size_t)(W >> 1) * (H >> 1), sizeof(uint16_t));
-            }
-        }
-        int alloc_ok16 = y_pad16 && out->y_plane16 &&
-                         (is_gray ||
-                          (cb_pad16 && cr_pad16 && out->cb_plane16 && out->cr_plane16 &&
-                           (!is_420 || (cb_pad16_sub && cr_pad16_sub &&
-                                        out->cb_plane16_420 && out->cr_plane16_420))));
-        if (!alloc_ok16) {
-            free(y_pad16); free(cb_pad16_sub); free(cr_pad16_sub);
-            free(cb_pad16); free(cr_pad16);
-            out->err = (uint32_t)JPEG_ERR_INTERNAL; goto fail;
-        }
-
-        int32_t dq[64];
-        uint16_t blk_u16[64];
-        for (int c = 0; c < num_comps; c++) {
-            const uint16_t *qt = info->qtables[info->components[c].qt_id].q;
-            uint32_t blk_rows = cg[c].blk_rows;
-            uint32_t blk_cols = cg[c].blk_cols;
-            uint32_t base = cg[c].base;
-            uint16_t *pad;
-            uint16_t pad_stride;
-            if (c == 0) {
-                pad = y_pad16;
-                pad_stride = Wp;
-            } else if (is_420) {
-                pad = (c == 1) ? cb_pad16_sub : cr_pad16_sub;
-                pad_stride = CWp_sub;
-            } else { /* 4:4:4 */
-                pad = (c == 1) ? cb_pad16 : cr_pad16;
-                pad_stride = Wp;
-            }
-            for (uint32_t by = 0; by < blk_rows; by++) {
-                for (uint32_t bx = 0; bx < blk_cols; bx++) {
-                    uint32_t blk = base + by * blk_cols + bx;
-                    dequant_block_i32(coef_buf[blk], qt, dq);
-                    idct_islow_p12(dq, blk_u16);
-                    uint16_t *dst = pad + ((size_t)by * 8u) * pad_stride + (bx * 8u);
-                    copy_block_8x8_u16(blk_u16, dst, pad_stride);
-                }
-            }
-        }
-        free(coef_buf);
-
-        /* 4:2:0 chroma upsample — uint16 nearest-neighbor 2x 2x. */
-        if (is_420) {
-            for (uint16_t r = 0; r < Hp; r++) {
-                const uint16_t *cb_src = cb_pad16_sub + (size_t)(r >> 1) * CWp_sub;
-                const uint16_t *cr_src = cr_pad16_sub + (size_t)(r >> 1) * CWp_sub;
-                uint16_t *cb_dst = cb_pad16 + (size_t)r * Wp;
-                uint16_t *cr_dst = cr_pad16 + (size_t)r * Wp;
-                for (uint16_t c = 0; c < CWp_sub; c++) {
-                    cb_dst[2*c    ] = cb_src[c];
-                    cb_dst[2*c + 1] = cb_src[c];
-                    cr_dst[2*c    ] = cr_src[c];
-                    cr_dst[2*c + 1] = cr_src[c];
-                }
-            }
-        }
-
-        /* Crop padded → output planes (16-bit). */
-        for (uint16_t r = 0; r < H; r++) {
-            memcpy(out->y_plane16 + (size_t)r * W,
-                   y_pad16 + (size_t)r * Wp, W * sizeof(uint16_t));
-            if (!is_gray) {
-                memcpy(out->cb_plane16 + (size_t)r * W,
-                       cb_pad16 + (size_t)r * Wp, W * sizeof(uint16_t));
-                memcpy(out->cr_plane16 + (size_t)r * W,
-                       cr_pad16 + (size_t)r * Wp, W * sizeof(uint16_t));
-            }
-        }
-        if (is_420) {
-            for (uint16_t r = 0; r < (H >> 1); r++) {
-                memcpy(out->cb_plane16_420 + (size_t)r * (W >> 1),
-                       cb_pad16_sub + (size_t)r * CWp_sub,
-                       (size_t)(W >> 1) * sizeof(uint16_t));
-                memcpy(out->cr_plane16_420 + (size_t)r * (W >> 1),
-                       cr_pad16_sub + (size_t)r * CWp_sub,
-                       (size_t)(W >> 1) * sizeof(uint16_t));
-            }
-        }
-
-        free(y_pad16); free(cb_pad16_sub); free(cr_pad16_sub);
-        free(cb_pad16); free(cr_pad16);
-        out->err = 0;
-        return 0;
-    }
-
-    int is_chroma_sub = (is_420 || is_422 || is_440 || is_411);
-    uint8_t *y_pad      = (uint8_t*)calloc((size_t)Wp * Hp, 1);
-    uint8_t *cb_pad_sub = is_chroma_sub ? (uint8_t*)calloc((size_t)CWp_sub * CHp_sub, 1) : NULL;
-    uint8_t *cr_pad_sub = is_chroma_sub ? (uint8_t*)calloc((size_t)CWp_sub * CHp_sub, 1) : NULL;
-    uint8_t *cb_pad     = (is_gray || is_cmyk) ? NULL : (uint8_t*)calloc((size_t)Wp * Hp, 1);
-    uint8_t *cr_pad     = (is_gray || is_cmyk) ? NULL : (uint8_t*)calloc((size_t)Wp * Hp, 1);
-    /* Phase 12c: CMYK drain needs 3 extra padded buffers (M, Y-comp, K);
-     * y_pad above holds the C component when is_cmyk. */
-    uint8_t *m_pad      = is_cmyk ? (uint8_t*)calloc((size_t)Wp * Hp, 1) : NULL;
-    uint8_t *yc_pad     = is_cmyk ? (uint8_t*)calloc((size_t)Wp * Hp, 1) : NULL;
-    uint8_t *k_pad      = is_cmyk ? (uint8_t*)calloc((size_t)Wp * Hp, 1) : NULL;
-
-    if (is_cmyk) {
-        out->c_plane      = (uint8_t*)calloc((size_t)W * H, 1);
-        out->m_plane      = (uint8_t*)calloc((size_t)W * H, 1);
-        out->y_plane_cmyk = (uint8_t*)calloc((size_t)W * H, 1);
-        out->k_plane      = (uint8_t*)calloc((size_t)W * H, 1);
-    } else {
-        out->y_plane = (uint8_t*)calloc((size_t)W * H, 1);
-        if (!is_gray) {
-            out->cb_plane = (uint8_t*)calloc((size_t)W * H, 1);
-            out->cr_plane = (uint8_t*)calloc((size_t)W * H, 1);
-            if (is_420) {
-                out->cb_plane_420 = (uint8_t*)calloc((size_t)(W >> 1) * (H >> 1), 1);
-                out->cr_plane_420 = (uint8_t*)calloc((size_t)(W >> 1) * (H >> 1), 1);
-            }
-            if (is_422) {
-                out->cb_plane_422 = (uint8_t*)calloc((size_t)(W >> 1) * H, 1);
-                out->cr_plane_422 = (uint8_t*)calloc((size_t)(W >> 1) * H, 1);
-            }
-            if (is_440) {
-                out->cb_plane_440 = (uint8_t*)calloc((size_t)W * (H >> 1), 1);
-                out->cr_plane_440 = (uint8_t*)calloc((size_t)W * (H >> 1), 1);
-            }
-            if (is_411) {
-                out->cb_plane_411 = (uint8_t*)calloc((size_t)(W >> 2) * H, 1);
-                out->cr_plane_411 = (uint8_t*)calloc((size_t)(W >> 2) * H, 1);
-            }
-        }
-    }
-    int alloc_ok = y_pad &&
-                   (is_cmyk
-                    ? (m_pad && yc_pad && k_pad &&
-                       out->c_plane && out->m_plane && out->y_plane_cmyk && out->k_plane)
-                    : (out->y_plane &&
-                       (is_gray ||
-                        (cb_pad && cr_pad && out->cb_plane && out->cr_plane &&
-                         (!is_420 ||
-                          (cb_pad_sub && cr_pad_sub &&
-                           out->cb_plane_420 && out->cr_plane_420)) &&
-                         (!is_422 ||
-                          (cb_pad_sub && cr_pad_sub &&
-                           out->cb_plane_422 && out->cr_plane_422)) &&
-                         (!is_440 ||
-                          (cb_pad_sub && cr_pad_sub &&
-                           out->cb_plane_440 && out->cr_plane_440)) &&
-                         (!is_411 ||
-                          (cb_pad_sub && cr_pad_sub &&
-                           out->cb_plane_411 && out->cr_plane_411))))));
-    if (!alloc_ok) {
-        free(y_pad); free(cb_pad_sub); free(cr_pad_sub); free(cb_pad); free(cr_pad);
-        free(m_pad); free(yc_pad); free(k_pad);
-        out->err = (uint32_t)JPEG_ERR_INTERNAL; goto fail;
-    }
-
-    uint8_t blk_out[64];
-    for (int c = 0; c < num_comps; c++) {
-        const uint16_t *qt = info->qtables[info->components[c].qt_id].q;
-        uint32_t blk_rows = cg[c].blk_rows;
-        uint32_t blk_cols = cg[c].blk_cols;
-        uint32_t base = cg[c].base;
-        uint8_t *pad;
-        uint16_t pad_stride;
-        if (is_cmyk) {
-            /* Phase 12c: CMYK — 4 full-res pads, one per component.
-             * c=0 (C) lands in y_pad, c=1 (M) in m_pad, c=2 (Y) in yc_pad,
-             * c=3 (K) in k_pad. All at Wp stride. */
-            if (c == 0)      pad = y_pad;
-            else if (c == 1) pad = m_pad;
-            else if (c == 2) pad = yc_pad;
-            else             pad = k_pad;
-            pad_stride = Wp;
-        } else if (c == 0) {
-            pad = y_pad;
-            pad_stride = Wp;
-        } else if (is_chroma_sub) {
-            pad = (c == 1) ? cb_pad_sub : cr_pad_sub;
-            pad_stride = CWp_sub;
-        } else { /* 4:4:4 */
-            pad = (c == 1) ? cb_pad : cr_pad;
-            pad_stride = Wp;
-        }
-
-        for (uint32_t by = 0; by < blk_rows; by++) {
-            for (uint32_t bx = 0; bx < blk_cols; bx++) {
-                uint32_t blk = base + by * blk_cols + bx;
-                dequant_block(coef_buf[blk], qt);
-                idct_islow(coef_buf[blk], blk_out);
-                uint8_t *dst = pad + ((size_t)by * 8u) * pad_stride + (bx * 8u);
-                copy_block_8x8(blk_out, dst, pad_stride);
-            }
-        }
-    }
-
-    free(coef_buf);
-
-    /* Chroma upsample — mirrors baseline Phase 10/11 helpers. */
-    if (is_420) {
-        chroma_upsample_nn(cb_pad_sub, cb_pad, Wp, Hp);
-        chroma_upsample_nn(cr_pad_sub, cr_pad, Wp, Hp);
-    } else if (is_422) {
-        /* 4:2:2 — horizontal 2x nearest-neighbor upsample. */
-        for (uint16_t r = 0; r < Hp; r++) {
-            const uint8_t *cb_src = cb_pad_sub + (size_t)r * CWp_sub;
-            const uint8_t *cr_src = cr_pad_sub + (size_t)r * CWp_sub;
-            uint8_t *cb_dst = cb_pad + (size_t)r * Wp;
-            uint8_t *cr_dst = cr_pad + (size_t)r * Wp;
-            for (uint16_t c = 0; c < CWp_sub; c++) {
-                cb_dst[2*c    ] = cb_src[c];
-                cb_dst[2*c + 1] = cb_src[c];
-                cr_dst[2*c    ] = cr_src[c];
-                cr_dst[2*c + 1] = cr_src[c];
-            }
-        }
-    } else if (is_411) {
-        /* 4:1:1 — horizontal 4x nearest-neighbor upsample. */
-        for (uint16_t r = 0; r < Hp; r++) {
-            const uint8_t *cb_src = cb_pad_sub + (size_t)r * CWp_sub;
-            const uint8_t *cr_src = cr_pad_sub + (size_t)r * CWp_sub;
-            uint8_t *cb_dst = cb_pad + (size_t)r * Wp;
-            uint8_t *cr_dst = cr_pad + (size_t)r * Wp;
-            for (uint16_t c = 0; c < CWp_sub; c++) {
-                cb_dst[4*c    ] = cb_src[c];
-                cb_dst[4*c + 1] = cb_src[c];
-                cb_dst[4*c + 2] = cb_src[c];
-                cb_dst[4*c + 3] = cb_src[c];
-                cr_dst[4*c    ] = cr_src[c];
-                cr_dst[4*c + 1] = cr_src[c];
-                cr_dst[4*c + 2] = cr_src[c];
-                cr_dst[4*c + 3] = cr_src[c];
-            }
-        }
-    } else if (is_440) {
-        /* 4:4:0 — vertical 2x nearest-neighbor upsample. */
-        for (uint16_t r = 0; r < CHp_sub; r++) {
-            const uint8_t *cb_src = cb_pad_sub + (size_t)r * CWp_sub;
-            const uint8_t *cr_src = cr_pad_sub + (size_t)r * CWp_sub;
-            uint8_t *cb_dst0 = cb_pad + (size_t)(2*r    ) * Wp;
-            uint8_t *cb_dst1 = cb_pad + (size_t)(2*r + 1) * Wp;
-            uint8_t *cr_dst0 = cr_pad + (size_t)(2*r    ) * Wp;
-            uint8_t *cr_dst1 = cr_pad + (size_t)(2*r + 1) * Wp;
-            memcpy(cb_dst0, cb_src, Wp);
-            memcpy(cb_dst1, cb_src, Wp);
-            memcpy(cr_dst0, cr_src, Wp);
-            memcpy(cr_dst1, cr_src, Wp);
-        }
-    }
-
-    /* Crop padded → output planes */
-    if (is_cmyk) {
-        /* Phase 12c: CMYK — 4 full-res planes, no upsample. */
-        for (uint16_t r = 0; r < H; r++) {
-            memcpy(out->c_plane      + (size_t)r * W, y_pad  + (size_t)r * Wp, W);
-            memcpy(out->m_plane      + (size_t)r * W, m_pad  + (size_t)r * Wp, W);
-            memcpy(out->y_plane_cmyk + (size_t)r * W, yc_pad + (size_t)r * Wp, W);
-            memcpy(out->k_plane      + (size_t)r * W, k_pad  + (size_t)r * Wp, W);
-        }
-    } else {
-        for (uint16_t r = 0; r < H; r++) {
-            memcpy(out->y_plane + (size_t)r * W, y_pad + (size_t)r * Wp, W);
-            if (!is_gray) {
-                memcpy(out->cb_plane + (size_t)r * W, cb_pad + (size_t)r * Wp, W);
-                memcpy(out->cr_plane + (size_t)r * W, cr_pad + (size_t)r * Wp, W);
-            }
-        }
-    }
-    if (is_420) {
-        for (uint16_t r = 0; r < (H >> 1); r++) {
-            memcpy(out->cb_plane_420 + (size_t)r * (W >> 1),
-                   cb_pad_sub + (size_t)r * CWp_sub, (W >> 1));
-            memcpy(out->cr_plane_420 + (size_t)r * (W >> 1),
-                   cr_pad_sub + (size_t)r * CWp_sub, (W >> 1));
-        }
-    }
-    if (is_422) {
-        for (uint16_t r = 0; r < H; r++) {
-            memcpy(out->cb_plane_422 + (size_t)r * (W >> 1),
-                   cb_pad_sub + (size_t)r * CWp_sub, (W >> 1));
-            memcpy(out->cr_plane_422 + (size_t)r * (W >> 1),
-                   cr_pad_sub + (size_t)r * CWp_sub, (W >> 1));
-        }
-    }
-    if (is_440) {
-        for (uint16_t r = 0; r < (H >> 1); r++) {
-            memcpy(out->cb_plane_440 + (size_t)r * W,
-                   cb_pad_sub + (size_t)r * CWp_sub, W);
-            memcpy(out->cr_plane_440 + (size_t)r * W,
-                   cr_pad_sub + (size_t)r * CWp_sub, W);
-        }
-    }
-    if (is_411) {
-        for (uint16_t r = 0; r < H; r++) {
-            memcpy(out->cb_plane_411 + (size_t)r * (W >> 2),
-                   cb_pad_sub + (size_t)r * CWp_sub, (W >> 2));
-            memcpy(out->cr_plane_411 + (size_t)r * (W >> 2),
-                   cr_pad_sub + (size_t)r * CWp_sub, (W >> 2));
-        }
-    }
-
-    free(y_pad); free(cb_pad_sub); free(cr_pad_sub); free(cb_pad); free(cr_pad);
-    free(m_pad); free(yc_pad); free(k_pad);
-
-    out->err = 0;
-    return 0;
+    return drain_coef_buf_to_planes(coef_buf, cg, info, out);
 
 fail:
     free(coef_buf);
@@ -2910,14 +2894,6 @@ static int decode_sof10(bitstream_t *bs, jpeg_info_t *info, jpeg_decoded_t *out)
 
     uint16_t W  = info->width;
     uint16_t H  = info->height;
-    /* MCU footprint mirrors baseline. */
-    uint16_t mcu_w = is_411 ? 32 : ((is_420 || is_422) ? 16 : 8);
-    uint16_t mcu_h = (is_420 || is_440) ? 16 : 8;
-    uint16_t Wp = info->mcu_cols * mcu_w;
-    uint16_t Hp = info->mcu_rows * mcu_h;
-    uint16_t CWp_sub = is_411 ? (uint16_t)(Wp >> 2)
-                              : ((is_420 || is_422) ? (uint16_t)(Wp >> 1) : Wp);
-    uint16_t CHp_sub = (is_420 || is_440) ? (uint16_t)(Hp >> 1) : Hp;
 
     out->width  = W;
     out->height = H;
@@ -3363,220 +3339,7 @@ static int decode_sof10(bitstream_t *bs, jpeg_info_t *info, jpeg_decoded_t *out)
 
     (void)scan_no;
 
-    /* ---------------------------------------------------------------- */
-    /* Drain: dequant + IDCT per block → pad planes → crop.             */
-    /* Identical to decode_progressive's drain path.                    */
-    /* ---------------------------------------------------------------- */
-
-    int is_chroma_sub = (is_420 || is_422 || is_440 || is_411);
-    uint8_t *y_pad      = (uint8_t*)calloc((size_t)Wp * Hp, 1);
-    uint8_t *cb_pad_sub = is_chroma_sub ? (uint8_t*)calloc((size_t)CWp_sub * CHp_sub, 1) : NULL;
-    uint8_t *cr_pad_sub = is_chroma_sub ? (uint8_t*)calloc((size_t)CWp_sub * CHp_sub, 1) : NULL;
-    uint8_t *cb_pad     = (is_gray || is_cmyk) ? NULL : (uint8_t*)calloc((size_t)Wp * Hp, 1);
-    uint8_t *cr_pad     = (is_gray || is_cmyk) ? NULL : (uint8_t*)calloc((size_t)Wp * Hp, 1);
-    /* Phase 12c: CMYK drain needs 3 extra pads for M / Y-comp / K. */
-    uint8_t *m_pad      = is_cmyk ? (uint8_t*)calloc((size_t)Wp * Hp, 1) : NULL;
-    uint8_t *yc_pad     = is_cmyk ? (uint8_t*)calloc((size_t)Wp * Hp, 1) : NULL;
-    uint8_t *k_pad      = is_cmyk ? (uint8_t*)calloc((size_t)Wp * Hp, 1) : NULL;
-
-    if (is_cmyk) {
-        out->c_plane      = (uint8_t*)calloc((size_t)W * H, 1);
-        out->m_plane      = (uint8_t*)calloc((size_t)W * H, 1);
-        out->y_plane_cmyk = (uint8_t*)calloc((size_t)W * H, 1);
-        out->k_plane      = (uint8_t*)calloc((size_t)W * H, 1);
-    } else {
-        out->y_plane = (uint8_t*)calloc((size_t)W * H, 1);
-        if (!is_gray) {
-            out->cb_plane = (uint8_t*)calloc((size_t)W * H, 1);
-            out->cr_plane = (uint8_t*)calloc((size_t)W * H, 1);
-            if (is_420) {
-                out->cb_plane_420 = (uint8_t*)calloc((size_t)(W >> 1) * (H >> 1), 1);
-                out->cr_plane_420 = (uint8_t*)calloc((size_t)(W >> 1) * (H >> 1), 1);
-            }
-            if (is_422) {
-                out->cb_plane_422 = (uint8_t*)calloc((size_t)(W >> 1) * H, 1);
-                out->cr_plane_422 = (uint8_t*)calloc((size_t)(W >> 1) * H, 1);
-            }
-            if (is_440) {
-                out->cb_plane_440 = (uint8_t*)calloc((size_t)W * (H >> 1), 1);
-                out->cr_plane_440 = (uint8_t*)calloc((size_t)W * (H >> 1), 1);
-            }
-            if (is_411) {
-                out->cb_plane_411 = (uint8_t*)calloc((size_t)(W >> 2) * H, 1);
-                out->cr_plane_411 = (uint8_t*)calloc((size_t)(W >> 2) * H, 1);
-            }
-        }
-    }
-    int alloc_ok = y_pad &&
-                   (is_cmyk
-                    ? (m_pad && yc_pad && k_pad &&
-                       out->c_plane && out->m_plane && out->y_plane_cmyk && out->k_plane)
-                    : (out->y_plane &&
-                       (is_gray ||
-                        (cb_pad && cr_pad && out->cb_plane && out->cr_plane &&
-                         (!is_420 ||
-                          (cb_pad_sub && cr_pad_sub &&
-                           out->cb_plane_420 && out->cr_plane_420)) &&
-                         (!is_422 ||
-                          (cb_pad_sub && cr_pad_sub &&
-                           out->cb_plane_422 && out->cr_plane_422)) &&
-                         (!is_440 ||
-                          (cb_pad_sub && cr_pad_sub &&
-                           out->cb_plane_440 && out->cr_plane_440)) &&
-                         (!is_411 ||
-                          (cb_pad_sub && cr_pad_sub &&
-                           out->cb_plane_411 && out->cr_plane_411))))));
-    if (!alloc_ok) {
-        free(y_pad); free(cb_pad_sub); free(cr_pad_sub);
-        free(cb_pad); free(cr_pad);
-        free(m_pad); free(yc_pad); free(k_pad);
-        out->err = (uint32_t)JPEG_ERR_INTERNAL; goto fail;
-    }
-
-    uint8_t blk_out[64];
-    for (int c = 0; c < num_comps; c++) {
-        const uint16_t *qt = info->qtables[info->components[c].qt_id].q;
-        uint32_t blk_rows = cg[c].blk_rows;
-        uint32_t blk_cols = cg[c].blk_cols;
-        uint32_t base = cg[c].base;
-        uint8_t *pad;
-        uint16_t pad_stride;
-        if (is_cmyk) {
-            /* Phase 12c: CMYK — 4 full-res pads, one per component. */
-            if (c == 0)      pad = y_pad;
-            else if (c == 1) pad = m_pad;
-            else if (c == 2) pad = yc_pad;
-            else             pad = k_pad;
-            pad_stride = Wp;
-        } else if (c == 0) {
-            pad = y_pad; pad_stride = Wp;
-        } else if (is_chroma_sub) {
-            pad = (c == 1) ? cb_pad_sub : cr_pad_sub;
-            pad_stride = CWp_sub;
-        } else {
-            pad = (c == 1) ? cb_pad : cr_pad;
-            pad_stride = Wp;
-        }
-        for (uint32_t by = 0; by < blk_rows; by++) {
-            for (uint32_t bx = 0; bx < blk_cols; bx++) {
-                uint32_t blk = base + by * blk_cols + bx;
-                dequant_block(coef_buf[blk], qt);
-                idct_islow(coef_buf[blk], blk_out);
-                uint8_t *dst = pad + ((size_t)by * 8u) * pad_stride + (bx * 8u);
-                copy_block_8x8(blk_out, dst, pad_stride);
-            }
-        }
-    }
-
-    free(coef_buf);
-
-    if (is_420) {
-        chroma_upsample_nn(cb_pad_sub, cb_pad, Wp, Hp);
-        chroma_upsample_nn(cr_pad_sub, cr_pad, Wp, Hp);
-    } else if (is_422) {
-        /* 4:2:2 — horizontal 2x nearest-neighbor upsample. */
-        for (uint16_t r = 0; r < Hp; r++) {
-            const uint8_t *cb_src = cb_pad_sub + (size_t)r * CWp_sub;
-            const uint8_t *cr_src = cr_pad_sub + (size_t)r * CWp_sub;
-            uint8_t *cb_dst = cb_pad + (size_t)r * Wp;
-            uint8_t *cr_dst = cr_pad + (size_t)r * Wp;
-            for (uint16_t c = 0; c < CWp_sub; c++) {
-                cb_dst[2*c    ] = cb_src[c];
-                cb_dst[2*c + 1] = cb_src[c];
-                cr_dst[2*c    ] = cr_src[c];
-                cr_dst[2*c + 1] = cr_src[c];
-            }
-        }
-    } else if (is_411) {
-        /* 4:1:1 — horizontal 4x nearest-neighbor upsample. */
-        for (uint16_t r = 0; r < Hp; r++) {
-            const uint8_t *cb_src = cb_pad_sub + (size_t)r * CWp_sub;
-            const uint8_t *cr_src = cr_pad_sub + (size_t)r * CWp_sub;
-            uint8_t *cb_dst = cb_pad + (size_t)r * Wp;
-            uint8_t *cr_dst = cr_pad + (size_t)r * Wp;
-            for (uint16_t c = 0; c < CWp_sub; c++) {
-                cb_dst[4*c    ] = cb_src[c];
-                cb_dst[4*c + 1] = cb_src[c];
-                cb_dst[4*c + 2] = cb_src[c];
-                cb_dst[4*c + 3] = cb_src[c];
-                cr_dst[4*c    ] = cr_src[c];
-                cr_dst[4*c + 1] = cr_src[c];
-                cr_dst[4*c + 2] = cr_src[c];
-                cr_dst[4*c + 3] = cr_src[c];
-            }
-        }
-    } else if (is_440) {
-        /* 4:4:0 — vertical 2x nearest-neighbor upsample. */
-        for (uint16_t r = 0; r < CHp_sub; r++) {
-            const uint8_t *cb_src = cb_pad_sub + (size_t)r * CWp_sub;
-            const uint8_t *cr_src = cr_pad_sub + (size_t)r * CWp_sub;
-            uint8_t *cb_dst0 = cb_pad + (size_t)(2*r    ) * Wp;
-            uint8_t *cb_dst1 = cb_pad + (size_t)(2*r + 1) * Wp;
-            uint8_t *cr_dst0 = cr_pad + (size_t)(2*r    ) * Wp;
-            uint8_t *cr_dst1 = cr_pad + (size_t)(2*r + 1) * Wp;
-            memcpy(cb_dst0, cb_src, Wp);
-            memcpy(cb_dst1, cb_src, Wp);
-            memcpy(cr_dst0, cr_src, Wp);
-            memcpy(cr_dst1, cr_src, Wp);
-        }
-    }
-
-    if (is_cmyk) {
-        /* Phase 12c: CMYK — 4 full-res planes, no upsample. */
-        for (uint16_t r = 0; r < H; r++) {
-            memcpy(out->c_plane      + (size_t)r * W, y_pad  + (size_t)r * Wp, W);
-            memcpy(out->m_plane      + (size_t)r * W, m_pad  + (size_t)r * Wp, W);
-            memcpy(out->y_plane_cmyk + (size_t)r * W, yc_pad + (size_t)r * Wp, W);
-            memcpy(out->k_plane      + (size_t)r * W, k_pad  + (size_t)r * Wp, W);
-        }
-    } else {
-        for (uint16_t r = 0; r < H; r++) {
-            memcpy(out->y_plane + (size_t)r * W, y_pad + (size_t)r * Wp, W);
-            if (!is_gray) {
-                memcpy(out->cb_plane + (size_t)r * W, cb_pad + (size_t)r * Wp, W);
-                memcpy(out->cr_plane + (size_t)r * W, cr_pad + (size_t)r * Wp, W);
-            }
-        }
-    }
-    if (is_420) {
-        for (uint16_t r = 0; r < (H >> 1); r++) {
-            memcpy(out->cb_plane_420 + (size_t)r * (W >> 1),
-                   cb_pad_sub + (size_t)r * CWp_sub, (W >> 1));
-            memcpy(out->cr_plane_420 + (size_t)r * (W >> 1),
-                   cr_pad_sub + (size_t)r * CWp_sub, (W >> 1));
-        }
-    }
-    if (is_422) {
-        for (uint16_t r = 0; r < H; r++) {
-            memcpy(out->cb_plane_422 + (size_t)r * (W >> 1),
-                   cb_pad_sub + (size_t)r * CWp_sub, (W >> 1));
-            memcpy(out->cr_plane_422 + (size_t)r * (W >> 1),
-                   cr_pad_sub + (size_t)r * CWp_sub, (W >> 1));
-        }
-    }
-    if (is_440) {
-        for (uint16_t r = 0; r < (H >> 1); r++) {
-            memcpy(out->cb_plane_440 + (size_t)r * W,
-                   cb_pad_sub + (size_t)r * CWp_sub, W);
-            memcpy(out->cr_plane_440 + (size_t)r * W,
-                   cr_pad_sub + (size_t)r * CWp_sub, W);
-        }
-    }
-    if (is_411) {
-        for (uint16_t r = 0; r < H; r++) {
-            memcpy(out->cb_plane_411 + (size_t)r * (W >> 2),
-                   cb_pad_sub + (size_t)r * CWp_sub, (W >> 2));
-            memcpy(out->cr_plane_411 + (size_t)r * (W >> 2),
-                   cr_pad_sub + (size_t)r * CWp_sub, (W >> 2));
-        }
-    }
-
-    free(y_pad); free(cb_pad_sub); free(cr_pad_sub);
-    free(cb_pad); free(cr_pad);
-    free(m_pad); free(yc_pad); free(k_pad);
-
-    out->err = 0;
-    return 0;
+    return drain_coef_buf_to_planes(coef_buf, cg, info, out);
 
 fail:
     free(coef_buf);
