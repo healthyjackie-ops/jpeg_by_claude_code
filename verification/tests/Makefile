@@ -21,13 +21,15 @@ TOP        := jpeg_axi_top
 RTL_SRCS   := $(wildcard $(RTL_DIR)/*.v)
 
 # C model objects to link as golden reference -------------------------------
+# arith.o is required since Phase 21+ (decoder.o references arith_dec_*).
 CMODEL_OBJS := $(CMODEL_BUILD)/bitstream.o \
                $(CMODEL_BUILD)/header_parser.o \
                $(CMODEL_BUILD)/huffman.o \
                $(CMODEL_BUILD)/dequant.o \
                $(CMODEL_BUILD)/idct.o \
                $(CMODEL_BUILD)/chroma.o \
-               $(CMODEL_BUILD)/decoder.o
+               $(CMODEL_BUILD)/decoder.o \
+               $(CMODEL_BUILD)/arith.o
 
 # Verilator flags -----------------------------------------------------------
 VERILATOR ?= verilator
