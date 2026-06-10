@@ -28,6 +28,13 @@ typedef struct {
     uint16_t *cr_plane16;
     uint16_t *cb_plane16_420;  /* sub-res chroma (W/2) × (H/2) */
     uint16_t *cr_plane16_420;
+    /* Phase 13b-prog-ext: P=12 sub-res chroma for 4:2:2 / 4:4:0 / 4:1:1. */
+    uint16_t *cb_plane16_422;  /* (W/2) × H */
+    uint16_t *cr_plane16_422;
+    uint16_t *cb_plane16_440;  /* W × (H/2) */
+    uint16_t *cr_plane16_440;
+    uint16_t *cb_plane16_411;  /* (W/4) × H */
+    uint16_t *cr_plane16_411;
     uint8_t  precision;      /* 8 or 12 */
     /* Phase 25b: SOF3 lossless 3-component output uses y_plane/cb_plane/
        cr_plane as R/G/B storage (not YCbCr). golden_compare and downstream

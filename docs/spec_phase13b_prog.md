@@ -142,13 +142,13 @@ gray (P12):       8×8 grad q75
 
 ## 6. 完工后剩余 P=12 / CMYK 空缺
 
-Phase 13b-prog 落完后的 P=12 地图：
+Phase 13b-prog（+ ext，见 §8）落完后的 P=12 地图：
 
 - ✅ SOF0/SOF1 (Phase 13a, `decode_p12`)
 - ✅ **SOF2 gray/444/420** (Phase 13b-prog, `decode_progressive`)
-- ⏳ SOF2 + 4:2:2 / 4:4:0 / 4:1:1 + P=12 — 只需把 Phase 17d 的 chroma 分支扩到 drain，与本 Phase 同构
+- ✅ **SOF2 + 4:2:2 / 4:4:0 / 4:1:1** (Phase 13b-prog-ext, 共享 drain)
 - ⏳ SOF9 + P=12 (`decode_sof9`) — arith entropy 本身 P-agnostic，改动集中在 drain
-- ⏳ SOF10 + P=12 (`decode_sof10`) — 同 SOF2，drain 早退分支
+- ⏳ SOF10 + P=12 (`decode_sof10`) — drain 已统一并支持 P=12 全 YCbCr 模式，只需放宽 SOF10 的精度 gate + 向量验证
 - ⏳ CMYK + P=12 (任何 SOF) — 一起收掉时成本最低
 - ⏳ SOF5/6/7 (DCT hierarchical)、SOF13/14/15 (arith hierarchical) — 与 P=12 正交
 - 🔒 SOF11 — libjpeg-turbo 3.1.3 参考端仍阻塞，等 Wave 5 切换到 libjpeg-9 参考
@@ -161,3 +161,29 @@ Phase 13b-prog 落完后的 P=12 地图：
 - scan-time 代码一行没改 — 证实 Phase 17 系列 `cg[c]` 抽象 + 17d 的 chroma 泛化 + 12c 的 Nf 泛化已经把 progressive Huffman 打磨到 "只剩一个精度轴"，本期在 drain 层增加早退支路即可关掉。
 - drain 早退把 P=8 / P=12 路径做硬物理隔离，零 P=8 回归风险。aggregate 1515/1515 印证这一设计选择。
 - P=12 drain 对 4:2:0 的 chroma 上采样选最近邻 2×2，这是为了与 `decode_p12` (Phase 13a) 保持一致 — 与 libjpeg-turbo 默认 `jsample_smooth = FALSE` 的 box upsample 对齐。
+
+## 8. Phase 13b-prog-ext — P=12 × 4:2:2 / 4:4:0 / 4:1:1
+
+**Status**: ✅ **COMPLETE** — 36/36 phase13b_ext bit-exact, 2329/2329 full-corpus regress (2026-06-10)。
+
+13b-prog 落地后做了一次 drain 统一重构：decode_progressive 的 P=8 / P=12
+两份 drain 与 decode_sof10 的第三份合并为单一 `drain_coef_buf_to_planes()`，
+4:2:2 / 4:1:1 / 4:4:0 的方向性上采样循环抽进 `chroma.c`
+(`chroma_upsample_{h2,h4,v2}[_u16]`)。重构后本扩展的改动半径：
+
+1. `decode_progressive` 的 P=12 gate 从 `gray/444/420` 放宽到 "非 CMYK 即可"
+2. 共享 drain 的 P=12 分支按 P=8 分支同构推广：`is_sub16` 覆盖全部
+   降采样模式、新 `cb/cr_plane16_{422,440,411}` 子分辨率输出平面、
+   u16 方向性上采样、对应 crop
+3. `decoder.h` + `jpeg_free` 增加 6 个 plane 字段
+4. `golden_compare`：P=12 raw-data 分支按 chroma_mode 参数化 MCU 几何
+   (422: 16×8 / 440: 8×16 / 411: 32×8，Y 每调 8 或 16 行)，比较器新增
+   chroma_mode 3/4/5 @ P>8 的 sub-res uint16 平面对比
+
+向量 (`tools/gen_phase13b_ext.py`)：12 尺寸 × 3 模式 = 36 张，
+`cjpeg -precision 12 -progressive -optimize -sample {2x1,1x2,4x1}`，
+覆盖各模式 MCU 非对齐尺寸 (17×13, 23×19, 57×39, 100×75, 199×131, 161×97)、
+DRI ∈ {0,1,4,16}、q 50-90、grad/check/noise。
+
+**36/36 第一轮 bit-exact** — drain 统一让 chroma × 精度矩阵的最后三格
+在单点落地，无任何 bring-up 调试。

@@ -413,8 +413,11 @@ deferred:
 
 - **CMYK (Nf=4)** in any SOF2/SOF9/SOF10 path → **closed in Phase 12c** ✅
 - **P=12** in SOF2 gray/444/420 → **closed in Phase 13b-prog** ✅
-- **P=12** in SOF2 extended chroma (4:2:2 / 4:4:0 / 4:1:1) — future
+- **P=12** in SOF2 extended chroma (4:2:2 / 4:4:0 / 4:1:1) → **closed in
+  Phase 13b-prog-ext** ✅ (drain unification made it a one-point change)
 - **P=12** in SOF9 sequential arith / SOF10 progressive arith — future
+  (SOF10 shares the unified drain, so only its precision gate + vectors
+  remain)
 - **P=12** + CMYK in any entropy-coded DCT path — future
 
 All are unblockable future extensions; libjpeg-turbo supports them so

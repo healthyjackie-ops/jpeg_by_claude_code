@@ -276,20 +276,27 @@ static int libjpeg_decode_ycc(const uint8_t *data, size_t size, libjpeg_ycc_t *o
                        is_411  ? 5 : 1;
 
     /* Phase 13: P=12 path uses jpeg12_read_raw_data into J12SAMPLE (int16)
-       row buffers. Supports grayscale / 4:4:4 / 4:2:0 (matches C model scope).
-       Converts to uint16_t (0..4095) for plane storage. */
-    if (out->precision == 12 && !is_cmyk && (is_gray || is_444 || out->chroma_mode == 1)) {
-        int is_420_p = (out->chroma_mode == 1);
-        uint32_t Wp = (is_420_p) ? (((W + 15) / 16) * 16) : (((W + 7) / 8) * 8);
-        uint32_t Hp = (is_420_p) ? (((H + 15) / 16) * 16) : (((H + 7) / 8) * 8);
-        uint32_t CWp = is_420_p ? (Wp / 2) : Wp;
-        uint32_t CHp = is_420_p ? (Hp / 2) : Hp;
+       row buffers. Phase 13b-prog-ext widens coverage from gray/444/420 to
+       all YCbCr modes (gray / 444 / 420 / 422 / 440 / 411 — matches C model
+       scope; CMYK+P=12 still excluded). Converts to uint16_t (0..4095). */
+    if (out->precision == 12 && !is_cmyk) {
+        int cm = out->chroma_mode;          /* 0=gray 1=420 2=444 3=422 4=440 5=411 */
+        uint32_t mcu_w = (cm == 1 || cm == 3) ? 16 : (cm == 5 ? 32 : 8);
+        uint32_t mcu_h = (cm == 1 || cm == 4) ? 16 : 8;
+        uint32_t Wp = ((W + mcu_w - 1) / mcu_w) * mcu_w;
+        uint32_t Hp = ((H + mcu_h - 1) / mcu_h) * mcu_h;
+        uint32_t CWp = (cm == 1 || cm == 3) ? (Wp / 2)
+                                            : (cm == 5 ? (Wp / 4) : Wp);
+        uint32_t CHp = (cm == 1 || cm == 4) ? (Hp / 2) : Hp;
 
         J12SAMPLE *y_pad  = (J12SAMPLE*)calloc((size_t)Wp * Hp, sizeof(J12SAMPLE));
         J12SAMPLE *cb_pad = is_gray ? NULL : (J12SAMPLE*)calloc((size_t)CWp * CHp, sizeof(J12SAMPLE));
         J12SAMPLE *cr_pad = is_gray ? NULL : (J12SAMPLE*)calloc((size_t)CWp * CHp, sizeof(J12SAMPLE));
 
-        int y_rows_per_call = is_420_p ? 16 : 8;
+        /* One iMCU row per call: Y delivers v_samp*8 rows (16 when Y has
+           v=2, i.e. 4:2:0/4:4:0), chroma always delivers 8. */
+        int y_rows_per_call = (cm == 1 || cm == 4) ? 16 : 8;
+        int c_sub_v = (cm == 1 || cm == 4);   /* chroma rows advance at half rate */
         J12SAMPROW y_rowptrs[16];
         J12SAMPROW cb_rowptrs[8];
         J12SAMPROW cr_rowptrs[8];
@@ -302,7 +309,7 @@ static int libjpeg_decode_ycc(const uint8_t *data, size_t size, libjpeg_ycc_t *o
                 y_rowptrs[i] = y_pad + (size_t)(base_y + (uint32_t)i) * Wp;
             }
             if (!is_gray) {
-                uint32_t base_c = is_420_p ? (base_y >> 1) : base_y;
+                uint32_t base_c = c_sub_v ? (base_y >> 1) : base_y;
                 for (int i = 0; i < 8; i++) {
                     cb_rowptrs[i] = cb_pad + (size_t)(base_c + (uint32_t)i) * CWp;
                     cr_rowptrs[i] = cr_pad + (size_t)(base_c + (uint32_t)i) * CWp;
@@ -323,8 +330,9 @@ static int libjpeg_decode_ycc(const uint8_t *data, size_t size, libjpeg_ycc_t *o
             }
         }
         if (!is_gray) {
-            uint32_t cW = is_420_p ? (W / 2) : W;
-            uint32_t cH = is_420_p ? (H / 2) : H;
+            uint32_t cW = (cm == 1 || cm == 3) ? (W / 2)
+                                               : (cm == 5 ? (W / 4) : W);
+            uint32_t cH = (cm == 1 || cm == 4) ? (H / 2) : H;
             out->cb16 = (uint16_t*)calloc((size_t)cW * cH, sizeof(uint16_t));
             out->cr16 = (uint16_t*)calloc((size_t)cW * cH, sizeof(uint16_t));
             out->cb_width  = cW;
@@ -719,6 +727,26 @@ int main(int argc, char **argv) {
                 for (size_t i = 0; i < ncpix; i++) {
                     int d1 = (int)ours.cb_plane16[i] - (int)gold.cb16[i];
                     int d2 = (int)ours.cr_plane16[i] - (int)gold.cr16[i];
+                    if (d1 < 0) d1 = -d1;
+                    if (d2 < 0) d2 = -d2;
+                    if (d1 > dc_max) dc_max = d1;
+                    if (d2 > dc_max) dc_max = d2;
+                }
+            } else if (gold.chroma_mode >= 3 && gold.chroma_mode <= 5) {
+                /* Phase 13b-prog-ext: 4:2:2 / 4:4:0 / 4:1:1 at P=12 —
+                 * compare pre-upsample sub-res uint16 chroma planes. */
+                const uint16_t *ours_cb =
+                    (gold.chroma_mode == 3) ? ours.cb_plane16_422 :
+                    (gold.chroma_mode == 4) ? ours.cb_plane16_440 :
+                                              ours.cb_plane16_411;
+                const uint16_t *ours_cr =
+                    (gold.chroma_mode == 3) ? ours.cr_plane16_422 :
+                    (gold.chroma_mode == 4) ? ours.cr_plane16_440 :
+                                              ours.cr_plane16_411;
+                size_t ncpix = (size_t)gold.cb_width * gold.cb_height;
+                for (size_t i = 0; i < ncpix; i++) {
+                    int d1 = (int)ours_cb[i] - (int)gold.cb16[i];
+                    int d2 = (int)ours_cr[i] - (int)gold.cr16[i];
                     if (d1 < 0) d1 = -d1;
                     if (d2 < 0) d2 = -d2;
                     if (d1 > dc_max) dc_max = d1;
