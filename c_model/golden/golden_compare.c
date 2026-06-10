@@ -626,17 +626,42 @@ static uint8_t *read_file(const char *p, size_t *s) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) {
-        fprintf(stderr, "usage: %s <jpg1> [jpg2 ...]\n", argv[0]);
+    /* --expect-fail: every input is a corrupted vector the C model must
+     * REJECT (jpeg_decode rc != 0). libjpeg is not consulted. Used by
+     * `make errtest` over verification/vectors/error_cases/. */
+    int expect_fail = 0;
+    int first_arg = 1;
+    if (argc >= 2 && strcmp(argv[1], "--expect-fail") == 0) {
+        expect_fail = 1;
+        first_arg = 2;
+    }
+    if (argc < first_arg + 1) {
+        fprintf(stderr, "usage: %s [--expect-fail] <jpg1> [jpg2 ...]\n", argv[0]);
         return 1;
     }
     int total = 0, pass = 0, fail = 0, skip = 0;
     int worst_diff_y = 0, worst_diff_c = 0;
 
-    for (int a = 1; a < argc; a++) {
+    for (int a = first_arg; a < argc; a++) {
         total++;
         size_t sz; uint8_t *buf = read_file(argv[a], &sz);
         if (!buf) { fprintf(stderr, "[SKIP] %s: read fail\n", argv[a]); skip++; continue; }
+
+        if (expect_fail) {
+            jpeg_decoded_t ours;
+            int rc = jpeg_decode(buf, sz, &ours);
+            if (rc != 0) {
+                printf("[PASS] %s rejected err=0x%X\n", argv[a], ours.err);
+                pass++;
+            } else {
+                printf("[FAIL] %s decoded %ux%u — corrupted input must be rejected\n",
+                       argv[a], ours.width, ours.height);
+                fail++;
+            }
+            jpeg_free(&ours);
+            free(buf);
+            continue;
+        }
 
         libjpeg_ycc_t gold;
         int sof_type = peek_sof_type(buf, sz);

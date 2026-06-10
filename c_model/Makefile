@@ -23,7 +23,7 @@ TEST_BINS := $(patsubst $(TEST_DIR)/test_%.c,$(BUILD_DIR)/test_%,$(TEST_SRCS))
 GOLDEN_SRC := $(GOLDEN_DIR)/golden_compare.c
 GOLDEN_BIN := $(BUILD_DIR)/golden_compare
 
-.PHONY: all test golden regress clean
+.PHONY: all test golden regress errtest clean
 all: $(BUILD_DIR)/jpeg_decode $(GOLDEN_BIN)
 
 VECTORS_ROOT ?= ../verification/vectors
@@ -40,10 +40,32 @@ phase%: $(GOLDEN_BIN)
 	fi
 
 # Full-corpus regression: every vector in every directory, except phase14
-# (RTL error-out vectors, not golden-comparable). This is the number to quote
-# in landing commits — hand-assembled per-phase lists silently rot.
+# (RTL error-out vectors, not golden-comparable) and error_cases (covered by
+# errtest below). This is the number to quote in landing commits —
+# hand-assembled per-phase lists silently rot.
 regress: $(GOLDEN_BIN)
-	@find $(VECTORS_ROOT) -name '*.jpg' -not -path '*phase14*' | sort | xargs $(GOLDEN_BIN)
+	@find $(VECTORS_ROOT) -name '*.jpg' -not -path '*phase14*' \
+	     -not -path '*error_cases*' | sort | xargs $(GOLDEN_BIN)
+
+# Error-path coverage: corrupted vectors must be rejected (rc != 0), and on
+# macOS each rejection is also checked for leaks with the system leaks tool.
+ERROR_DIR := $(VECTORS_ROOT)/error_cases
+errtest: $(GOLDEN_BIN) $(BUILD_DIR)/jpeg_decode
+	@if ls $(ERROR_DIR)/*.jpg >/dev/null 2>&1; then \
+	  $(GOLDEN_BIN) --expect-fail $(ERROR_DIR)/*.jpg; \
+	else \
+	  echo "[errtest] no vectors in $(ERROR_DIR) — run tools/gen_error_cases.py" >&2; \
+	  exit 2; \
+	fi
+	@if command -v leaks >/dev/null 2>&1; then \
+	  for f in $(ERROR_DIR)/*.jpg; do \
+	    leaks --atExit -- $(BUILD_DIR)/jpeg_decode $$f 2>&1 | grep -q " 0 leaks" \
+	      || { echo "[errtest] LEAK on $$f" >&2; exit 3; }; \
+	  done; \
+	  echo "[errtest] leaks: clean on all error cases"; \
+	else \
+	  echo "[errtest] leaks tool unavailable, leak check skipped"; \
+	fi
 
 $(BUILD_DIR):
 	@mkdir -p $@
