@@ -653,7 +653,7 @@ int main(int argc, char **argv) {
         if (rc != 0) {
             fprintf(stderr, "[FAIL] %s: our decode err=0x%X\n", argv[a], ours.err);
             fail++;
-            libjpeg_free(&gold); free(buf); continue;
+            jpeg_free(&ours); libjpeg_free(&gold); free(buf); continue;
         }
 
         if (ours.width != gold.width || ours.height != gold.height) {

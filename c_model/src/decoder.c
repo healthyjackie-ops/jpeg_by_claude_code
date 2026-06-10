@@ -73,7 +73,8 @@ static int dec_blk(bitstream_t *bs, const htable_t *dc, const htable_t *ac,
     return huff_decode_block(bs, dc, ac, dc_pred, coef);
 }
 
-int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
+static int jpeg_decode_impl(const uint8_t *data, size_t size,
+                            jpeg_decoded_t *out) {
     memset(out, 0, sizeof(*out));
 
     bitstream_t bs;
@@ -690,6 +691,20 @@ int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
 
     out->err = 0;
     return 0;
+}
+
+/* Public entry. Decode paths free their local scratch (pads, coef buffers)
+ * on failure, but planes already attached to *out would otherwise be left
+ * for the caller — and callers are not required to call jpeg_free() after a
+ * failed decode. Release them here; only the error code survives. */
+int jpeg_decode(const uint8_t *data, size_t size, jpeg_decoded_t *out) {
+    int rc = jpeg_decode_impl(data, size, out);
+    if (rc != 0) {
+        uint32_t err = out->err;
+        jpeg_free(out);
+        out->err = err;
+    }
+    return rc;
 }
 
 static int decode_p12(bitstream_t *bs, jpeg_info_t *info, jpeg_decoded_t *out) {

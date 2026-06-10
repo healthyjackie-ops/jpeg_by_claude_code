@@ -19,11 +19,23 @@ static uint8_t *read_file(const char *path, size_t *size) {
 }
 
 static int write_ppm(const char *path, const jpeg_decoded_t *d) {
+    /* Only 8-bit gray / full-res YCbCr planes are renderable here; CMYK and
+     * P>8 outputs live in other plane sets and would deref NULL below. */
+    if (!d->y_plane || (d->cb_plane && !d->cr_plane)) {
+        fprintf(stderr, "ppm: unsupported output mode (CMYK or P>8), skipping\n");
+        return -1;
+    }
+    int is_gray = (d->cb_plane == NULL);
     FILE *f = fopen(path, "wb");
     if (!f) return -1;
     fprintf(f, "P6\n%u %u\n255\n", d->width, d->height);
     for (uint32_t i = 0; i < (uint32_t)d->width * d->height; i++) {
         int y  = d->y_plane[i];
+        if (is_gray) {
+            uint8_t g3[3] = { (uint8_t)y, (uint8_t)y, (uint8_t)y };
+            fwrite(g3, 1, 3, f);
+            continue;
+        }
         int cb = (int)d->cb_plane[i] - 128;
         int cr = (int)d->cr_plane[i] - 128;
         int r = y + ((91881 * cr + 32768) >> 16);
@@ -40,6 +52,10 @@ static int write_ppm(const char *path, const jpeg_decoded_t *d) {
 }
 
 static int write_yuv420(const char *path, const jpeg_decoded_t *d) {
+    if (!d->y_plane || !d->cb_plane_420 || !d->cr_plane_420) {
+        fprintf(stderr, "yuv420: decoded image is not 8-bit 4:2:0, skipping\n");
+        return -1;
+    }
     FILE *f = fopen(path, "wb");
     if (!f) return -1;
     fwrite(d->y_plane, 1, (size_t)d->width * d->height, f);
@@ -63,6 +79,7 @@ int main(int argc, char **argv) {
     int rc = jpeg_decode(data, size, &dec);
     if (rc != 0) {
         fprintf(stderr, "decode error: 0x%X\n", dec.err);
+        jpeg_free(&dec);
         free(data);
         return 2;
     }
