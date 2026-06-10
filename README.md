@@ -1,6 +1,6 @@
-# JPEG Baseline Decoder — ASIC IP
+# JPEG Decoder — ASIC IP + full-spec C reference model
 
-An open-source, synthesizable **JPEG baseline decoder** RTL block, closed to timing on **ASAP7 7.5T RVT TT @ 600 MHz** with a complete verification flow, bit-exact to `libjpeg` on everything from 16×16 synthetic vectors to 4K real-world photos.
+An open-source, synthesizable **JPEG baseline decoder** RTL block — closed to timing on **ASAP7 7.5T RVT TT @ 600 MHz** — paired with a **C reference model that now covers most of ISO/IEC 10918-1**: baseline, extended sequential, progressive, lossless, and arithmetic-coded paths, 8/12-bit precision, all common chroma layouts plus CMYK, validated **bit-exact against libjpeg-turbo on a 2 329-vector corpus**.
 
 <p align="center">
   <img src="docs/images/rtl_decoded_4k_thumb.jpg" alt="RTL-decoded 4K image (3840×2160)" width="720"/>
@@ -16,13 +16,14 @@ An open-source, synthesizable **JPEG baseline decoder** RTL block, closed to tim
 
 | | |
 |---|---|
-| **Standard** | ISO/IEC 10918-1 baseline sequential DCT, 8-bit, YCbCr 4:2:0, up to 4096 px wide |
-| **Throughput** | 1 Y-pixel / cycle → **≈ 13 fps @ 4K UHD** @ 600 MHz |
+| **RTL standard** | ISO/IEC 10918-1 baseline sequential DCT, 8-bit, YCbCr 4:2:0, up to 4096 px wide |
+| **C model standard** | SOF0/1/2/3/9/10 (baseline, extended, progressive, lossless, sequential+progressive arithmetic) · P=8 and P=12 DCT, P=2..16 lossless · gray / 4:4:4 / 4:2:0 / 4:2:2 / 4:4:0 / 4:1:1 / CMYK · DRI/restart everywhere |
+| **Throughput (RTL)** | 1 Y-pixel / cycle → **≈ 13 fps @ 4K UHD** @ 600 MHz |
 | **Timing** | **WNS = +339 ps** at 1.667 ns clock (20.3 % margin; Fmax ≈ 753 MHz) |
 | **Area** | **45.1 k GE** logic (30 % of 150 k budget), 3 942 µm² on ASAP7 7.5T RVT TT |
 | **Memory** | 20 × `$mem_v2` kept for SRAM macro substitution; ~436 k GE macro footprint |
 | **Interfaces** | AXI4-Lite CSR + AXI4-Stream bytestream in / pixel out |
-| **Verification** | smoke 12/12 + 956/1 150 random + 4K real photo — all bit-exact vs `libjpeg` |
+| **Verification** | C model: **2 329/2 329 vectors bit-exact** vs libjpeg-turbo (`make regress`) + 14 corrupted-input reject cases, leak-clean (`make errtest`) · RTL: smoke 12/12 + 956/1 150 random + 4K real photo bit-exact |
 | **Toolchain** | Yosys 0.63 + ABC + ASAP7 PDK + Verilator + libjpeg-turbo (100 % open-source) |
 
 ## Table of contents
@@ -91,6 +92,16 @@ cd c_model && make                       # build the libjpeg-based golden refere
 cd ../verification/tests && make diff    # smoke 12 images, should print "[DIFF] 12/12 passed"
 ```
 
+### C-model full regression
+
+```bash
+cd c_model
+make test      # unit tests (bitstream, huffman, idct, arith, errors, SOF1 P=12)
+make regress   # all 2 329 vectors in verification/vectors/ vs libjpeg-turbo
+make errtest   # 14 corrupted vectors must be rejected; leak-checked on macOS
+make phase17d  # any single vectors/phase* directory also works as a target
+```
+
 ### Decode one JPEG end-to-end through the RTL, dump a PPM
 
 ```bash
@@ -153,13 +164,25 @@ make one    # runs grad_16x16_q80.jpg with --vcd=trace.vcd — open in GTKWave
 | Logic budget | 150 k GE → **30 % used** |
 | Memory (20 × `$mem_v2`) | ≈ 38 146 µm² = 436 k GE (see `syn/asap7/asap7_mem_area.py`) |
 
-### Verification
+### Verification — RTL
 
 | Test set | Result |
 |---|---|
 | **Smoke** (12 crafted vectors, 16×16..64×64) | **12/12 PASS**, ΔY=0 ΔC=0 |
 | **Random** (1 150 images, q25..q100, 16×16..128×128) | **956/1 150 PASS**, 0 failures (remainder blocked by macOS `pthread_create` rate limit, not an RTL issue) |
 | **4K real-world** (3840×2160 baseline photo) | **PASS**, bit-exact, 12.5 s Verilator wall time |
+
+### Verification — C model (`make regress`, full corpus)
+
+| Coverage axis | Vectors | Result |
+|---|---:|---|
+| Baseline + extended seq (SOF0/1), 8-bit, all chroma + CMYK | 1 150 + phase06..13 sets | bit-exact |
+| Progressive Huffman (SOF2): DC/AC spectral + refine, DRI, gray/444/420/422/440/411, CMYK | phase16/17/17d/18/prog_dri/12c | bit-exact |
+| Sequential + progressive arithmetic (SOF9/SOF10), all chroma + CMYK | phase22/24/24c/12c | bit-exact |
+| Lossless (SOF3), P=2..16, predictors 1-7, point transform | phase25/25b/25c/27 (549) | bit-exact |
+| 12-bit DCT (SOF0/1/2), gray/444/420/422/440/411 | phase13/13b_prog/13b_ext (76) | bit-exact |
+| **Total** | **2 329** | **2 329/2 329, ΔY=0 ΔC=0** |
+| Corrupted-input rejection (`make errtest`) | 14 | all rejected, 0 leaks |
 
 Golden reference in every case: libjpeg-turbo 3.1.3.
 
@@ -176,16 +199,18 @@ Golden reference in every case: libjpeg-turbo 3.1.3.
 ├── verification/
 │   ├── cocotb/       # Reserved for module-level cocotb benches
 │   ├── tests/        # Verilator C++ testbench (sim_main.cpp, BFMs, diff harness)
-│   └── vectors/
-│       ├── smoke/    # 12 hand-crafted bit-exact vectors
-│       └── full/     # 1 150 random images from tools/gen_vectors.py
+│   └── vectors/      # 30 directories, 2 351 JPEGs
+│       ├── smoke/        # 12 hand-crafted bit-exact vectors
+│       ├── full/         # 1 150 random images from tools/gen_vectors.py
+│       ├── phase*/       # per-feature sets (progressive, arith, lossless, P=12, CMYK, ...)
+│       └── error_cases/  # 14 corrupted inputs the decoder must reject
 ├── syn/
 │   ├── asap7/        # ASAP7 7.5T RVT TT Liberty + SRAM area model
 │   ├── constraints/  # jpeg_axi_top.sdc
 │   ├── scripts/      # Yosys flows (flat + hierarchical)
 │   └── reports/      # Synthesized netlist (4.4 MB)
 ├── pnr/              # (reserved for Phase 5 — OpenROAD/OpenLane)
-├── tools/            # gen_vectors.py — generates random JPEG test corpus
+├── tools/            # 28 vector generators (gen_vectors.py + per-phase gen_*.py)
 ├── docs/
 │   ├── spec.md       # Top-level spec
 │   ├── plan.md       # Phased project plan
@@ -200,16 +225,14 @@ Golden reference in every case: libjpeg-turbo 3.1.3.
 
 | Component | Lines of code |
 |---|---:|
-| RTL Verilog (18 modules + defs) | **3 237** |
-| C reference model | 1 169 |
-| Verilator C++ testbench | 898 |
-| Synthesis scripts (Yosys / ABC / SDC / Python) | 261 |
-| Vector generator | 150 |
-| Documentation (Markdown) | 2 005 |
-| **Total authored SLOC** | **~7 720** |
-| Test JPEG vectors | 1 162 files (10 MB) |
+| RTL Verilog (18 modules + defs) | ~4 000 |
+| C reference model (src + golden harness) | ~6 900 |
+| Verilator C++ testbench | ~900 |
+| Synthesis scripts (Yosys / ABC / SDC / Python) | ~260 |
+| Vector generators (28 scripts) | ~3 000 |
+| Test JPEG vectors | 2 351 files (14 MB) |
 | Synthesized netlist | 4.4 MB |
-| Repo checkout size | ≈ 16 MB |
+| Repo checkout size | ≈ 60 MB |
 
 ---
 
@@ -231,15 +254,23 @@ Supporting material: [spec.md](docs/spec.md), [plan.md](docs/plan.md), [uarch.md
 
 ## Design limits
 
-Per [spec.md §1.1](docs/spec.md):
+### RTL (per [spec.md §1.1](docs/spec.md), v1.0 scope)
 
-**Supported** · SOF0 baseline · 8-bit precision · YCbCr 4:2:0 (sampling 2×2,1×1,1×1) · 3 components · up to 4 DQT + 4 DHT (2 per class) · 16×16 … 4096-wide (internal registers 13 bit → 8192×8192) · standard markers (SOI, APPn, DQT, DHT, SOF0, SOS, EOI)
+**Supported** · SOF0 baseline · 8-bit precision · YCbCr 4:2:0 (sampling 2×2,1×1,1×1) · 3 components · up to 4 DQT + 4 DHT (2 per class) · 16×16 … 4096-wide (internal registers 13 bit → 8192×8192) · standard markers (SOI, APPn, DQT, DHT, SOF0, SOS, EOI) · plus SOF2 DC-only progressive (Phase 16c)
 
-**Not supported** (hard-rejected with ERROR bit) · Progressive / Extended / Lossless / Hierarchical / Arithmetic (SOF1..SOF15) · 12-bit · 4:4:4 / 4:2:2 / 4:1:1 / grayscale · restart markers (DRI must be 0 in v1.0)
+**Not supported** (hard-rejected with ERROR bit) · full progressive / Extended / Lossless / Hierarchical / Arithmetic · 12-bit · 4:4:4 / 4:2:2 / 4:1:1 / grayscale · restart markers
+
+### C model (current, see [docs/roadmap_v2.md](docs/roadmap_v2.md))
+
+**Supported** · SOF0/SOF1 sequential, SOF2 progressive Huffman (full spectral selection + successive approximation), SOF3 lossless (predictors 1-7, point transform, P=2..16), SOF9 sequential arith, SOF10 progressive arith · P=8 and P=12 for all DCT paths (SOF9/10 P=12 pending) · gray / 4:4:4 / 4:2:0 / 4:2:2 / 4:4:0 / 4:1:1 / CMYK (Nf=4) · DRI/restart in every path
+
+**Not yet** · SOF5/6/7 DCT hierarchical · SOF13/14/15 arith hierarchical · SOF11 lossless arith (blocked by libjpeg-turbo reference; needs libjpeg-9) · P=12 in SOF9/SOF10 · CMYK + P=12
 
 ---
 
 ## Status & roadmap
+
+### v1.0 baseline ASIC flow
 
 | Phase | Status |
 |---|---|
@@ -248,10 +279,23 @@ Per [spec.md §1.1](docs/spec.md):
 | 2. RTL implementation | ✅ |
 | 3. RTL simulation + diff harness | ✅ |
 | 4. ASAP7 synthesis + timing closure | ✅ **WNS +339 ps** |
-| 5. Place & route (OpenROAD/OpenLane) | ⏳ next |
+| 5. Place & route (OpenROAD/OpenLane) | ⏳ |
 | 6. Sign-off STA + DRC/LVS | ⏳ |
 
-See [`docs/plan.md`](docs/plan.md) for the full schedule.
+### v2 full-spec expansion ([docs/roadmap_v2.md](docs/roadmap_v2.md))
+
+| Wave | C model | RTL |
+|---|---|---|
+| 2 — SOF1 + 12-bit | ✅ (incl. SOF2 P=12 via 13b-prog/-ext) | ⏳ 16-bit datapath + 48b tdata |
+| 3 — Progressive (SOF2) | ✅ all chroma + CMYK + DRI | ✅ DC-only (16c); AC/refine ⏳ |
+| 4 — Arithmetic (SOF9/10) | ✅ all chroma + CMYK | ⏳ |
+| 5 — Lossless (SOF3) | ✅ P=2..16 (SOF11 blocked upstream) | ⏳ |
+
+The C model leads; RTL phases 17b/18b/19/20/23c/24b pick up each wave's
+scan machinery against the already-validated vector corpus.
+
+See [`docs/plan.md`](docs/plan.md) for the v1.0 schedule and
+[`docs/roadmap_v2.md`](docs/roadmap_v2.md) for the expansion plan.
 
 ---
 
